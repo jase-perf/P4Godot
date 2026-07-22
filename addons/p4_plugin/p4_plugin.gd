@@ -755,18 +755,18 @@ func _build_dock() -> void:
 	revert_unchanged_button = _add_dock_button(button_row, "Revert Unchanged...",
 			"Revert opened files that have no actual changes (p4 revert -a).",
 			_on_revert_unchanged_pressed)
-	_add_dock_button(button_row, "Checkout Current File",
-			"Run 'p4 edit' on the current scene or script.",
+	_add_dock_button(button_row, "Checkout Active File",
+			"Run 'p4 edit' on the scene/script open in the active editor tab.",
 			_on_checkout_current_pressed)
-	_add_dock_button(button_row, "Revert Current File",
-			"Run 'p4 revert', then reload the file from disk in the editor.",
-			_on_revert_current_pressed)
-	_add_dock_button(button_row, "Sync Current File",
-			"Run 'p4 sync' on the current file, then reload it from disk in the editor.",
-			_on_sync_current_pressed)
-	_add_dock_button(button_row, "Reload Current File",
-			"Reload the current scene/script from disk without touching P4.",
-			_on_reload_current_pressed)
+	_add_dock_button(button_row, "Revert Selected File",
+			"Run 'p4 revert' on the file selected in the changelist tree, then reload it from disk.",
+			_on_revert_selected_pressed)
+	_add_dock_button(button_row, "Sync Selected File",
+			"Run 'p4 sync' on the file selected in the changelist tree, then reload it from disk.",
+			_on_sync_selected_pressed)
+	_add_dock_button(button_row, "Reload Selected File",
+			"Reload the file selected in the changelist tree from disk without touching P4.",
+			_on_reload_selected_pressed)
 	_add_dock_button(button_row, "Log",
 			"Show or hide the P4 activity log window.",
 			_on_toggle_log_pressed)
@@ -1199,41 +1199,65 @@ func _on_checkout_current_pressed() -> void:
 		_show_alert("Couldn't check out '%s' - %s." % [path, result.reason])
 
 
-func _on_revert_current_pressed() -> void:
-	var path := _get_current_file_path()
+## The file selected in the changelist tree (a file row), or "" if none. The
+## revert/sync/reload toolbar buttons act on THIS, not the active editor tab -
+## "Current" was ambiguous once files became selectable in the tree.
+func _get_selected_res_path() -> String:
+	if tree == null:
+		return ""
+	var item := tree.get_selected()
+	if item == null:
+		return ""
+	var meta: Variant = item.get_metadata(0)
+	if typeof(meta) == TYPE_DICTIONARY and meta.get("type") == "file":
+		return String(meta.res_path)
+	return ""
+
+
+func _on_revert_selected_pressed() -> void:
+	var path := _get_selected_res_path()
 	if path.is_empty():
-		_log("No current scene/script with a saved path to revert.")
+		_log("Select a file in the changelist tree to revert.")
 		return
 	await _revert_path(path)
 
 
-## Revert res_path in Perforce and reload it from disk. Shared by the toolbar
-## "Revert Current File" button and the tree's per-row context menu.
+## Revert res_path in Perforce and reload it from disk. Confirms first, naming
+## the exact file, because revert discards unsaved in-editor changes too - the
+## user must not lose work in a file they didn't mean to touch. Shared by the
+## toolbar "Revert Selected File" button and the tree's per-row context menu.
 func _revert_path(res_path: String) -> void:
+	var proceed: bool = await _show_confirm_dialog(
+			("Revert '%s'?\n\nThis reverts the Perforce checkout AND discards any unsaved " +
+			"changes to this file in the editor, reloading it from disk.") % res_path,
+			"Revert", "Cancel")
+	if not proceed:
+		_log("Revert of '%s' cancelled." % res_path)
+		return
 	await _p4_exec_logged(["revert", ProjectSettings.globalize_path(res_path)])
 	_checked_out_this_session.erase(res_path)
 	_reload_path(res_path)
 
 
-func _on_sync_current_pressed() -> void:
-	var path := _get_current_file_path()
+func _on_sync_selected_pressed() -> void:
+	var path := _get_selected_res_path()
 	if path.is_empty():
-		_log("No current scene/script with a saved path to sync.")
+		_log("Select a file in the changelist tree to sync.")
 		return
 	await _sync_path(path)
 
 
 ## Sync res_path to the head revision and reload it from disk. Shared by the
-## toolbar "Sync Current File" button and the tree's per-row context menu.
+## toolbar "Sync Selected File" button and the tree's per-row context menu.
 func _sync_path(res_path: String) -> void:
 	await _p4_exec_logged(["sync", ProjectSettings.globalize_path(res_path)])
 	_reload_path(res_path)
 
 
-func _on_reload_current_pressed() -> void:
-	var path := _get_current_file_path()
+func _on_reload_selected_pressed() -> void:
+	var path := _get_selected_res_path()
 	if path.is_empty():
-		_log("No current scene/script with a saved path to reload.")
+		_log("Select a file in the changelist tree to reload.")
 		return
 	_reload_path(path)
 
