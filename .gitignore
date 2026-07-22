@@ -1,0 +1,5 @@
+# Transient MCP / tooling logs
+.logs/
+
+# Godot editor cache
+.godot/
