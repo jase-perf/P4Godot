@@ -104,6 +104,12 @@ var reconcile_button: Button
 var revert_unchanged_button: Button
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
+var verbose_log_checkbox: CheckBox
+
+# Mirrors verbose_log_checkbox so the logging hot path never touches a UI node.
+# When false, read-only probes (fstat/opened/where/changes/info/change -o and -n
+# previews) are kept out of the log; state-changing commands always show.
+var _verbose_log: bool = false
 
 # Metadata dict of the row a context-menu action targets (captured at right-click
 # so the action still knows its subject after the menu closes the selection).
@@ -308,6 +314,9 @@ func _load_settings() -> void:
 			SETTINGS_SECTION, "auto_checkout_on_edit", true)
 	checkout_on_save_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "checkout_on_save", true)
+	verbose_log_checkbox.button_pressed = settings.get_project_metadata(
+			SETTINGS_SECTION, "verbose_log", false)
+	_verbose_log = verbose_log_checkbox.button_pressed
 
 
 func _on_setting_toggled(_pressed: bool) -> void:
@@ -316,6 +325,9 @@ func _on_setting_toggled(_pressed: bool) -> void:
 			auto_checkout_checkbox.button_pressed)
 	settings.set_project_metadata(SETTINGS_SECTION, "checkout_on_save",
 			checkout_on_save_checkbox.button_pressed)
+	settings.set_project_metadata(SETTINGS_SECTION, "verbose_log",
+			verbose_log_checkbox.button_pressed)
+	_verbose_log = verbose_log_checkbox.button_pressed
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +800,12 @@ func _build_dock() -> void:
 	checkout_on_save_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(checkout_on_save_checkbox)
 
+	verbose_log_checkbox = CheckBox.new()
+	verbose_log_checkbox.text = "Verbose log"
+	verbose_log_checkbox.tooltip_text = "Log every p4 command and its output, including read-only status probes (fstat/opened/where/changes). When off, only state-changing commands are logged."
+	verbose_log_checkbox.toggled.connect(_on_setting_toggled)
+	settings_row.add_child(verbose_log_checkbox)
+
 	_build_tree()
 
 	# The log lives in its own on-demand Window rather than eating dock space -
@@ -1098,7 +1116,7 @@ func _on_context_menu_id_pressed(id: int) -> void:
 				await _sync_path(meta.res_path)
 		CTX_RELOAD:
 			if meta.has("res_path"):
-				_reload_path(meta.res_path)
+				await _reload_path_confirmed(meta.res_path)
 		CTX_EDIT_DESC:
 			if meta.has("change"):
 				await _edit_changelist_description(meta.change)
@@ -1268,7 +1286,22 @@ func _on_reload_selected_pressed() -> void:
 	if path.is_empty():
 		_log("Select a file in the changelist tree to reload.")
 		return
-	_reload_path(path)
+	await _reload_path_confirmed(path)
+
+
+## Confirm-then-reload for the user-initiated Reload actions (toolbar button and
+## context menu). Reload discards unsaved in-editor changes, so it warns first,
+## naming the file. Internal reloads (after revert/sync/decline) call _reload_path
+## directly - they either already confirmed or the reload IS the intended effect.
+func _reload_path_confirmed(res_path: String) -> void:
+	var proceed: bool = await _show_confirm_dialog(
+			("Reload '%s' from disk?\n\nThis discards any unsaved changes to this file " +
+			"in the editor.") % res_path,
+			"Reload", "Cancel")
+	if not proceed:
+		_log("Reload of '%s' cancelled." % res_path)
+		return
+	_reload_path(res_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1893,12 +1926,14 @@ func _local_to_res(local_path: String) -> String:
 # _apply_changes() (see its doc comment).
 # ---------------------------------------------------------------------------
 
-## Async `p4 <args>` via the worker thread. Returns {exit_code, output}. Every
-## command and its output are logged (the log window is the troubleshooting view).
+## Async `p4 <args>` via the worker thread. Returns {exit_code, output}. Commands
+## are logged to the log window per the Verbose setting (see _should_log_cmd).
 func _p4_exec(args: PackedStringArray) -> Dictionary:
 	if _p4_thread == null:
 		return _p4_exec_sync(args) # Worker gone (shutdown); it logs on its own.
-	_log_p4_cmd(args)
+	var loud := _should_log_cmd(args)
+	if loud:
+		_log_p4_cmd(args)
 	var req := P4Request.new()
 	req.args = args
 	_p4_inflight += 1
@@ -1910,7 +1945,7 @@ func _p4_exec(args: PackedStringArray) -> Dictionary:
 		await req.done
 	_p4_inflight -= 1
 	var result := {"exit_code": req.exit_code, "output": req.output}
-	_log_p4_result(result)
+	_finish_p4_log(args, result, loud)
 	return result
 
 
@@ -1927,13 +1962,16 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 	var tmp := _write_temp_spec(spec_text)
 	if tmp.is_empty():
 		return {"exit_code": -1, "output": ["Could not write a temporary p4 spec file."]}
-	_log_p4_cmd(args + PackedStringArray(["< (spec on stdin)"]))
+	var display_args := args + PackedStringArray(["< (spec on stdin)"])
+	var loud := _should_log_cmd(args) # change -i is always loud (never a probe)
+	if loud:
+		_log_p4_cmd(display_args)
 	if _p4_thread == null:
 		var out := []
 		var code := _p4_execute_with_stdin(args, tmp, out)
 		DirAccess.remove_absolute(tmp)
 		var sync_result := {"exit_code": code, "output": out}
-		_log_p4_result(sync_result)
+		_finish_p4_log(display_args, sync_result, loud)
 		return sync_result
 	var req := P4Request.new()
 	req.args = args
@@ -1948,7 +1986,7 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 	_p4_inflight -= 1
 	DirAccess.remove_absolute(tmp)
 	var result := {"exit_code": req.exit_code, "output": req.output}
-	_log_p4_result(result)
+	_finish_p4_log(display_args, result, loud)
 	return result
 
 
@@ -1974,11 +2012,13 @@ func _write_temp_spec(spec_text: String) -> String:
 
 
 func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
-	_log_p4_cmd(args)
+	var loud := _should_log_cmd(args)
+	if loud:
+		_log_p4_cmd(args)
 	var output := []
 	var exit_code := OS.execute("p4", args, output, true)
 	var result := {"exit_code": exit_code, "output": output}
-	_log_p4_result(result)
+	_finish_p4_log(args, result, loud)
 	return result
 
 
@@ -1997,7 +2037,7 @@ func _log_p4_cmd(args: PackedStringArray) -> void:
 
 
 ## Log a p4 result: its exit code when nonzero, then its (possibly truncated)
-## output. Verbose by design - the log window is where you troubleshoot p4.
+## output.
 func _log_p4_result(result: Dictionary) -> void:
 	if int(result.get("exit_code", 0)) != 0:
 		_log("  (exit %d)" % int(result.exit_code))
@@ -2007,6 +2047,42 @@ func _log_p4_result(result: Dictionary) -> void:
 			if text.length() > 2000:
 				text = text.substr(0, 2000) + "\n  ... (output truncated)"
 			_log(text)
+
+
+## True if `args` is a read-only probe whose successful output is just noise
+## unless Verbose logging is on. Mutating commands (edit, revert, sync, submit,
+## reopen, reconcile, change -i/-d, ...) are never probes and always log.
+func _is_probe_command(args: PackedStringArray) -> bool:
+	if "-n" in args:
+		return true # a dry-run preview (reconcile -n, revert -a -n) never mutates
+	var sub := ""
+	for a in args:
+		if not a.begins_with("-"):
+			sub = a
+			break
+	match sub:
+		"info", "fstat", "opened", "where", "changes", "print", "have", "files", "dirs":
+			return true
+		"change":
+			return "-o" in args # change -o reads; change -i / -d mutate
+		_:
+			return false
+
+
+## Whether to log this command's line and its successful output right now.
+func _should_log_cmd(args: PackedStringArray) -> bool:
+	return _verbose_log or not _is_probe_command(args)
+
+
+## Finish logging a p4 invocation. If the command line was logged, log its
+## result. Otherwise (a quiet probe) stay silent UNLESS it failed - a failure is
+## always surfaced, with its command line for context, even in non-verbose mode.
+func _finish_p4_log(args: PackedStringArray, result: Dictionary, cmd_was_logged: bool) -> void:
+	if cmd_was_logged:
+		_log_p4_result(result)
+	elif int(result.get("exit_code", 0)) != 0:
+		_log_p4_cmd(args)
+		_log_p4_result(result)
 
 
 ## Parse tagged (`p4 -ztag <cmd>`) output into an Array of Dictionaries, one per
