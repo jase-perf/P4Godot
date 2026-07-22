@@ -2064,6 +2064,18 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 		te.text = default_text
 		te.custom_minimum_size = Vector2(420, 120)
 		te.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		# Ctrl+Enter accepts the dialog (P4V-style); plain Enter still newlines.
+		# Routes through the dialog's `confirmed` signal (which sets the member
+		# result flags), so the awaiting loop below sees it - a lambda writing a
+		# local would not (see the _show_confirm_dialog note on lambda capture).
+		var submit_on_ctrl_enter := func(event: InputEvent) -> void:
+			if event is InputEventKey and event.pressed and not event.echo \
+					and event.ctrl_pressed \
+					and (event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER):
+				te.accept_event()
+				if is_instance_valid(dialog):
+					dialog.confirmed.emit()
+		te.gui_input.connect(submit_on_ctrl_enter)
 		vbox.add_child(te)
 		input = te
 	else:
@@ -2075,6 +2087,9 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 	# Adding CONTENT children to the dialog is fine (and required); the
 	# don't-parent-first caveat in _show_confirm_dialog is about the dialog node.
 	dialog.add_child(vbox)
+	# Plain Enter in a single-line field accepts the dialog.
+	if not multiline:
+		dialog.register_text_enter(input)
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
