@@ -99,6 +99,8 @@ var log_window: Window
 var tree: Tree
 var context_menu: PopupMenu
 var move_submenu: PopupMenu
+var diff_window: Window
+var diff_view: RichTextLabel
 var new_changelist_button: Button
 var reconcile_button: Button
 var revert_unchanged_button: Button
@@ -272,10 +274,12 @@ func _exit_tree() -> void:
 		_p4_queue.clear()
 	if dock:
 		remove_control_from_docks(dock)
-		dock.queue_free() # Cascades to log_window and log_box (its descendants).
+		dock.queue_free() # Cascades to log_window/diff_window and their descendants.
 		dock = null
 		log_window = null
 		log_box = null
+		diff_window = null
+		diff_view = null
 
 
 func _detect_p4_identity() -> void:
@@ -770,6 +774,9 @@ func _build_dock() -> void:
 	_add_dock_button(button_row, "Checkout Active File",
 			"Run 'p4 edit' on the scene/script open in the active editor tab.",
 			_on_checkout_current_pressed)
+	_add_dock_button(button_row, "Diff Selected File",
+			"Show a diff of the file selected in the changelist tree against its depot revision.",
+			_on_diff_selected_pressed)
 	_add_dock_button(button_row, "Revert Selected File",
 			"Run 'p4 revert' on the file selected in the changelist tree, then reload it from disk.",
 			_on_revert_selected_pressed)
@@ -812,6 +819,7 @@ func _build_dock() -> void:
 	# the toolbar "Log" button toggles it. log_box stays a member (so _log() is
 	# untouched) and exists from here on regardless of the window's visibility.
 	_build_log_window()
+	_build_diff_window()
 
 	# A dock (rather than a fixed bottom-panel item) so the user can drag it
 	# to any dock slot or float it in its own window via the dock's menu.
@@ -887,6 +895,104 @@ func _on_toggle_log_pressed() -> void:
 
 func _on_log_window_close_requested() -> void:
 	log_window.hide()
+
+
+# ---------------------------------------------------------------------------
+# Diff viewer
+# ---------------------------------------------------------------------------
+
+## The diff window (a hidden Window child of the dock) hosting a RichTextLabel
+## that renders colored unified-diff text. Repopulated and popped per diff.
+func _build_diff_window() -> void:
+	diff_window = Window.new()
+	diff_window.title = "P4 Diff"
+	diff_window.size = Vector2i(820, 560)
+	diff_window.visible = false
+	diff_window.close_requested.connect(_on_diff_window_close_requested)
+
+	var root := VBoxContainer.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	diff_window.add_child(root)
+
+	diff_view = RichTextLabel.new()
+	diff_view.bbcode_enabled = true
+	diff_view.scroll_active = true
+	diff_view.selection_enabled = true # let the user copy the diff
+	diff_view.focus_mode = Control.FOCUS_ALL
+	diff_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# Monospace so diff columns line up; fall back to default if unavailable.
+	var mono := get_editor_interface().get_base_control().get_theme_font("source", "EditorFonts")
+	if mono:
+		diff_view.add_theme_font_override("normal_font", mono)
+		diff_view.add_theme_font_override("bold_font", mono)
+		diff_view.add_theme_font_override("mono_font", mono)
+	root.add_child(diff_view)
+
+	dock.add_child(diff_window)
+
+
+func _on_diff_window_close_requested() -> void:
+	diff_window.hide()
+
+
+func _on_diff_selected_pressed() -> void:
+	var path := _get_selected_res_path()
+	if path.is_empty():
+		_log("Select a file in the changelist tree to diff.")
+		return
+	await _diff_path(path)
+
+
+## Diff res_path (workspace vs the depot revision you have) and show it in the
+## diff window. `p4 diff -du` is read-only.
+func _diff_path(res_path: String) -> void:
+	if not await _ensure_identity():
+		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		return
+	var result := await _p4_exec(["diff", "-du", ProjectSettings.globalize_path(res_path)])
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	if not _diff_has_changes(text):
+		await _show_alert("No differences: '%s' matches the depot revision you have." % res_path)
+		return
+	diff_window.title = "P4 Diff: %s" % res_path
+	diff_view.text = _diff_to_bbcode(text)
+	diff_window.popup_centered()
+
+
+## Whether `p4 diff -du` output shows an actual change. A unified diff always has
+## an "@@" hunk header when content differs; an unchanged-but-opened file emits
+## only the ---/+++ header. "files differ" is p4's binary-difference message.
+func _diff_has_changes(text: String) -> bool:
+	if text.contains("files differ"):
+		return true
+	for line in text.split("\n"):
+		if line.begins_with("@@"):
+			return true
+	return false
+
+
+## Turn unified-diff text into BBCode with per-line coloring (add=green,
+## remove=red, hunk=cyan, file header=dim). BBCode's '[' is escaped to '[lb]' so
+## code brackets in the diff aren't parsed as tags.
+func _diff_to_bbcode(diff_text: String) -> String:
+	var out := ""
+	for line in diff_text.split("\n"):
+		var esc := line.replace("[", "[lb]")
+		var color := ""
+		if line.begins_with("+++") or line.begins_with("---") \
+				or line.begins_with("====") or line.begins_with("diff "):
+			color = "9c9ca8" # neutral - file headers
+		elif line.begins_with("@@"):
+			color = P4_ACCENT.to_html(false) # cyan hunk header
+		elif line.begins_with("+"):
+			color = ACTION_ADD_COLOR.to_html(false) # green
+		elif line.begins_with("-"):
+			color = ACTION_DELETE_COLOR.to_html(false) # red
+		if color.is_empty():
+			out += esc + "\n"
+		else:
+			out += "[color=#%s]%s[/color]\n" % [color, esc]
+	return out
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1128,7 @@ enum {
 	CTX_EDIT_DESC,
 	CTX_SUBMIT,
 	CTX_DELETE_CL,
+	CTX_DIFF,
 }
 const CTX_MOVE_BASE := 1000
 
@@ -1055,6 +1162,7 @@ func _populate_context_menu(meta: Dictionary) -> void:
 	var kind: String = meta.get("type", "")
 	if kind == "file":
 		context_menu.add_item("Open", CTX_OPEN)
+		context_menu.add_item("Diff vs Depot", CTX_DIFF)
 		context_menu.add_item("Revert This File", CTX_REVERT)
 		context_menu.add_item("Sync This File", CTX_SYNC)
 		context_menu.add_item("Reload From Disk", CTX_RELOAD)
@@ -1108,6 +1216,9 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_OPEN:
 			if meta.has("res_path"):
 				_open_res_path(meta.res_path)
+		CTX_DIFF:
+			if meta.has("res_path"):
+				await _diff_path(meta.res_path)
 		CTX_REVERT:
 			if meta.has("res_path"):
 				await _revert_path(meta.res_path)
@@ -2061,7 +2172,8 @@ func _is_probe_command(args: PackedStringArray) -> bool:
 			sub = a
 			break
 	match sub:
-		"info", "fstat", "opened", "where", "changes", "print", "have", "files", "dirs":
+		"info", "fstat", "opened", "where", "changes", "print", "have", "files", "dirs", \
+		"diff", "diff2":
 			return true
 		"change":
 			return "-o" in args # change -o reads; change -i / -d mutate
@@ -2509,6 +2621,25 @@ func _run_cli_self_test_if_requested() -> void:
 					revertable += 1
 			_log("[selftest] revert-unchanged: preview=%d revertable=%d skipped=%d"
 					% [preview.size(), revertable, skipped])
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-diff-bbcode":
+			# Server-independent: per-line coloring + BBCode escaping.
+			var sample := "--- //depot/a\n+++ /local/a\n@@ -1,2 +1,2 @@\n context\n-old[x]\n+new\n"
+			var bb := _diff_to_bbcode(sample)
+			var ok := bb.contains("[color=#%s]" % ACTION_ADD_COLOR.to_html(false)) \
+					and bb.contains("[color=#%s]" % ACTION_DELETE_COLOR.to_html(false)) \
+					and bb.contains("[color=#%s]" % P4_ACCENT.to_html(false)) \
+					and bb.contains("[lb]x]") # the '[' in old[x] escaped
+			_log("[selftest] %s: diff-bbcode" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-diff="):
+			# Live, read-only: run p4 diff -du and report change detection.
+			var path := arg.substr("--p4-selftest-diff=".length())
+			var result := await _p4_exec(["diff", "-du", ProjectSettings.globalize_path(path)])
+			var text := "" if result.output.is_empty() else String(result.output[0])
+			_log("[selftest] diff '%s': has_changes=%s" % [path, _diff_has_changes(text)])
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-build-change-spec":

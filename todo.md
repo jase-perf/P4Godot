@@ -8,6 +8,6 @@
 - [x] Create/edit changelists and submit (v0.7.0 - New Changelist, Edit Description, Move to Changelist, Submit)
 - [x] Update UI with P4 branding as seen in <https://github.com/Perforce-Shared-Services/shadcn-force-ui> (v0.7.0 - cyan changelist accent + per-action colors over Godot's native theme)
 - [x] Delete empty changelists; edit the default changelist (promotes to numbered); Ctrl+Enter to accept dialogs; verbose command/output log; toolbar acts on tree selection; Revert Unchanged skips files open in the editor (v0.8.0)
-- Convert to compiled GDExtension to integrate with commit dock and file-status overlays
-  - Add diffing in Godot
+- [x] Diff files (v0.9.0 - `p4 diff -du` rendered in a colored diff window; no GDExtension needed)
+- GDExtension is only actually required for Godot's built-in Version Control panel (EditorVCSInterface), which is git-shaped (stage/commit/branch/push) and fits Perforce poorly. File-status overlays have NO Godot hook - they'd need an engine PR or a fragile FileSystem-dock-tree hack (GDScript-doable, no GDExtension needed). Reassess whether the commit-panel integration is worth the build cost. See memory: gdextension-vs-gdscript-assessment.
 - Shelving changelists (deferred)
