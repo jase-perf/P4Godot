@@ -927,7 +927,8 @@ func _rebuild_tree(model: Dictionary) -> void:
 		cl_item.set_text(0, label)
 		cl_item.set_text(1, "(%d)" % cl.files.size())
 		cl_item.set_selectable(1, false)
-		cl_item.set_metadata(0, {"type": "cl", "change": cl.change, "desc": cl.desc})
+		cl_item.set_metadata(0, {"type": "cl", "change": cl.change, "desc": cl.desc,
+				"file_count": cl.files.size()})
 		if folder_icon:
 			cl_item.set_icon(0, folder_icon)
 			cl_item.set_icon_modulate(0, P4_ACCENT) # the P4 brand touch
@@ -1002,6 +1003,7 @@ enum {
 	CTX_REFRESH,
 	CTX_EDIT_DESC,
 	CTX_SUBMIT,
+	CTX_DELETE_CL,
 }
 const CTX_MOVE_BASE := 1000
 
@@ -1042,9 +1044,13 @@ func _populate_context_menu(meta: Dictionary) -> void:
 		context_menu.add_submenu_node_item("Move to Changelist", move_submenu)
 		context_menu.add_separator()
 	elif kind == "cl":
-		context_menu.add_item("Submit Changelist...", CTX_SUBMIT)
-		if String(meta.get("change", "")) != "default":
-			context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
+		var fc := int(meta.get("file_count", -1)) # -1 (unknown) is treated non-empty
+		if fc != 0:
+			context_menu.add_item("Submit Changelist...", CTX_SUBMIT)
+		# Editing the default changelist's description promotes it to a numbered one.
+		context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
+		if String(meta.get("change", "")) != "default" and fc == 0:
+			context_menu.add_item("Delete Changelist", CTX_DELETE_CL)
 	context_menu.add_item("Refresh", CTX_REFRESH)
 
 
@@ -1099,6 +1105,9 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_SUBMIT:
 			if meta.get("type") == "cl":
 				await _submit_changelist_from_meta(meta)
+		CTX_DELETE_CL:
+			if meta.has("change"):
+				await _delete_changelist(meta.change)
 		CTX_REFRESH:
 			_refresh_changelists()
 
@@ -1381,16 +1390,25 @@ func _create_changelist(desc: String) -> String:
 	return _parse_change_number(result)
 
 
-## Edit a numbered changelist's description in place. Round-trips the existing
-## spec (`change -o`) so Files/Jobs are preserved - only Description changes.
+## Edit a changelist's description. For a numbered changelist this updates it in
+## place; the `change -o` round-trip preserves Files/Jobs. For the DEFAULT
+## changelist there is no description to edit, so `change -o` (no number) returns
+## a `Change: new` spec that already carries the default's files - saving it
+## promotes those files into a new numbered changelist (matching P4V).
 func _edit_changelist_description(change: String) -> void:
-	var current := await _p4_exec(["change", "-o", change])
+	var is_default := change == "default"
+	var read_args: PackedStringArray = ["change", "-o"]
+	if not is_default:
+		read_args.append(change)
+	var current := await _p4_exec(read_args)
 	var spec_text := "" if current.output.is_empty() else String(current.output[0])
 	if spec_text.is_empty():
-		await _show_alert("Could not read changelist #%s - see the P4 Log." % change)
+		await _show_alert("Could not read the changelist spec - see the P4 Log.")
 		return
-	var res: Dictionary = await _show_input_dialog("Edit Changelist #%s" % change,
-			"Description:", _extract_spec_description(spec_text), true, "Save")
+	var title := "Edit Default Changelist (creates a numbered changelist)" if is_default \
+			else "Edit Changelist #%s" % change
+	var initial := "" if is_default else _extract_spec_description(spec_text)
+	var res: Dictionary = await _show_input_dialog(title, "Description:", initial, true, "Save")
 	if not res.ok:
 		return
 	var new_desc := String(res.text).strip_edges()
@@ -1398,6 +1416,23 @@ func _edit_changelist_description(change: String) -> void:
 		await _show_alert("A changelist needs a description.")
 		return
 	await _p4_exec_spec(["change", "-i"], _replace_spec_description(spec_text, new_desc))
+	_request_refresh()
+
+
+## Delete an empty numbered changelist (`p4 change -d`). p4 refuses if it still
+## has open files; the menu only offers this on empty numbered changelists, and
+## the failure is surfaced if the state changed underneath us.
+func _delete_changelist(change: String) -> void:
+	if change == "default":
+		return # The default changelist can't be deleted.
+	var proceed: bool = await _show_confirm_dialog(
+			"Delete empty changelist #%s?" % change, "Delete", "Cancel")
+	if not proceed:
+		return
+	var result := await _p4_exec_logged(["change", "-d", change])
+	if result.exit_code != 0:
+		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+		await _show_alert("Could not delete changelist #%s:\n\n%s" % [change, msg])
 	_request_refresh()
 
 
@@ -2307,13 +2342,15 @@ func _run_cli_self_test_if_requested() -> void:
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-context-menu":
-			# Server-independent: assert the per-row menu item sets.
+			# Server-independent: log the per-row menu item labels.
 			_populate_context_menu({"type": "file", "res_path": "res://x.gd", "change": "default"})
-			_log("[selftest] file-menu items=%d" % context_menu.item_count)
-			_populate_context_menu({"type": "cl", "change": "default"})
-			_log("[selftest] default-cl-menu items=%d" % context_menu.item_count)
-			_populate_context_menu({"type": "cl", "change": "123", "desc": "wip"})
-			_log("[selftest] numbered-cl-menu items=%d" % context_menu.item_count)
+			_log("[selftest] file-menu: %s" % _selftest_menu_labels())
+			_populate_context_menu({"type": "cl", "change": "default", "file_count": 2})
+			_log("[selftest] default-cl(2): %s" % _selftest_menu_labels())
+			_populate_context_menu({"type": "cl", "change": "123", "desc": "wip", "file_count": 3})
+			_log("[selftest] numbered-cl(3): %s" % _selftest_menu_labels())
+			_populate_context_menu({"type": "cl", "change": "124", "desc": "empty", "file_count": 0})
+			_log("[selftest] numbered-cl(0): %s" % _selftest_menu_labels())
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-reconcile-preview":
@@ -2433,6 +2470,13 @@ func _run_cli_self_test_if_requested() -> void:
 				await _selftest_report_opened(p)
 			get_tree().quit()
 			return
+
+
+func _selftest_menu_labels() -> String:
+	var labels: Array = []
+	for i in range(context_menu.item_count):
+		labels.append(context_menu.get_item_text(i))
+	return " | ".join(labels)
 
 
 func _selftest_simulate_edit(path: String) -> void:
