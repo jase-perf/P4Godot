@@ -1354,7 +1354,6 @@ func _on_new_changelist_pressed() -> void:
 func _create_changelist(desc: String) -> String:
 	var spec := "Change: new\n\nDescription:\n" + _indent_spec_text(desc)
 	var result := await _p4_exec_spec(["change", "-i"], spec)
-	_log_exec_output(result)
 	return _parse_change_number(result)
 
 
@@ -1374,8 +1373,7 @@ func _edit_changelist_description(change: String) -> void:
 	if new_desc.is_empty():
 		await _show_alert("A changelist needs a description.")
 		return
-	var result := await _p4_exec_spec(["change", "-i"], _replace_spec_description(spec_text, new_desc))
-	_log_exec_output(result)
+	await _p4_exec_spec(["change", "-i"], _replace_spec_description(spec_text, new_desc))
 	_request_refresh()
 
 
@@ -1787,10 +1785,12 @@ func _local_to_res(local_path: String) -> String:
 # _apply_changes() (see its doc comment).
 # ---------------------------------------------------------------------------
 
-## Async `p4 <args>` via the worker thread. Returns {exit_code, output}.
+## Async `p4 <args>` via the worker thread. Returns {exit_code, output}. Every
+## command and its output are logged (the log window is the troubleshooting view).
 func _p4_exec(args: PackedStringArray) -> Dictionary:
 	if _p4_thread == null:
-		return _p4_exec_sync(args) # Worker gone (shutdown) - degrade gracefully.
+		return _p4_exec_sync(args) # Worker gone (shutdown); it logs on its own.
+	_log_p4_cmd(args)
 	var req := P4Request.new()
 	req.args = args
 	_p4_inflight += 1
@@ -1801,17 +1801,14 @@ func _p4_exec(args: PackedStringArray) -> Dictionary:
 	if not req.completed:
 		await req.done
 	_p4_inflight -= 1
-	return {"exit_code": req.exit_code, "output": req.output}
-
-
-## Like _p4_exec(), logging the command line and its output to the dock (used
-## for the state-changing commands a user would want a record of: edit,
-## revert, sync - the fstat/opened probes stay quiet).
-func _p4_exec_logged(args: PackedStringArray) -> Dictionary:
-	_log("$ p4 " + " ".join(args))
-	var result: Dictionary = await _p4_exec(args)
-	_log_exec_output(result)
+	var result := {"exit_code": req.exit_code, "output": req.output}
+	_log_p4_result(result)
 	return result
+
+
+## Retained as a semantic alias; _p4_exec now logs every command and its output.
+func _p4_exec_logged(args: PackedStringArray) -> Dictionary:
+	return await _p4_exec(args)
 
 
 ## Run `p4 <args>` with `spec_text` fed on stdin (for `p4 change -i`). OS.execute
@@ -1822,11 +1819,14 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 	var tmp := _write_temp_spec(spec_text)
 	if tmp.is_empty():
 		return {"exit_code": -1, "output": ["Could not write a temporary p4 spec file."]}
+	_log_p4_cmd(args + PackedStringArray(["< (spec on stdin)"]))
 	if _p4_thread == null:
 		var out := []
 		var code := _p4_execute_with_stdin(args, tmp, out)
 		DirAccess.remove_absolute(tmp)
-		return {"exit_code": code, "output": out}
+		var sync_result := {"exit_code": code, "output": out}
+		_log_p4_result(sync_result)
+		return sync_result
 	var req := P4Request.new()
 	req.args = args
 	req.stdin_path = tmp
@@ -1839,7 +1839,9 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 		await req.done
 	_p4_inflight -= 1
 	DirAccess.remove_absolute(tmp)
-	return {"exit_code": req.exit_code, "output": req.output}
+	var result := {"exit_code": req.exit_code, "output": req.output}
+	_log_p4_result(result)
+	return result
 
 
 ## Runs on the worker thread: p4 through the platform shell with the spec file
@@ -1864,22 +1866,38 @@ func _write_temp_spec(spec_text: String) -> String:
 
 
 func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
+	_log_p4_cmd(args)
 	var output := []
 	var exit_code := OS.execute("p4", args, output, true)
-	return {"exit_code": exit_code, "output": output}
-
-
-func _p4_exec_logged_sync(args: PackedStringArray) -> Dictionary:
-	_log("$ p4 " + " ".join(args))
-	var result := _p4_exec_sync(args)
-	_log_exec_output(result)
+	var result := {"exit_code": exit_code, "output": output}
+	_log_p4_result(result)
 	return result
 
 
-func _log_exec_output(result: Dictionary) -> void:
+## Retained as a semantic alias; _p4_exec_sync now logs command and output.
+func _p4_exec_logged_sync(args: PackedStringArray) -> Dictionary:
+	return _p4_exec_sync(args)
+
+
+## Log a p4 invocation's command line (truncated if enormous, e.g. a `where`
+## over the whole opened set).
+func _log_p4_cmd(args: PackedStringArray) -> void:
+	var line := "$ p4 " + " ".join(args)
+	if line.length() > 400:
+		line = line.substr(0, 400) + " ... (%d args total)" % args.size()
+	_log(line)
+
+
+## Log a p4 result: its exit code when nonzero, then its (possibly truncated)
+## output. Verbose by design - the log window is where you troubleshoot p4.
+func _log_p4_result(result: Dictionary) -> void:
+	if int(result.get("exit_code", 0)) != 0:
+		_log("  (exit %d)" % int(result.exit_code))
 	if not result.output.is_empty():
 		var text := String(result.output[0]).strip_edges()
 		if not text.is_empty():
+			if text.length() > 2000:
+				text = text.substr(0, 2000) + "\n  ... (output truncated)"
 			_log(text)
 
 
