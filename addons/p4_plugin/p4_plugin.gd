@@ -69,6 +69,9 @@ const SETTINGS_SECTION := "p4_plugin"
 class P4Request extends RefCounted:
 	signal done
 	var args: PackedStringArray
+	# When set, p4 is run through the platform shell with this file redirected
+	# onto its stdin (for `p4 change -i`, whose spec input OS.execute can't feed).
+	var stdin_path: String = ""
 	var exit_code: int = -1
 	var output: Array = []
 	var completed: bool = false
@@ -88,6 +91,7 @@ var log_box: TextEdit
 var log_window: Window
 var tree: Tree
 var context_menu: PopupMenu
+var move_submenu: PopupMenu
 var reconcile_button: Button
 var revert_unchanged_button: Button
 var auto_checkout_checkbox: CheckBox
@@ -96,6 +100,12 @@ var checkout_on_save_checkbox: CheckBox
 # Metadata dict of the row a context-menu action targets (captured at right-click
 # so the action still knows its subject after the menu closes the selection).
 var _context_target: Dictionary = {}
+# The changelists from the last refresh - drives the "Move to Changelist" submenu
+# without a re-query.
+var _last_changelists: Array = []
+# Parallel to the move submenu's items: index -> target change key ("default", a
+# number, or "__new__"). Rebuilt each time the submenu is populated.
+var _move_targets: Array = []
 
 # Guards for the changelist-tree refresh coroutine. It awaits several p4 calls,
 # during which another mutation or a visibility event can fire - _refresh_inflight
@@ -728,6 +738,9 @@ func _build_dock() -> void:
 	_add_dock_button(button_row, "Refresh",
 			"Re-query Perforce and rebuild the changelist view.",
 			_on_refresh_pressed)
+	_add_dock_button(button_row, "New Changelist...",
+			"Create a new empty pending changelist.",
+			_on_new_changelist_pressed)
 	reconcile_button = _add_dock_button(button_row, "Reconcile...",
 			"Find files changed on disk and open them for add/edit/delete in Perforce.",
 			_on_reconcile_pressed)
@@ -877,6 +890,12 @@ func _build_tree() -> void:
 	context_menu.id_pressed.connect(_on_context_menu_id_pressed)
 	dock.add_child(context_menu)
 
+	# Submenu of "Move to Changelist". Items fire the submenu's own id_pressed
+	# (not the parent's), so route it through the same handler.
+	move_submenu = PopupMenu.new()
+	move_submenu.id_pressed.connect(_on_context_menu_id_pressed)
+	context_menu.add_child(move_submenu)
+
 
 ## Rebuild the whole tree from a model snapshot (see _query_pending_model). Cheap
 ## enough to clear-and-rebuild - the opened set is small and this only runs on
@@ -884,6 +903,7 @@ func _build_tree() -> void:
 func _rebuild_tree(model: Dictionary) -> void:
 	if tree == null:
 		return
+	_last_changelists = model.get("changelists", [])
 	tree.clear()
 	var root := tree.create_item()
 	if not model.get("available", false):
@@ -929,14 +949,18 @@ func _open_res_path(res_path: String) -> void:
 			get_editor_interface().edit_resource(res)
 
 
-# Context-menu action ids.
+# Context-menu action ids. Move-to-changelist items use CTX_MOVE_BASE + index
+# (into _move_targets) so a variable number of target changelists fit one menu.
 enum {
 	CTX_OPEN,
 	CTX_REVERT,
 	CTX_SYNC,
 	CTX_RELOAD,
 	CTX_REFRESH,
+	CTX_EDIT_DESC,
+	CTX_SUBMIT,
 }
+const CTX_MOVE_BASE := 1000
 
 
 func _on_tree_item_mouse_selected(_mouse_position: Vector2, mouse_button_index: int) -> void:
@@ -963,13 +987,36 @@ func _on_tree_empty_clicked(_click_position: Vector2, mouse_button_index: int) -
 ## popup so a headless self-test can assert the item set without a display.
 func _populate_context_menu(meta: Dictionary) -> void:
 	context_menu.clear()
-	if meta.get("type", "") == "file":
+	move_submenu.clear()
+	_move_targets.clear()
+	var kind: String = meta.get("type", "")
+	if kind == "file":
 		context_menu.add_item("Open", CTX_OPEN)
 		context_menu.add_item("Revert This File", CTX_REVERT)
 		context_menu.add_item("Sync This File", CTX_SYNC)
 		context_menu.add_item("Reload From Disk", CTX_RELOAD)
+		_populate_move_submenu(String(meta.get("change", "")))
+		context_menu.add_submenu_node_item("Move to Changelist", move_submenu)
 		context_menu.add_separator()
+	elif kind == "cl" and String(meta.get("change", "")) != "default":
+		context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
 	context_menu.add_item("Refresh", CTX_REFRESH)
+
+
+## Populate the Move-to-Changelist submenu with every pending changelist except
+## the file's current one, plus a New Changelist option. _move_targets maps each
+## item's id (CTX_MOVE_BASE + index) back to a target change key.
+func _populate_move_submenu(current_change: String) -> void:
+	for cl in _last_changelists:
+		if String(cl.change) == current_change:
+			continue
+		var label: String = "Default changelist" if cl.change == "default" \
+				else "#%s  %s" % [cl.change, cl.desc]
+		move_submenu.add_item(label, CTX_MOVE_BASE + _move_targets.size())
+		_move_targets.append(String(cl.change))
+	move_submenu.add_separator()
+	move_submenu.add_item("New Changelist...", CTX_MOVE_BASE + _move_targets.size())
+	_move_targets.append("__new__")
 
 
 func _show_context_menu(meta: Dictionary) -> void:
@@ -983,6 +1030,11 @@ func _show_context_menu(meta: Dictionary) -> void:
 
 func _on_context_menu_id_pressed(id: int) -> void:
 	var meta := _context_target
+	if id >= CTX_MOVE_BASE:
+		var idx := id - CTX_MOVE_BASE
+		if idx >= 0 and idx < _move_targets.size() and meta.has("res_path"):
+			await _move_file_to_changelist(meta.res_path, _move_targets[idx])
+		return
 	match id:
 		CTX_OPEN:
 			if meta.has("res_path"):
@@ -996,6 +1048,9 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_RELOAD:
 			if meta.has("res_path"):
 				_reload_path(meta.res_path)
+		CTX_EDIT_DESC:
+			if meta.has("change"):
+				await _edit_changelist_description(meta.change)
 		CTX_REFRESH:
 			_refresh_changelists()
 
@@ -1215,6 +1270,138 @@ func _revert_unchanged_flow() -> void:
 			_checked_out_this_session.erase(res)
 			_pending_save_checkout.erase(res)
 	_request_refresh()
+
+
+# ---------------------------------------------------------------------------
+# Changelist create / edit / move
+# ---------------------------------------------------------------------------
+
+func _on_new_changelist_pressed() -> void:
+	var res: Dictionary = await _show_input_dialog("New Changelist",
+			"Description for the new pending changelist:", "", true, "Create")
+	if not res.ok:
+		return
+	var desc := String(res.text).strip_edges()
+	if desc.is_empty():
+		await _show_alert("A changelist needs a description.")
+		return
+	var num := await _create_changelist(desc)
+	if num.is_empty():
+		await _show_alert("Could not create the changelist - see the P4 Log.")
+	_request_refresh()
+
+
+## Create an EMPTY pending changelist (no Files section in the spec, so nothing
+## moves into it) and return its number, or "" on failure.
+func _create_changelist(desc: String) -> String:
+	var spec := "Change: new\n\nDescription:\n" + _indent_spec_text(desc)
+	var result := await _p4_exec_spec(["change", "-i"], spec)
+	_log_exec_output(result)
+	return _parse_change_number(result)
+
+
+## Edit a numbered changelist's description in place. Round-trips the existing
+## spec (`change -o`) so Files/Jobs are preserved - only Description changes.
+func _edit_changelist_description(change: String) -> void:
+	var current := await _p4_exec(["change", "-o", change])
+	var spec_text := "" if current.output.is_empty() else String(current.output[0])
+	if spec_text.is_empty():
+		await _show_alert("Could not read changelist #%s - see the P4 Log." % change)
+		return
+	var res: Dictionary = await _show_input_dialog("Edit Changelist #%s" % change,
+			"Description:", _extract_spec_description(spec_text), true, "Save")
+	if not res.ok:
+		return
+	var new_desc := String(res.text).strip_edges()
+	if new_desc.is_empty():
+		await _show_alert("A changelist needs a description.")
+		return
+	var result := await _p4_exec_spec(["change", "-i"], _replace_spec_description(spec_text, new_desc))
+	_log_exec_output(result)
+	_request_refresh()
+
+
+## Move a file to another changelist via `p4 reopen -c`. `change` is "default", a
+## number, or "__new__" to create a changelist first and move into that.
+func _move_file_to_changelist(res_path: String, change: String) -> void:
+	var target := change
+	if target == "__new__":
+		var res: Dictionary = await _show_input_dialog("New Changelist",
+				"Description for the changelist to move the file into:", "", true, "Create & Move")
+		if not res.ok:
+			return
+		var desc := String(res.text).strip_edges()
+		if desc.is_empty():
+			await _show_alert("A changelist needs a description.")
+			return
+		target = await _create_changelist(desc)
+		if target.is_empty():
+			await _show_alert("Could not create the changelist - see the P4 Log.")
+			return
+	await _p4_exec_logged(["reopen", "-c", target, ProjectSettings.globalize_path(res_path)])
+	_request_refresh()
+
+
+## Indent each line of `text` with a tab, as p4 spec field values require.
+func _indent_spec_text(text: String) -> String:
+	var out := ""
+	for line in text.split("\n"):
+		out += "\t" + line + "\n"
+	return out
+
+
+## Pull the Description field's text out of a `change -o` spec (leading tab of
+## each content line removed). Comment lines (`#...`) never match the field line.
+func _extract_spec_description(spec_text: String) -> String:
+	var lines := spec_text.split("\n")
+	var i := 0
+	var desc_lines: Array = []
+	while i < lines.size():
+		if lines[i].begins_with("Description:"):
+			i += 1
+			while i < lines.size() and (lines[i].begins_with("\t") or lines[i].begins_with(" ")):
+				var content: String = lines[i]
+				content = content.substr(1) if content.begins_with("\t") else content.strip_edges()
+				desc_lines.append(content)
+				i += 1
+			break
+		i += 1
+	return "\n".join(desc_lines)
+
+
+## Return a copy of `spec_text` with its Description block replaced by new_desc
+## (tab-indented). Everything else - Files, Jobs, comments - is preserved.
+func _replace_spec_description(spec_text: String, new_desc: String) -> String:
+	var lines := spec_text.split("\n")
+	var out: Array = []
+	var i := 0
+	var replaced := false
+	while i < lines.size():
+		if not replaced and lines[i].begins_with("Description:"):
+			out.append("Description:")
+			for dl in new_desc.split("\n"):
+				out.append("\t" + dl)
+			i += 1
+			# Drop the old indented description lines; stop at the next field
+			# (non-indented) or a blank separator, which is left intact.
+			while i < lines.size() and (lines[i].begins_with("\t") or lines[i].begins_with(" ")):
+				i += 1
+			replaced = true
+			continue
+		out.append(lines[i])
+		i += 1
+	return "\n".join(out)
+
+
+## Extract the changelist number from p4 output like "Change 3064 created." /
+## "Change 3064 submitted." Returns "" if none is present.
+func _parse_change_number(result: Dictionary) -> String:
+	if result.output.is_empty():
+		return ""
+	var re := RegEx.new()
+	re.compile("Change (\\d+)")
+	var m := re.search(String(result.output[0]))
+	return m.get_string(1) if m else ""
 
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1675,55 @@ func _p4_exec_logged(args: PackedStringArray) -> Dictionary:
 	return result
 
 
+## Run `p4 <args>` with `spec_text` fed on stdin (for `p4 change -i`). OS.execute
+## has no stdin, so the spec is written to a temp file and p4 is run through the
+## platform shell with the file redirected in. Goes through the same worker queue
+## as _p4_exec so it stays serialized; resumes on the main thread.
+func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
+	var tmp := _write_temp_spec(spec_text)
+	if tmp.is_empty():
+		return {"exit_code": -1, "output": ["Could not write a temporary p4 spec file."]}
+	if _p4_thread == null:
+		var out := []
+		var code := _p4_execute_with_stdin(args, tmp, out)
+		DirAccess.remove_absolute(tmp)
+		return {"exit_code": code, "output": out}
+	var req := P4Request.new()
+	req.args = args
+	req.stdin_path = tmp
+	_p4_inflight += 1
+	_p4_queue_mutex.lock()
+	_p4_queue.push_back(req)
+	_p4_queue_mutex.unlock()
+	_p4_queue_semaphore.post()
+	if not req.completed:
+		await req.done
+	_p4_inflight -= 1
+	DirAccess.remove_absolute(tmp)
+	return {"exit_code": req.exit_code, "output": req.output}
+
+
+## Runs on the worker thread: p4 through the platform shell with the spec file
+## on stdin. Uses only OS + its args (no plugin state) so it is thread-safe.
+func _p4_execute_with_stdin(args: PackedStringArray, stdin_path: String, output: Array) -> int:
+	if OS.get_name() == "Windows":
+		var cmd := "p4 " + " ".join(args) + " < \"" + stdin_path.replace("/", "\\") + "\""
+		return OS.execute("cmd.exe", ["/c", cmd], output, true)
+	var sh_cmd := "p4 " + " ".join(args) + " < '" + stdin_path + "'"
+	return OS.execute("sh", ["-c", sh_cmd], output, true)
+
+
+func _write_temp_spec(spec_text: String) -> String:
+	var path := OS.get_cache_dir().path_join("p4_spec_%d.txt" % Time.get_ticks_usec())
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		_log("Could not open a temp spec file at '%s'." % path)
+		return ""
+	f.store_string(spec_text)
+	f.close()
+	return path
+
+
 func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
 	var output := []
 	var exit_code := OS.execute("p4", args, output, true)
@@ -1566,7 +1802,10 @@ func _p4_worker_loop() -> void:
 		var req: P4Request = _p4_queue.pop_front()
 		_p4_queue_mutex.unlock()
 		var output := []
-		req.exit_code = OS.execute("p4", req.args, output, true)
+		if req.stdin_path.is_empty():
+			req.exit_code = OS.execute("p4", req.args, output, true)
+		else:
+			req.exit_code = _p4_execute_with_stdin(req.args, req.stdin_path, output)
 		req.output = output
 		req.call_deferred("_finish")
 
@@ -1616,6 +1855,65 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 	_discard_dialog(dialog)
 	_dialog_busy = false
 	return _dialog_result_confirmed
+
+
+## Shows a modal dialog with a text field and returns {ok: bool, text: String}.
+## Used for changelist descriptions. Serialized through the same _dialog_busy
+## lock as the other dialogs. `multiline` picks a TextEdit vs a LineEdit.
+func _show_input_dialog(title: String, message: String, default_text: String,
+		multiline: bool, ok_text: String) -> Dictionary:
+	if _shutting_down:
+		return {"ok": false, "text": ""}
+	while _dialog_busy:
+		await get_tree().process_frame
+	_dialog_busy = true
+	_dialog_result_ready = false
+	_dialog_result_confirmed = false
+
+	var dialog := ConfirmationDialog.new()
+	dialog.title = title
+	dialog.set_ok_button_text(ok_text)
+	var vbox := VBoxContainer.new()
+	var label := Label.new()
+	label.text = message
+	vbox.add_child(label)
+	var input: Control
+	if multiline:
+		var te := TextEdit.new()
+		te.text = default_text
+		te.custom_minimum_size = Vector2(420, 120)
+		te.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		vbox.add_child(te)
+		input = te
+	else:
+		var le := LineEdit.new()
+		le.text = default_text
+		le.custom_minimum_size = Vector2(420, 0)
+		vbox.add_child(le)
+		input = le
+	# Adding CONTENT children to the dialog is fine (and required); the
+	# don't-parent-first caveat in _show_confirm_dialog is about the dialog node.
+	dialog.add_child(vbox)
+	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	dialog.canceled.connect(_on_confirm_dialog_canceled)
+	dialog.close_requested.connect(_on_confirm_dialog_canceled)
+	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+
+	if not _selftest_auto_answer.is_empty():
+		await get_tree().process_frame
+		if is_instance_valid(dialog):
+			if _selftest_auto_answer == "confirm":
+				dialog.confirmed.emit()
+			else:
+				dialog.canceled.emit()
+
+	while not _dialog_result_ready:
+		await get_tree().process_frame
+	var confirmed := _dialog_result_confirmed
+	var text: String = input.text if (confirmed and is_instance_valid(input)) else ""
+	_discard_dialog(dialog)
+	_dialog_busy = false
+	return {"ok": confirmed, "text": text}
 
 
 ## Shows a modal OK-only notice (checkout failures and other conditions the
@@ -1832,6 +2130,30 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] revert-unchanged preview: %d file(s)" % preview.size())
 			for rec in preview:
 				_log("[selftest]   -> %s" % _local_to_res(String(rec.get("clientFile", ""))))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-build-change-spec":
+			# Server-independent: replace a spec's Description, keep its Files.
+			var template := "Change:\t123\n\nUser:\tbob\n\nDescription:\n\told line\n\nFiles:\n\t//depot/a\t# edit\n"
+			var extracted := _extract_spec_description(template)
+			var edited := _replace_spec_description(template, "new desc\nsecond")
+			_log("[selftest] extracted-desc=%s" % extracted.replace("\n", "|"))
+			var ok := extracted == "old line" and edited.contains("new desc") \
+					and edited.contains("second") and edited.contains("//depot/a") \
+					and not edited.contains("old line")
+			_log("[selftest] %s: build-change-spec" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-create-changelist":
+			# Live: exercise the full stdin-spec plumbing, then clean up.
+			var num := await _create_changelist("[P4 selftest] temp CL - safe to delete")
+			_log("[selftest] created CL=%s" % num)
+			if not num.is_empty():
+				var del := await _p4_exec_logged(["change", "-d", num])
+				_log("[selftest] cleanup delete exit=%d" % del.exit_code)
+				_log("[selftest] %s: create-changelist" % ("PASS" if del.exit_code == 0 else "FAIL"))
+			else:
+				_log("[selftest] FAIL: create-changelist (no number returned)")
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-checkout="):
