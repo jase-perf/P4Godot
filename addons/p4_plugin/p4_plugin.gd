@@ -1024,6 +1024,48 @@ func _log_exec_output(result: Dictionary) -> void:
 			_log(text)
 
 
+## Parse tagged (`p4 -ztag <cmd>`) output into an Array of Dictionaries, one per
+## record. Records are separated by blank lines; each field is a `... key value`
+## line; a value that spans multiple lines (notably a changelist `desc`)
+## continues on the following un-prefixed lines. Robustness notes learned from
+## real p4.exe output:
+## - p4.exe emits CRLF, so every line is rstrip("\r")'d before inspection (the
+##   plain-text parsers elsewhere survive on strip_edges(); a key/value parser
+##   does not get that for free).
+## - OS.execute() runs with read_stderr=true, so stray p4 error/info lines
+##   ("... - file(s) not opened on this client.") can share the blob. Non-"... "
+##   lines are treated as continuations ONLY while a record is open, so a stray
+##   error line before any field is ignored rather than corrupting a value.
+func _parse_ztag(result: Dictionary) -> Array:
+	var records: Array = []
+	if result.output.is_empty():
+		return records
+	var current: Dictionary = {}
+	var last_key: String = ""
+	for raw_line in String(result.output[0]).split("\n"):
+		var line: String = raw_line.rstrip("\r")
+		if line.strip_edges().is_empty():
+			if not current.is_empty():
+				records.append(current)
+				current = {}
+				last_key = ""
+			continue
+		if line.begins_with("... "):
+			var rest: String = line.substr(4)
+			var sp: int = rest.find(" ")
+			if sp == -1:
+				current[rest] = ""
+				last_key = rest
+			else:
+				last_key = rest.substr(0, sp)
+				current[last_key] = rest.substr(sp + 1)
+		elif not current.is_empty() and not last_key.is_empty():
+			current[last_key] = String(current[last_key]) + "\n" + line
+	if not current.is_empty():
+		records.append(current)
+	return records
+
+
 ## Worker thread body: drain the queue in FIFO order, one command at a time.
 ## Results are handed back to the main thread via call_deferred - the worker
 ## itself never touches plugin state.
@@ -1232,6 +1274,27 @@ func _run_cli_self_test_if_requested() -> void:
 	await _ensure_identity()
 
 	for arg in OS.get_cmdline_user_args():
+		if arg == "--p4-selftest-parse-ztag":
+			# Server-independent: feed a canned tagged blob (CRLF line endings, a
+			# blank-line record separator, and a multi-line desc continuation) to
+			# _parse_ztag and assert the structure it recovers.
+			var blob := "... action edit\r\n... change default\r\n\r\n" \
+					+ "... change 123\r\n... desc first line\r\nsecond line\r\n... user bob\r\n"
+			var recs := _parse_ztag({"exit_code": 0, "output": [blob]})
+			_log("[selftest] ztag records: %d" % recs.size())
+			if recs.size() == 2:
+				_log("[selftest] rec0 action=%s change=%s" % [recs[0].get("action", "?"), recs[0].get("change", "?")])
+				var desc_lines := String(recs[1].get("desc", "")).split("\n").size()
+				_log("[selftest] rec1 change=%s desc-lines=%d" % [recs[1].get("change", "?"), desc_lines])
+				if recs[0].get("action") == "edit" and recs[0].get("change") == "default" \
+						and recs[1].get("change") == "123" and desc_lines == 2:
+					_log("[selftest] PASS: parse-ztag")
+				else:
+					_log("[selftest] FAIL: parse-ztag field mismatch")
+			else:
+				_log("[selftest] FAIL: parse-ztag expected 2 records")
+			get_tree().quit()
+			return
 		if arg.begins_with("--p4-selftest-checkout="):
 			var path := arg.substr("--p4-selftest-checkout=".length())
 			_log("[selftest] Forcing checkout of '%s'" % path)
