@@ -86,8 +86,16 @@ signal identity_checked
 var dock: VBoxContainer
 var log_box: TextEdit
 var log_window: Window
+var tree: Tree
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
+
+# Guards for the changelist-tree refresh coroutine. It awaits several p4 calls,
+# during which another mutation or a visibility event can fire - _refresh_inflight
+# coalesces those into a single in-flight refresh plus at most one re-run
+# (_refresh_pending), so the tree can't end stale and clicks can't stack.
+var _refresh_inflight: bool = false
+var _refresh_pending: bool = false
 
 # False when `p4 info` failed at startup (p4 missing/unconfigured). All
 # automatic hooks bail out early so the plugin never issues doomed p4 calls.
@@ -710,6 +718,9 @@ func _build_dock() -> void:
 	# the user leaves it in a narrow side slot, floats it, or widens it.
 	var button_row := HFlowContainer.new()
 	dock.add_child(button_row)
+	_add_dock_button(button_row, "Refresh",
+			"Re-query Perforce and rebuild the changelist view.",
+			_on_refresh_pressed)
 	_add_dock_button(button_row, "Checkout Current File",
 			"Run 'p4 edit' on the current scene or script.",
 			_on_checkout_current_pressed)
@@ -743,6 +754,8 @@ func _build_dock() -> void:
 	checkout_on_save_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(checkout_on_save_checkbox)
 
+	_build_tree()
+
 	# The log lives in its own on-demand Window rather than eating dock space -
 	# the toolbar "Log" button toggles it. log_box stays a member (so _log() is
 	# untouched) and exists from here on regardless of the window's visibility.
@@ -753,6 +766,12 @@ func _build_dock() -> void:
 	# DOCK_SLOT_BOTTOM keeps the familiar default placement (4.7+ treats the
 	# bottom area as a dock slot).
 	add_control_to_dock(EditorPlugin.DOCK_SLOT_BOTTOM, dock)
+
+	# Refresh when the dock tab is brought to front (cheap, coalesced), and once
+	# now - the deferred refresh awaits the startup identity check, so it fills
+	# in as soon as `p4 info` resolves.
+	dock.visibility_changed.connect(_on_dock_visibility_changed)
+	_request_refresh()
 
 
 func _add_dock_button(parent: Control, text: String, tooltip: String, handler: Callable) -> void:
@@ -815,6 +834,132 @@ func _on_toggle_log_pressed() -> void:
 
 func _on_log_window_close_requested() -> void:
 	log_window.hide()
+
+
+# ---------------------------------------------------------------------------
+# Changelist tree
+# ---------------------------------------------------------------------------
+
+func _build_tree() -> void:
+	tree = Tree.new()
+	tree.hide_root = true
+	tree.columns = 2
+	tree.set_column_title(0, "Changelist / File")
+	tree.set_column_title(1, "Action")
+	tree.set_column_titles_visible(true)
+	tree.set_column_expand(0, true)
+	tree.set_column_expand(1, false)
+	tree.set_column_custom_minimum_width(1, 90)
+	tree.allow_rmb_select = true # so right-click selects the row under the cursor
+	tree.select_mode = Tree.SELECT_ROW
+	tree.custom_minimum_size = Vector2(0, 180)
+	tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	tree.item_activated.connect(_on_tree_item_activated)
+	dock.add_child(tree)
+
+
+## Rebuild the whole tree from a model snapshot (see _query_pending_model). Cheap
+## enough to clear-and-rebuild - the opened set is small and this only runs on
+## refresh, not per frame.
+func _rebuild_tree(model: Dictionary) -> void:
+	if tree == null:
+		return
+	tree.clear()
+	var root := tree.create_item()
+	if not model.get("available", false):
+		var row := tree.create_item(root)
+		row.set_text(0, "Perforce unavailable - see the P4 Log.")
+		row.set_selectable(0, false)
+		return
+	for cl in model.changelists:
+		var cl_item := tree.create_item(root)
+		var label: String = "Default changelist" if cl.change == "default" \
+				else "#%s  %s" % [cl.change, cl.desc]
+		cl_item.set_text(0, label)
+		cl_item.set_text(1, "(%d)" % cl.files.size())
+		cl_item.set_selectable(1, false)
+		cl_item.set_metadata(0, {"type": "cl", "change": cl.change, "desc": cl.desc})
+		for f in cl.files:
+			var f_item := tree.create_item(cl_item)
+			f_item.set_text(0, f.res_path)
+			f_item.set_text(1, f.action)
+			f_item.set_selectable(1, false)
+			f_item.set_metadata(0, {"type": "file", "res_path": f.res_path,
+					"depot_path": f.depot_path, "action": f.action, "change": f.change})
+
+
+## Open the double-clicked / Enter-activated file row in the editor.
+func _on_tree_item_activated() -> void:
+	var item := tree.get_selected()
+	if item == null:
+		return
+	var meta: Variant = item.get_metadata(0)
+	if typeof(meta) != TYPE_DICTIONARY or meta.get("type") != "file":
+		return
+	_open_res_path(meta.res_path)
+
+
+func _open_res_path(res_path: String) -> void:
+	var ext := res_path.get_extension().to_lower()
+	if ext == "tscn" or ext == "scn":
+		get_editor_interface().open_scene_from_path(res_path)
+	else:
+		var res := ResourceLoader.load(res_path)
+		if res:
+			get_editor_interface().edit_resource(res)
+
+
+func _on_refresh_pressed() -> void:
+	_refresh_changelists()
+
+
+func _on_dock_visibility_changed() -> void:
+	if dock and dock.is_visible_in_tree():
+		_request_refresh()
+
+
+## Fire-and-forget refresh request, safe to call from synchronous contexts (e.g.
+## _apply_changes) and from bursts of mutations - it defers to next frame and the
+## coroutine below coalesces. No-op once p4 is known unavailable.
+func _request_refresh() -> void:
+	if _identity_checked and not _p4_available:
+		return
+	call_deferred("_refresh_changelists")
+
+
+## Re-query Perforce and rebuild the tree. Coalescing: a refresh requested while
+## one is in flight sets _refresh_pending, and the in-flight run loops once more
+## instead of a second coroutine stacking up.
+func _refresh_changelists() -> void:
+	if tree == null or _shutting_down:
+		return
+	if _refresh_inflight:
+		_refresh_pending = true
+		return
+	_refresh_inflight = true
+	while true:
+		_refresh_pending = false
+		if not await _ensure_identity():
+			_rebuild_tree({"available": false, "changelists": []})
+		else:
+			var model: Dictionary = await _query_pending_model()
+			if tree == null or _shutting_down:
+				break
+			_rebuild_tree(model)
+			_fold_opened_into_cache(model)
+		if not _refresh_pending:
+			break
+	_refresh_inflight = false
+
+
+## Every file Perforce reports as opened is, by definition, checked out by us -
+## fold them into the session cache so a refresh right after a reconcile (or any
+## external checkout) suppresses redundant edit-time prompts. Additive only;
+## removal stays with the explicit revert paths.
+func _fold_opened_into_cache(model: Dictionary) -> void:
+	for cl in model.get("changelists", []):
+		for f in cl.files:
+			_checked_out_this_session[f.res_path] = true
 
 
 # ---------------------------------------------------------------------------
@@ -1445,6 +1590,26 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] CL %s: %d file(s) - %s" % [cl.change, cl.files.size(), cl.desc])
 				for f in cl.files:
 					_log("[selftest] opened: %s (%s) cl=%s" % [f.res_path, f.action, f.change])
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-tree":
+			# Live: refresh and walk the built Tree (items exist in memory even
+			# headless) to confirm _rebuild_tree populated CLs and file rows.
+			while _refresh_inflight: # let the initial _build_dock refresh settle
+				await get_tree().process_frame
+			await _refresh_changelists()
+			var root := tree.get_root()
+			var cl_count := 0
+			var file_count := 0
+			var cl_item: TreeItem = root.get_first_child() if root else null
+			while cl_item != null:
+				cl_count += 1
+				var f_item := cl_item.get_first_child()
+				while f_item != null:
+					file_count += 1
+					f_item = f_item.get_next()
+				cl_item = cl_item.get_next()
+			_log("[selftest] tree changelists=%d files=%d" % [cl_count, file_count])
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-checkout="):
