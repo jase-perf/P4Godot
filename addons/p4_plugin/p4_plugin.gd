@@ -1344,23 +1344,72 @@ func _revert_unchanged_flow() -> void:
 	if preview.is_empty():
 		await _show_alert("No open-but-unchanged files to revert.")
 		return
+
+	# A file "unchanged" on disk can still have UNSAVED edits held only in an open
+	# editor tab (the checkout-on-edit prompt fires before you save). Reverting it
+	# would silently drop the checkout out from under those pending changes. So
+	# skip any file currently open in the editor - the only files that can carry
+	# in-memory edits - and revert just the rest. (Open-but-unmodified files are
+	# skipped too; revert those individually via the tree if you want.)
+	var open_files := _open_editor_files()
+	var to_revert: Array = []
+	var skipped: Array = []
+	for rec in preview:
+		var res := _local_to_res(String(rec.get("clientFile", "")))
+		if not res.is_empty() and open_files.has(res):
+			skipped.append(res)
+		else:
+			to_revert.append(rec)
+
+	if to_revert.is_empty():
+		await _show_alert(("All %d open-but-unchanged file(s) are open in the editor and were " +
+				"skipped to protect unsaved changes. Close a file (or revert it from the tree) " +
+				"if you really mean to revert it.") % skipped.size())
+		return
+
+	var note := ""
+	if not skipped.is_empty():
+		note = "\n\n(%d file(s) open in the editor were skipped to protect unsaved changes.)" % skipped.size()
 	var proceed: bool = await _show_confirm_dialog(
 			("%d open file(s) have no actual changes.\n\nRevert them? This closes them in " +
-			"Perforce (they leave your changelist); your on-disk files are untouched.")
-			% preview.size(),
+			"Perforce (they leave your changelist); your on-disk files are untouched.%s")
+			% [to_revert.size(), note],
 			"Revert Unchanged", "Cancel")
 	if not proceed:
 		_log("Revert Unchanged cancelled.")
 		return
-	await _p4_exec_logged(["revert", "-a", _project_scope()])
+
+	# Revert only the specific non-open files (`revert -a <file>...`), not the
+	# whole scope, so the skipped open files keep their checkout.
+	var revert_args: PackedStringArray = ["revert", "-a"]
+	for rec in to_revert:
+		revert_args.append(String(rec.get("clientFile", "")))
+	await _p4_exec_logged(revert_args)
 	# Reverted files are no longer opened - drop them from the caches so a later
-	# edit re-prompts. `revert -n`'s clientFile is already a local OS path.
-	for rec in preview:
+	# edit re-prompts.
+	for rec in to_revert:
 		var res := _local_to_res(String(rec.get("clientFile", "")))
 		if not res.is_empty():
 			_checked_out_this_session.erase(res)
 			_pending_save_checkout.erase(res)
 	_request_refresh()
+
+
+## res:// paths of every file currently open in the editor (open scenes, open
+## scripts, and the inspector-edited resource) - i.e. the files that could hold
+## unsaved in-memory changes. Used to keep Revert Unchanged from reverting a file
+## whose edits haven't been written to disk yet.
+func _open_editor_files() -> Dictionary:
+	var open: Dictionary = {}
+	for scene_path in get_editor_interface().get_open_scenes():
+		open[String(scene_path)] = true
+	for scr in get_editor_interface().get_script_editor().get_open_scripts():
+		if scr and not scr.resource_path.is_empty():
+			open[scr.resource_path] = true
+	var edited := get_editor_interface().get_inspector().get_edited_object()
+	if edited is Resource and not edited.resource_path.is_empty():
+		open[edited.resource_path] = true
+	return open
 
 
 # ---------------------------------------------------------------------------
@@ -2365,6 +2414,25 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] revert-unchanged preview: %d file(s)" % preview.size())
 			for rec in preview:
 				_log("[selftest]   -> %s" % _local_to_res(String(rec.get("clientFile", ""))))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-revert-unchanged-skip":
+			# Live, non-destructive: verify open-editor files are split out of the
+			# revert set so their unsaved in-memory edits are protected.
+			var preview := await _revert_unchanged_preview()
+			var open_files := _open_editor_files()
+			_log("[selftest] open editor files: %d" % open_files.size())
+			var revertable := 0
+			var skipped := 0
+			for rec in preview:
+				var res := _local_to_res(String(rec.get("clientFile", "")))
+				if not res.is_empty() and open_files.has(res):
+					skipped += 1
+					_log("[selftest] skip (open): %s" % res)
+				else:
+					revertable += 1
+			_log("[selftest] revert-unchanged: preview=%d revertable=%d skipped=%d"
+					% [preview.size(), revertable, skipped])
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-build-change-spec":
