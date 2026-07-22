@@ -998,8 +998,10 @@ func _populate_context_menu(meta: Dictionary) -> void:
 		_populate_move_submenu(String(meta.get("change", "")))
 		context_menu.add_submenu_node_item("Move to Changelist", move_submenu)
 		context_menu.add_separator()
-	elif kind == "cl" and String(meta.get("change", "")) != "default":
-		context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
+	elif kind == "cl":
+		context_menu.add_item("Submit Changelist...", CTX_SUBMIT)
+		if String(meta.get("change", "")) != "default":
+			context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
 	context_menu.add_item("Refresh", CTX_REFRESH)
 
 
@@ -1051,6 +1053,9 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_EDIT_DESC:
 			if meta.has("change"):
 				await _edit_changelist_description(meta.change)
+		CTX_SUBMIT:
+			if meta.get("type") == "cl":
+				await _submit_changelist_from_meta(meta)
 		CTX_REFRESH:
 			_refresh_changelists()
 
@@ -1402,6 +1407,87 @@ func _parse_change_number(result: Dictionary) -> String:
 	re.compile("Change (\\d+)")
 	var m := re.search(String(result.output[0]))
 	return m.get_string(1) if m else ""
+
+
+# ---------------------------------------------------------------------------
+# Submit
+# ---------------------------------------------------------------------------
+
+## Resolve the files for the right-clicked changelist row (from the last refresh)
+## and submit it.
+func _submit_changelist_from_meta(meta: Dictionary) -> void:
+	var change := String(meta.get("change", ""))
+	var files: Array = []
+	for cl in _last_changelists:
+		if String(cl.change) == change:
+			files = cl.files
+			break
+	await _submit_changelist(change, files)
+
+
+## Submit a changelist. Irreversible and team-visible, so it always ends at an
+## explicit confirmation that lists the exact files and the description. Numbered
+## changelists submit by number (`submit -c`, using their own description); the
+## default changelist prompts for a description and submits its project-scoped
+## files (`submit -d <desc> <scope>`).
+func _submit_changelist(change: String, files: Array) -> void:
+	if not await _ensure_identity():
+		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		return
+	if files.is_empty():
+		await _show_alert("This changelist has no files to submit.")
+		return
+
+	var desc := ""
+	if change == "default":
+		var input: Dictionary = await _show_input_dialog("Submit Default Changelist",
+				"Description for this submission:", "", true, "Continue")
+		if not input.ok:
+			return
+		desc = String(input.text).strip_edges()
+		if desc.is_empty():
+			await _show_alert("A submission needs a description.")
+			return
+	else:
+		var spec := await _p4_exec(["change", "-o", change])
+		desc = _extract_spec_description("" if spec.output.is_empty() else String(spec.output[0]))
+
+	# The irreversibility gate: show exactly what will land in the depot.
+	var file_lines: Array = []
+	var shown: int = mini(files.size(), 20)
+	for i in range(shown):
+		file_lines.append("    %s  (%s)" % [files[i].res_path, files[i].action])
+	if files.size() > shown:
+		file_lines.append("    ...and %d more" % (files.size() - shown))
+	var label := "the default changelist" if change == "default" else "changelist #%s" % change
+	var proceed: bool = await _show_confirm_dialog(
+			("Submit %s to Perforce?\n\nDescription:\n%s\n\nFiles (%d):\n%s\n\n" +
+			"This is permanent and visible to your whole team.")
+			% [label, desc, files.size(), "\n".join(file_lines)],
+			"Submit to Perforce", "Cancel")
+	if not proceed:
+		_log("Submit cancelled.")
+		return
+
+	var result: Dictionary
+	if change == "default":
+		result = await _p4_exec_logged(["submit", "-d", desc, _project_scope()])
+	else:
+		result = await _p4_exec_logged(["submit", "-c", change])
+
+	if result.exit_code == 0:
+		var submitted := _parse_change_number(result)
+		_log("Submit complete." if submitted.is_empty() else "Submitted as change %s." % submitted)
+		# Submitted files are no longer opened - drop them from the caches.
+		for f in files:
+			_checked_out_this_session.erase(f.res_path)
+			_pending_save_checkout.erase(f.res_path)
+	else:
+		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+		await _show_alert(("Submit failed:\n\n%s\n\nThe changelist is unchanged. Common causes: " +
+				"files are out of date and need syncing/resolving first, or the server rejected " +
+				"the change.") % msg)
+	_request_refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -2112,10 +2198,12 @@ func _run_cli_self_test_if_requested() -> void:
 			return
 		if arg == "--p4-selftest-context-menu":
 			# Server-independent: assert the per-row menu item sets.
-			_populate_context_menu({"type": "file", "res_path": "res://x.gd"})
+			_populate_context_menu({"type": "file", "res_path": "res://x.gd", "change": "default"})
 			_log("[selftest] file-menu items=%d" % context_menu.item_count)
 			_populate_context_menu({"type": "cl", "change": "default"})
-			_log("[selftest] cl-menu items=%d" % context_menu.item_count)
+			_log("[selftest] default-cl-menu items=%d" % context_menu.item_count)
+			_populate_context_menu({"type": "cl", "change": "123", "desc": "wip"})
+			_log("[selftest] numbered-cl-menu items=%d" % context_menu.item_count)
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-reconcile-preview":
