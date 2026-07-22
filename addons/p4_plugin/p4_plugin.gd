@@ -88,6 +88,8 @@ var log_box: TextEdit
 var log_window: Window
 var tree: Tree
 var context_menu: PopupMenu
+var reconcile_button: Button
+var revert_unchanged_button: Button
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 
@@ -726,6 +728,12 @@ func _build_dock() -> void:
 	_add_dock_button(button_row, "Refresh",
 			"Re-query Perforce and rebuild the changelist view.",
 			_on_refresh_pressed)
+	reconcile_button = _add_dock_button(button_row, "Reconcile...",
+			"Find files changed on disk and open them for add/edit/delete in Perforce.",
+			_on_reconcile_pressed)
+	revert_unchanged_button = _add_dock_button(button_row, "Revert Unchanged...",
+			"Revert opened files that have no actual changes (p4 revert -a).",
+			_on_revert_unchanged_pressed)
 	_add_dock_button(button_row, "Checkout Current File",
 			"Run 'p4 edit' on the current scene or script.",
 			_on_checkout_current_pressed)
@@ -779,12 +787,13 @@ func _build_dock() -> void:
 	_request_refresh()
 
 
-func _add_dock_button(parent: Control, text: String, tooltip: String, handler: Callable) -> void:
+func _add_dock_button(parent: Control, text: String, tooltip: String, handler: Callable) -> Button:
 	var button := Button.new()
 	button.text = text
 	button.tooltip_text = tooltip
 	button.pressed.connect(handler)
 	parent.add_child(button)
+	return button
 
 
 func _log(text: String) -> void:
@@ -1114,6 +1123,98 @@ func _on_reload_current_pressed() -> void:
 		_log("No current scene/script with a saved path to reload.")
 		return
 	_reload_path(path)
+
+
+# ---------------------------------------------------------------------------
+# Workspace operations: Reconcile and Revert Unchanged (scoped to res://)
+# ---------------------------------------------------------------------------
+
+## The project subtree as a p4 recursive path argument (the res:// root + "...").
+## Bounds both operations to the Godot project even when the P4 workspace is
+## wider, and P4IGNORE still applies on top.
+func _project_scope() -> String:
+	var root := ProjectSettings.globalize_path("res://")
+	if not (root.ends_with("/") or root.ends_with("\\")):
+		root += "/"
+	return root + "..."
+
+
+## Non-mutating preview (`reconcile -n`) of what reconcile would open. Kept
+## separate so a self-test can exercise it without changing anything.
+func _reconcile_preview() -> Array:
+	return _parse_ztag(await _p4_exec(["-ztag", "reconcile", "-n", _project_scope()]))
+
+
+## Non-mutating preview (`revert -a -n`) of the open-but-unchanged files.
+func _revert_unchanged_preview() -> Array:
+	return _parse_ztag(await _p4_exec(["-ztag", "revert", "-a", "-n", _project_scope()]))
+
+
+func _on_reconcile_pressed() -> void:
+	await _reconcile_flow()
+
+
+func _reconcile_flow() -> void:
+	if not await _ensure_identity():
+		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		return
+	var preview := await _reconcile_preview()
+	if preview.is_empty():
+		await _show_alert("Reconcile found nothing to open - the workspace already matches Perforce.")
+		return
+	var adds := 0
+	var edits := 0
+	var deletes := 0
+	for rec in preview:
+		var action := String(rec.get("action", ""))
+		if action.contains("delete"):
+			deletes += 1
+		elif action.contains("add"):
+			adds += 1
+		else:
+			edits += 1
+	var proceed: bool = await _show_confirm_dialog(
+			("Perforce reconcile found %d change(s) on disk:\n\n" +
+			"    add: %d\n    edit: %d\n    delete: %d\n\n" +
+			"Open these files in Perforce? Your files on disk are not modified.")
+			% [preview.size(), adds, edits, deletes],
+			"Reconcile", "Cancel")
+	if not proceed:
+		_log("Reconcile cancelled.")
+		return
+	await _p4_exec_logged(["reconcile", _project_scope()])
+	_request_refresh()
+
+
+func _on_revert_unchanged_pressed() -> void:
+	await _revert_unchanged_flow()
+
+
+func _revert_unchanged_flow() -> void:
+	if not await _ensure_identity():
+		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		return
+	var preview := await _revert_unchanged_preview()
+	if preview.is_empty():
+		await _show_alert("No open-but-unchanged files to revert.")
+		return
+	var proceed: bool = await _show_confirm_dialog(
+			("%d open file(s) have no actual changes.\n\nRevert them? This closes them in " +
+			"Perforce (they leave your changelist); your on-disk files are untouched.")
+			% preview.size(),
+			"Revert Unchanged", "Cancel")
+	if not proceed:
+		_log("Revert Unchanged cancelled.")
+		return
+	await _p4_exec_logged(["revert", "-a", _project_scope()])
+	# Reverted files are no longer opened - drop them from the caches so a later
+	# edit re-prompts. `revert -n`'s clientFile is already a local OS path.
+	for rec in preview:
+		var res := _local_to_res(String(rec.get("clientFile", "")))
+		if not res.is_empty():
+			_checked_out_this_session.erase(res)
+			_pending_save_checkout.erase(res)
+	_request_refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -1717,6 +1818,20 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] file-menu items=%d" % context_menu.item_count)
 			_populate_context_menu({"type": "cl", "change": "default"})
 			_log("[selftest] cl-menu items=%d" % context_menu.item_count)
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-reconcile-preview":
+			# Live, non-destructive (reconcile -n).
+			var preview := await _reconcile_preview()
+			_log("[selftest] reconcile preview: %d change(s)" % preview.size())
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-revert-unchanged-preview":
+			# Live, non-destructive (revert -a -n); also checks clientFile->res.
+			var preview := await _revert_unchanged_preview()
+			_log("[selftest] revert-unchanged preview: %d file(s)" % preview.size())
+			for rec in preview:
+				_log("[selftest]   -> %s" % _local_to_res(String(rec.get("clientFile", ""))))
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-checkout="):
