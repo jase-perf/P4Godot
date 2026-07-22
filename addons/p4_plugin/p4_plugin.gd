@@ -87,8 +87,13 @@ var dock: VBoxContainer
 var log_box: TextEdit
 var log_window: Window
 var tree: Tree
+var context_menu: PopupMenu
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
+
+# Metadata dict of the row a context-menu action targets (captured at right-click
+# so the action still knows its subject after the menu closes the selection).
+var _context_target: Dictionary = {}
 
 # Guards for the changelist-tree refresh coroutine. It awaits several p4 calls,
 # during which another mutation or a visibility event can fire - _refresh_inflight
@@ -855,7 +860,13 @@ func _build_tree() -> void:
 	tree.custom_minimum_size = Vector2(0, 180)
 	tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	tree.item_activated.connect(_on_tree_item_activated)
+	tree.item_mouse_selected.connect(_on_tree_item_mouse_selected)
+	tree.empty_clicked.connect(_on_tree_empty_clicked)
 	dock.add_child(tree)
+
+	context_menu = PopupMenu.new()
+	context_menu.id_pressed.connect(_on_context_menu_id_pressed)
+	dock.add_child(context_menu)
 
 
 ## Rebuild the whole tree from a model snapshot (see _query_pending_model). Cheap
@@ -907,6 +918,77 @@ func _open_res_path(res_path: String) -> void:
 		var res := ResourceLoader.load(res_path)
 		if res:
 			get_editor_interface().edit_resource(res)
+
+
+# Context-menu action ids.
+enum {
+	CTX_OPEN,
+	CTX_REVERT,
+	CTX_SYNC,
+	CTX_RELOAD,
+	CTX_REFRESH,
+}
+
+
+func _on_tree_item_mouse_selected(_mouse_position: Vector2, mouse_button_index: int) -> void:
+	if mouse_button_index != MOUSE_BUTTON_RIGHT:
+		return
+	var item := tree.get_selected()
+	if item == null:
+		return
+	var meta: Variant = item.get_metadata(0)
+	if typeof(meta) != TYPE_DICTIONARY:
+		return
+	_context_target = meta
+	_show_context_menu(meta)
+
+
+func _on_tree_empty_clicked(_click_position: Vector2, mouse_button_index: int) -> void:
+	if mouse_button_index != MOUSE_BUTTON_RIGHT:
+		return
+	_context_target = {}
+	_show_context_menu({})
+
+
+## Fill context_menu with the actions valid for `meta`. Kept separate from the
+## popup so a headless self-test can assert the item set without a display.
+func _populate_context_menu(meta: Dictionary) -> void:
+	context_menu.clear()
+	if meta.get("type", "") == "file":
+		context_menu.add_item("Open", CTX_OPEN)
+		context_menu.add_item("Revert This File", CTX_REVERT)
+		context_menu.add_item("Sync This File", CTX_SYNC)
+		context_menu.add_item("Reload From Disk", CTX_RELOAD)
+		context_menu.add_separator()
+	context_menu.add_item("Refresh", CTX_REFRESH)
+
+
+func _show_context_menu(meta: Dictionary) -> void:
+	_populate_context_menu(meta)
+	context_menu.reset_size()
+	# get_screen_position() folds in the editor's window/embedding offset, so
+	# adding the local mouse position gives screen coordinates for the popup.
+	context_menu.position = Vector2i(tree.get_screen_position() + tree.get_local_mouse_position())
+	context_menu.popup()
+
+
+func _on_context_menu_id_pressed(id: int) -> void:
+	var meta := _context_target
+	match id:
+		CTX_OPEN:
+			if meta.has("res_path"):
+				_open_res_path(meta.res_path)
+		CTX_REVERT:
+			if meta.has("res_path"):
+				await _revert_path(meta.res_path)
+		CTX_SYNC:
+			if meta.has("res_path"):
+				await _sync_path(meta.res_path)
+		CTX_RELOAD:
+			if meta.has("res_path"):
+				_reload_path(meta.res_path)
+		CTX_REFRESH:
+			_refresh_changelists()
 
 
 func _on_refresh_pressed() -> void:
@@ -1000,9 +1082,15 @@ func _on_revert_current_pressed() -> void:
 	if path.is_empty():
 		_log("No current scene/script with a saved path to revert.")
 		return
-	await _p4_exec_logged(["revert", ProjectSettings.globalize_path(path)])
-	_checked_out_this_session.erase(path)
-	_reload_path(path)
+	await _revert_path(path)
+
+
+## Revert res_path in Perforce and reload it from disk. Shared by the toolbar
+## "Revert Current File" button and the tree's per-row context menu.
+func _revert_path(res_path: String) -> void:
+	await _p4_exec_logged(["revert", ProjectSettings.globalize_path(res_path)])
+	_checked_out_this_session.erase(res_path)
+	_reload_path(res_path)
 
 
 func _on_sync_current_pressed() -> void:
@@ -1010,8 +1098,14 @@ func _on_sync_current_pressed() -> void:
 	if path.is_empty():
 		_log("No current scene/script with a saved path to sync.")
 		return
-	await _p4_exec_logged(["sync", ProjectSettings.globalize_path(path)])
-	_reload_path(path)
+	await _sync_path(path)
+
+
+## Sync res_path to the head revision and reload it from disk. Shared by the
+## toolbar "Sync Current File" button and the tree's per-row context menu.
+func _sync_path(res_path: String) -> void:
+	await _p4_exec_logged(["sync", ProjectSettings.globalize_path(res_path)])
+	_reload_path(res_path)
 
 
 func _on_reload_current_pressed() -> void:
@@ -1066,6 +1160,9 @@ func _resolve_checkout(res_path: String, edit_result: Dictionary,
 		_pending_save_checkout.erase(res_path)
 		if not others.is_empty():
 			_log("Note: '%s' is ALSO currently open (non-exclusively) elsewhere: %s" % [res_path, _format_other_opens(others)])
+		# Newly opened - reflect it in the changelist tree. Deferred + coalesced,
+		# so this is safe even from the synchronous _do_checkout_sync/_apply_changes.
+		_request_refresh()
 		return {"ok": true, "reason": ""}
 
 	var reason: String
@@ -1519,6 +1616,8 @@ func _reload_path(res_path: String) -> void:
 	_checked_out_this_session.erase(res_path)
 	_declined_this_session.erase(res_path)
 	_pending_save_checkout.erase(res_path)
+	# Revert/sync/reload all change what's opened - reflect it in the tree.
+	_request_refresh()
 
 
 func _clear_auto_checkout_suppression() -> void:
@@ -1610,6 +1709,14 @@ func _run_cli_self_test_if_requested() -> void:
 					f_item = f_item.get_next()
 				cl_item = cl_item.get_next()
 			_log("[selftest] tree changelists=%d files=%d" % [cl_count, file_count])
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-context-menu":
+			# Server-independent: assert the per-row menu item sets.
+			_populate_context_menu({"type": "file", "res_path": "res://x.gd"})
+			_log("[selftest] file-menu items=%d" % context_menu.item_count)
+			_populate_context_menu({"type": "cl", "change": "default"})
+			_log("[selftest] cl-menu items=%d" % context_menu.item_count)
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-checkout="):
