@@ -61,6 +61,13 @@ extends EditorPlugin
 
 const SETTINGS_SECTION := "p4_plugin"
 
+# A light P4 brand accent over Godot's native theme (from the Perforce Force UI
+# palette). The dock otherwise uses editor theme colors/icons so it reads native.
+const P4_ACCENT := Color("00cfff") # cyan - tints the changelist icons
+const ACTION_ADD_COLOR := Color("138613") # green
+const ACTION_EDIT_COLOR := Color("0084e8") # info blue
+const ACTION_DELETE_COLOR := Color("d11323") # cranberry
+
 
 ## One queued `p4` invocation, executed on the worker thread. `done` is emitted
 ## on the MAIN thread (the worker hands the result back via call_deferred), so
@@ -92,6 +99,7 @@ var log_window: Window
 var tree: Tree
 var context_menu: PopupMenu
 var move_submenu: PopupMenu
+var new_changelist_button: Button
 var reconcile_button: Button
 var revert_unchanged_button: Button
 var auto_checkout_checkbox: CheckBox
@@ -738,7 +746,7 @@ func _build_dock() -> void:
 	_add_dock_button(button_row, "Refresh",
 			"Re-query Perforce and rebuild the changelist view.",
 			_on_refresh_pressed)
-	_add_dock_button(button_row, "New Changelist...",
+	new_changelist_button = _add_dock_button(button_row, "New Changelist...",
 			"Create a new empty pending changelist.",
 			_on_new_changelist_pressed)
 	reconcile_button = _add_dock_button(button_row, "Reconcile...",
@@ -911,6 +919,7 @@ func _rebuild_tree(model: Dictionary) -> void:
 		row.set_text(0, "Perforce unavailable - see the P4 Log.")
 		row.set_selectable(0, false)
 		return
+	var folder_icon := _theme_icon("Folder")
 	for cl in model.changelists:
 		var cl_item := tree.create_item(root)
 		var label: String = "Default changelist" if cl.change == "default" \
@@ -919,13 +928,47 @@ func _rebuild_tree(model: Dictionary) -> void:
 		cl_item.set_text(1, "(%d)" % cl.files.size())
 		cl_item.set_selectable(1, false)
 		cl_item.set_metadata(0, {"type": "cl", "change": cl.change, "desc": cl.desc})
+		if folder_icon:
+			cl_item.set_icon(0, folder_icon)
+			cl_item.set_icon_modulate(0, P4_ACCENT) # the P4 brand touch
 		for f in cl.files:
 			var f_item := tree.create_item(cl_item)
 			f_item.set_text(0, f.res_path)
 			f_item.set_text(1, f.action)
+			f_item.set_custom_color(1, _action_color(f.action))
 			f_item.set_selectable(1, false)
+			var icon := _file_icon(f.res_path)
+			if icon:
+				f_item.set_icon(0, icon)
 			f_item.set_metadata(0, {"type": "file", "res_path": f.res_path,
 					"depot_path": f.depot_path, "action": f.action, "change": f.change})
+
+
+## An editor theme icon by name, or null if this build doesn't have it (so
+## set_icon(null) just leaves the row icon-less rather than erroring).
+func _theme_icon(icon_name: String) -> Texture2D:
+	var base := get_editor_interface().get_base_control()
+	if base and base.has_theme_icon(icon_name, "EditorIcons"):
+		return base.get_theme_icon(icon_name, "EditorIcons")
+	return null
+
+
+func _file_icon(res_path: String) -> Texture2D:
+	match res_path.get_extension().to_lower():
+		"tscn", "scn": return _theme_icon("PackedScene")
+		"gd": return _theme_icon("GDScript")
+		"cs": return _theme_icon("CSharpScript")
+		"tres", "res": return _theme_icon("Resource")
+		"png", "webp", "jpg", "jpeg", "svg", "bmp": return _theme_icon("Image")
+		_: return _theme_icon("File")
+
+
+func _action_color(action: String) -> Color:
+	if action.contains("delete"):
+		return ACTION_DELETE_COLOR
+	if action.contains("add"):
+		return ACTION_ADD_COLOR
+	return ACTION_EDIT_COLOR # edit / integrate / branch
 
 
 ## Open the double-clicked / Enter-activated file row in the editor.
@@ -1091,8 +1134,10 @@ func _refresh_changelists() -> void:
 	while true:
 		_refresh_pending = false
 		if not await _ensure_identity():
+			_set_actions_enabled(false)
 			_rebuild_tree({"available": false, "changelists": []})
 		else:
+			_set_actions_enabled(true)
 			var model: Dictionary = await _query_pending_model()
 			if tree == null or _shutting_down:
 				break
@@ -1101,6 +1146,14 @@ func _refresh_changelists() -> void:
 		if not _refresh_pending:
 			break
 	_refresh_inflight = false
+
+
+## Grey out the p4-dependent action buttons when Perforce is unavailable, so the
+## dock is honestly inert instead of offering doomed actions.
+func _set_actions_enabled(enabled: bool) -> void:
+	for b: Button in [new_changelist_button, reconcile_button, revert_unchanged_button]:
+		if b:
+			b.disabled = not enabled
 
 
 ## Every file Perforce reports as opened is, by definition, checked out by us -
