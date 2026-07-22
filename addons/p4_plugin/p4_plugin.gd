@@ -85,6 +85,7 @@ signal identity_checked
 
 var dock: VBoxContainer
 var log_box: TextEdit
+var log_window: Window
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 
@@ -232,8 +233,10 @@ func _exit_tree() -> void:
 		_p4_queue.clear()
 	if dock:
 		remove_control_from_docks(dock)
-		dock.queue_free()
+		dock.queue_free() # Cascades to log_window and log_box (its descendants).
 		dock = null
+		log_window = null
+		log_box = null
 
 
 func _detect_p4_identity() -> void:
@@ -719,7 +722,9 @@ func _build_dock() -> void:
 	_add_dock_button(button_row, "Reload Current File",
 			"Reload the current scene/script from disk without touching P4.",
 			_on_reload_current_pressed)
-	_add_dock_button(button_row, "Clear Log", "", _on_clear_log_pressed)
+	_add_dock_button(button_row, "Log",
+			"Show or hide the P4 activity log window.",
+			_on_toggle_log_pressed)
 
 	var settings_row := HFlowContainer.new()
 	dock.add_child(settings_row)
@@ -738,11 +743,10 @@ func _build_dock() -> void:
 	checkout_on_save_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(checkout_on_save_checkbox)
 
-	log_box = TextEdit.new()
-	log_box.editable = false
-	log_box.custom_minimum_size = Vector2(0, 120)
-	log_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	dock.add_child(log_box)
+	# The log lives in its own on-demand Window rather than eating dock space -
+	# the toolbar "Log" button toggles it. log_box stays a member (so _log() is
+	# untouched) and exists from here on regardless of the window's visibility.
+	_build_log_window()
 
 	# A dock (rather than a fixed bottom-panel item) so the user can drag it
 	# to any dock slot or float it in its own window via the dock's menu.
@@ -771,6 +775,46 @@ func _log(text: String) -> void:
 
 func _on_clear_log_pressed() -> void:
 	log_box.text = ""
+
+
+## Builds the log window (a Window child of the dock, hidden by default) hosting
+## log_box plus a Clear button. A Window - not an AcceptDialog - because the log
+## is a non-modal, resizable, leave-it-open panel; AcceptDialog would drag in
+## modal semantics and the _dialog_busy serialization used for real prompts.
+func _build_log_window() -> void:
+	log_window = Window.new()
+	log_window.title = "P4 Log"
+	log_window.size = Vector2i(640, 360)
+	log_window.visible = false
+	# Closing HIDES (never frees) so log_box survives to keep receiving _log().
+	log_window.close_requested.connect(_on_log_window_close_requested)
+
+	var log_root := VBoxContainer.new()
+	log_root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	log_window.add_child(log_root)
+
+	var log_tools := HBoxContainer.new()
+	log_root.add_child(log_tools)
+	_add_dock_button(log_tools, "Clear Log", "", _on_clear_log_pressed)
+
+	log_box = TextEdit.new()
+	log_box.editable = false
+	log_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	log_root.add_child(log_box)
+
+	# Child of dock, so dock.queue_free() in _exit_tree() cascades to it.
+	dock.add_child(log_window)
+
+
+func _on_toggle_log_pressed() -> void:
+	if log_window.visible:
+		log_window.hide()
+	else:
+		log_window.popup_centered()
+
+
+func _on_log_window_close_requested() -> void:
+	log_window.hide()
 
 
 # ---------------------------------------------------------------------------
