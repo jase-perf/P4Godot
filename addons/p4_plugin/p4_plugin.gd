@@ -968,6 +968,103 @@ func _format_other_opens(others: Array) -> String:
 
 
 # ---------------------------------------------------------------------------
+# Changelist model - the data behind the dock's changelist tree
+# ---------------------------------------------------------------------------
+
+## Snapshot the pending changelists and the files opened in each, mapped back to
+## res:// paths. Returns:
+##   {available: bool, changelists: Array}
+## each changelist: {change: "default"|"<n>", desc: String, files: Array}
+## each file:       {res_path, depot_path, action, change, type}
+## The default changelist is synthesized (p4 never lists it) and always present,
+## even empty, so newly-opened files always have a home in the tree.
+func _query_pending_model() -> Dictionary:
+	if not await _ensure_identity():
+		return {"available": false, "changelists": []}
+
+	# 1. Files opened in our client (across all its pending changelists).
+	var opened := _parse_ztag(await _p4_exec(["-ztag", "opened"]))
+
+	# 2. Map each opened depotFile to a local path. `opened`'s clientFile is
+	#    CLIENT syntax (//workspace/...), not a filesystem path - `p4 where`'s
+	#    `path` field is the local OS path we can localize to res://.
+	var depot_to_res := {}
+	var depot_paths: PackedStringArray = []
+	for rec in opened:
+		var d := String(rec.get("depotFile", ""))
+		if not d.is_empty():
+			depot_paths.append(d)
+	if not depot_paths.is_empty():
+		var where_args: PackedStringArray = ["-ztag", "where"]
+		where_args.append_array(depot_paths)
+		for wrec in _parse_ztag(await _p4_exec(where_args)):
+			# Exclusionary client mappings emit multiple records per file; keep
+			# the one that actually carries a local `path`.
+			if wrec.has("path") and not String(wrec["path"]).is_empty():
+				var res_path := _local_to_res(String(wrec["path"]))
+				if not res_path.is_empty():
+					depot_to_res[String(wrec.get("depotFile", ""))] = res_path
+
+	# 3. Pending numbered changelists owned by us in this client.
+	var changes := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
+			"-c", _p4_client, "-u", _p4_user]))
+
+	# Ordered list: default first, then numbered. by_change indexes into it.
+	var cls: Array = []
+	var by_change: Dictionary = {}
+	var default_cl := {"change": "default", "desc": "(default changelist)", "files": []}
+	cls.append(default_cl)
+	by_change["default"] = default_cl
+	for crec in changes:
+		var num := String(crec.get("change", ""))
+		if num.is_empty():
+			continue
+		var cl := {"change": num, "desc": String(crec.get("desc", "")).strip_edges(), "files": []}
+		cls.append(cl)
+		by_change[num] = cl
+
+	# Bucket opened files under their changelist.
+	for rec in opened:
+		var depot := String(rec.get("depotFile", ""))
+		var res_path: String = depot_to_res.get(depot, "")
+		if res_path.is_empty():
+			continue # Outside the project, or unmapped by `where`.
+		var change_key := String(rec.get("change", "default"))
+		if not by_change.has(change_key):
+			# Opened in a numbered CL that `changes` didn't return - synthesize a
+			# bucket so the file is never silently dropped.
+			var cl := {"change": change_key, "desc": "", "files": []}
+			cls.append(cl)
+			by_change[change_key] = cl
+		by_change[change_key].files.append({
+			"res_path": res_path,
+			"depot_path": depot,
+			"action": String(rec.get("action", "")),
+			"change": change_key,
+			"type": String(rec.get("type", "")),
+		})
+
+	return {"available": true, "changelists": cls}
+
+
+## Map a local OS path (from `p4 where`'s `path`) to a res:// path, or "" if the
+## file is outside the project. Tries ProjectSettings.localize_path first, then
+## falls back to a case-insensitive project-root strip (Windows path casing can
+## keep localize_path from folding an otherwise-in-project path).
+func _local_to_res(local_path: String) -> String:
+	var normalized := local_path.replace("\\", "/")
+	var res := ProjectSettings.localize_path(normalized)
+	if res.begins_with("res://"):
+		return res
+	var project_root := ProjectSettings.globalize_path("res://").replace("\\", "/")
+	if not project_root.ends_with("/"):
+		project_root += "/"
+	if normalized.to_lower().begins_with(project_root.to_lower()):
+		return "res://" + normalized.substr(project_root.length())
+	return ""
+
+
+# ---------------------------------------------------------------------------
 # p4 process execution
 #
 # All p4 commands funnel through _p4_exec(): the request is queued for the
@@ -1293,6 +1390,17 @@ func _run_cli_self_test_if_requested() -> void:
 					_log("[selftest] FAIL: parse-ztag field mismatch")
 			else:
 				_log("[selftest] FAIL: parse-ztag expected 2 records")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-list-opened":
+			# Live (needs the server): exercise the opened + where + changes
+			# pipeline and the depot->res mapping end to end.
+			var model := await _query_pending_model()
+			_log("[selftest] available=%s changelists=%d" % [model.available, model.changelists.size()])
+			for cl in model.changelists:
+				_log("[selftest] CL %s: %d file(s) - %s" % [cl.change, cl.files.size(), cl.desc])
+				for f in cl.files:
+					_log("[selftest] opened: %s (%s) cl=%s" % [f.res_path, f.action, f.change])
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-checkout="):
