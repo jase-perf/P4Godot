@@ -1935,6 +1935,18 @@ func _revert_unchanged_preview() -> Array:
 	return _parse_ztag(await _p4_exec(["-ztag", "revert", "-a", "-n", _project_scope()]))
 
 
+## An indented one-per-line listing of paths for confirmation dialogs, capped
+## so a huge file set can't grow the dialog past the screen.
+func _file_listing(paths: Array, cap: int = 15) -> String:
+	var shown: Array = paths.slice(0, cap)
+	var listing := ""
+	for p in shown:
+		listing += "    %s\n" % String(p)
+	if paths.size() > shown.size():
+		listing += "    ... and %d more\n" % (paths.size() - shown.size())
+	return listing.rstrip("\n")
+
+
 func _on_reconcile_pressed() -> void:
 	await _reconcile_flow()
 
@@ -1992,27 +2004,32 @@ func _revert_unchanged_flow() -> void:
 	# skipped too; revert those individually via the tree if you want.)
 	var open_files := _open_editor_files()
 	var to_revert: Array = []
+	var revert_names: Array = []
 	var skipped: Array = []
 	for rec in preview:
-		var res := _local_to_res(String(rec.get("clientFile", "")))
+		var local := String(rec.get("clientFile", ""))
+		var res := _local_to_res(local)
 		if not res.is_empty() and open_files.has(res):
 			skipped.append(res)
 		else:
 			to_revert.append(rec)
+			revert_names.append(res if not res.is_empty() else local)
 
 	if to_revert.is_empty():
 		await _show_alert(("All %d open-but-unchanged file(s) are open in the editor and were " +
-				"skipped to protect unsaved changes. Close a file (or revert it from the tree) " +
-				"if you really mean to revert it.") % skipped.size())
+				"skipped to protect unsaved changes:\n\n%s\n\nClose a file (or revert it from " +
+				"the tree) if you really mean to revert it.")
+				% [skipped.size(), _file_listing(skipped)])
 		return
 
 	var note := ""
 	if not skipped.is_empty():
-		note = "\n\n(%d file(s) open in the editor were skipped to protect unsaved changes.)" % skipped.size()
+		note = ("\n\nSkipped (open in the editor, protecting unsaved changes):\n%s"
+				% _file_listing(skipped))
 	var proceed: bool = await _show_confirm_dialog(
-			("%d open file(s) have no actual changes.\n\nRevert them? This closes them in " +
+			("%d open file(s) have no actual changes:\n\n%s\n\nRevert them? This closes them in " +
 			"Perforce (they leave your changelist); your on-disk files are untouched.%s")
-			% [to_revert.size(), note],
+			% [to_revert.size(), _file_listing(revert_names), note],
 			"Revert Unchanged", "Cancel")
 	if not proceed:
 		_log("Revert Unchanged cancelled.")
