@@ -25,6 +25,25 @@ Works with your existing `p4` command-line client and inherits its configuration
   checked out, the file is checked out right after, so the changelist stays
   truthful.
 
+### Guided connection setup
+
+No P4CONFIG, no environment variables, no manual configuration required. If
+the project doesn't already resolve to a Perforce workspace, a short setup
+flow opens at startup and asks only for what's actually missing:
+
+- **Server address**, if none is configured.
+- **Login**, if your ticket is missing or expired — and if your ticket
+  expires mid-session, a re-login prompt appears right away instead of
+  commands quietly failing.
+- **Workspace**, suggested from your existing clients on the server, ranked
+  by whether their root contains this project — confirm and go.
+
+The choice is stored per-project, per-user and passed to `p4` directly, so
+your terminal, P4V, and other projects are untouched.
+
+<!-- 📷 SCREENSHOT (optional): the workspace-suggestion dialog from connection
+     setup. Suggested file: docs/images/connection-setup.png -->
+
 ### Changelist dock
 
 The P4 dock shows your pending changelists and the files opened in each.
@@ -32,7 +51,8 @@ From there you can:
 
 - **Create, edit, submit, and delete changelists** — the default changelist
   promotes to a numbered one on first edit.
-- **Move files between changelists** from the right-click menu.
+- **Drag and drop files between changelists**, or move them from the
+  right-click menu.
 - **Diff, revert, sync, and reload** individual files.
 - **Reconcile** the project to find offline edits, adds, and deletes.
 - **Revert Unchanged** to clean up files with no actual edits — files open in
@@ -77,7 +97,7 @@ additions, deletions, and hunk headers.
 <!-- 📷 SCREENSHOT: the diff window on a file with a few added and removed
      lines visible. Suggested file: docs/images/diff-viewer.png -->
 
-### Built for slow servers
+### Built for uninterrupted work
 
 Every p4 command runs on a background worker thread, so a slow or unreachable
 server never freezes the editor. The activity log window records every
@@ -88,11 +108,11 @@ status probes when you need to troubleshoot.
 
 - **Godot 4.7+**
 - **The `p4` command-line client**, installed and on your `PATH`
-  ([download from Perforce](https://www.perforce.com/downloads/helix-command-line-client-p4))
-- A Perforce workspace that contains your Godot project, with your login
-  ticket valid (`p4 login`). The plugin runs `p4` from the project directory,
-  so per-directory `P4CONFIG` files resolve the right server and client
-  automatically.
+  (On Windows this is installed by default along with P4V. If you need to download it separately, you can [download from Perforce](https://www.perforce.com/downloads/helix-command-line-client-p4))
+- A Perforce workspace that contains your Godot project. Existing
+  configuration (`P4CONFIG`, tickets, SSO) is picked up automatically; if
+  anything is missing, the built-in connection setup asks for it on first
+  run.
 
 ## Installation
 
@@ -102,12 +122,14 @@ status probes when you need to troubleshoot.
    **P4 Perforce Integration**.
 3. The **P4** dock appears at the bottom of the editor. If `p4 info` resolves
    your workspace, you're done — edit a file and watch it get checked out.
+   Otherwise the connection setup flow opens and walks you through server,
+   login, and workspace.
 
 ## Settings
 
-All settings live in the P4 dock toolbar and are stored per-project,
-per-user — never written into project files, so they don't churn version
-control.
+All settings live in the gear menu on the P4 dock toolbar and are stored
+per-project, per-user — never written into project files, so they don't
+churn version control.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
@@ -129,12 +151,12 @@ control.
 
 ## Troubleshooting
 
-- **"Perforce unavailable"** — the startup `p4 info` failed. Check that `p4`
-  is on your PATH and `p4 info` works from your project directory in a
-  terminal. The P4 Log window (toolbar → **Log**) shows the exact error.
-- **Wrong client or user** — the plugin uses whatever `p4 info` reports from
-  the project directory. A `P4CONFIG` file in the workspace root is the most
-  reliable way to pin the right server/client per project.
+- **"Not connected" in the toolbar** — click it (or press Refresh) to rerun
+  connection setup; it names what's missing. The P4 Log window (toolbar →
+  **Log**) shows the exact error.
+- **Wrong client or user** — click the connection status in the toolbar and
+  pick a different workspace; the choice is stored per-project. A `P4CONFIG`
+  file in the workspace root works too and needs no plugin configuration.
 - **Something unexpected happened** — turn on **Verbose log** and repeat the
   action; the log shows every command and its full output.
 
