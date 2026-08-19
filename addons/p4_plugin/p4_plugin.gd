@@ -145,7 +145,15 @@ var diff_left: TextEdit
 var diff_right: TextEdit
 var diff_left_label: Label
 var diff_right_label: Label
+var diff_prev_button: Button
+var diff_next_button: Button
+var diff_change_label: Label
+var diff_full_file_toggle: CheckButton
 var _diff_scroll_syncing: bool = false
+# The full aligned rows of the current diff (collapse is a re-render of these)
+# and the rendered-row index where each contiguous change block starts.
+var _diff_rows: Array = []
+var _diff_change_blocks: Array = []
 var new_changelist_button: Button
 var reconcile_button: Button
 var revert_unchanged_button: Button
@@ -375,6 +383,12 @@ func _exit_tree() -> void:
 		diff_right = null
 		diff_left_label = null
 		diff_right_label = null
+		diff_prev_button = null
+		diff_next_button = null
+		diff_change_label = null
+		diff_full_file_toggle = null
+		_diff_rows.clear()
+		_diff_change_blocks.clear()
 
 
 ## Startup probe: resolve who we are via `p4 -ztag info`, decide availability,
@@ -1392,11 +1406,12 @@ func _on_log_window_close_requested() -> void:
 # Diff viewer
 # ---------------------------------------------------------------------------
 
-# Side-by-side row backgrounds (alpha over the editor's own base color).
-const DIFF_BG_DEL := Color(0.55, 0.16, 0.16, 0.30)
-const DIFF_BG_ADD := Color(0.18, 0.55, 0.24, 0.25)
-const DIFF_BG_FILL := Color(0.5, 0.5, 0.55, 0.08) # alignment filler rows
+# Side-by-side row backgrounds (alpha over the darkened pane base).
+const DIFF_BG_DEL := Color(0.60, 0.14, 0.14, 0.42)
+const DIFF_BG_ADD := Color(0.16, 0.55, 0.22, 0.38)
+const DIFF_BG_FILL := Color(0.5, 0.5, 0.55, 0.10) # alignment filler rows
 const DIFF_GUTTER_COLS := 7 # "12345  " line-number prefix baked into each line
+const DIFF_CONTEXT_KEEP := 3 # context lines kept around each change when collapsed
 
 
 ## Per-character foreground coloring for the diff panes: dims the baked-in
@@ -1433,6 +1448,25 @@ func _build_diff_window() -> void:
 	var root := VBoxContainer.new()
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	diff_window.add_child(root)
+
+	# Nav row: hop between changes p4merge-style; toggle between the compact
+	# changes-only view (default) and the full file.
+	var nav := HBoxContainer.new()
+	root.add_child(nav)
+	diff_prev_button = _add_toolbar_button(nav, "MoveUp", "Previous",
+			"Jump to the previous change.", _on_diff_prev_pressed)
+	diff_next_button = _add_toolbar_button(nav, "MoveDown", "Next",
+			"Jump to the next change.", _on_diff_next_pressed)
+	diff_change_label = Label.new()
+	nav.add_child(diff_change_label)
+	var nav_spacer := Control.new()
+	nav_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	nav.add_child(nav_spacer)
+	diff_full_file_toggle = CheckButton.new()
+	diff_full_file_toggle.text = "Full file"
+	diff_full_file_toggle.tooltip_text = "Show the whole file. When off, unchanged runs collapse to '... N unchanged lines ...' markers with %d context lines around each change." % DIFF_CONTEXT_KEEP
+	diff_full_file_toggle.toggled.connect(_on_diff_full_file_toggled)
+	nav.add_child(diff_full_file_toggle)
 
 	var headers := HBoxContainer.new()
 	root.add_child(headers)
@@ -1480,6 +1514,14 @@ func _make_diff_pane() -> TextEdit:
 	var mono := base.get_theme_font("source", "EditorFonts")
 	if mono:
 		te.add_theme_font_override("font", mono)
+	# A darker base than the editor's default TextEdit so the change bands and
+	# text stand out. read_only is the stylebox a non-editable TextEdit draws.
+	var style := StyleBoxFlat.new()
+	style.bg_color = base.get_theme_color("dark_color_2", "Editor") \
+			if base.has_theme_color("dark_color_2", "Editor") else Color(0.09, 0.10, 0.12)
+	style.set_content_margin_all(4)
+	te.add_theme_stylebox_override("normal", style)
+	te.add_theme_stylebox_override("read_only", style)
 	return te
 
 
@@ -1527,13 +1569,99 @@ func _diff_path(res_path: String) -> void:
 		return
 	var new_text := f.get_as_text()
 	f.close()
-	var rows := _align_diff(_split_lines(old_text), _split_lines(new_text),
+	_diff_rows = _align_diff(_split_lines(old_text), _split_lines(new_text),
 			_parse_unified_hunks(text))
 	diff_left_label.text = "  %s#have" % _diff_depot_path(text, res_path)
 	diff_right_label.text = "  %s (workspace)" % res_path
-	_populate_diff_panes(rows)
+	_render_diff()
 	diff_window.title = "P4 Diff: %s" % res_path
 	diff_window.popup_centered()
+
+
+## Re-render the stored rows in the current context mode and land on the
+## first change.
+func _render_diff() -> void:
+	var rows := _diff_rows if diff_full_file_toggle.button_pressed \
+			else _collapse_context(_diff_rows)
+	_populate_diff_panes(rows)
+	if not _diff_change_blocks.is_empty():
+		_goto_diff_row(int(_diff_change_blocks[0]), 1)
+	_update_diff_nav(1)
+
+
+func _on_diff_full_file_toggled(_pressed: bool) -> void:
+	if not _diff_rows.is_empty():
+		_render_diff()
+
+
+## Collapse long unchanged runs to a single "... N unchanged lines ..." marker
+## row, keeping DIFF_CONTEXT_KEEP context lines on the side(s) that touch a
+## change. Pure row transform - toggling just re-renders the stored rows.
+func _collapse_context(rows: Array) -> Array:
+	var out: Array = []
+	var i := 0
+	var n := rows.size()
+	while i < n:
+		if String(rows[i].kind) != "ctx":
+			out.append(rows[i])
+			i += 1
+			continue
+		var j := i
+		while j < n and String(rows[j].kind) == "ctx":
+			j += 1
+		var lead := DIFF_CONTEXT_KEEP if i > 0 else 0 # trailing context of the change above
+		var tail := DIFF_CONTEXT_KEEP if j < n else 0 # leading context of the change below
+		if j - i > lead + tail + 1:
+			for k in range(i, i + lead):
+				out.append(rows[k])
+			out.append({"kind": "gap", "old_line": 0, "new_line": 0,
+					"left": "", "right": "", "count": j - i - lead - tail})
+			for k in range(j - tail, j):
+				out.append(rows[k])
+		else:
+			for k in range(i, j):
+				out.append(rows[k])
+		i = j
+	return out
+
+
+## Center both panes on a rendered row and update the "n / m" readout.
+func _goto_diff_row(row: int, ordinal: int) -> void:
+	_diff_scroll_syncing = true
+	diff_left.set_line_as_center_visible(row)
+	diff_right.set_line_as_center_visible(row)
+	_diff_scroll_syncing = false
+	_update_diff_nav(ordinal)
+
+
+func _update_diff_nav(ordinal: int) -> void:
+	var m := _diff_change_blocks.size()
+	diff_change_label.text = "  %d / %d changes" % [ordinal, m] if m > 0 else "  no changes"
+	diff_prev_button.disabled = m == 0
+	diff_next_button.disabled = m == 0
+
+
+## Stateless prev/next: measured from what is on screen now, so manual
+## scrolling between clicks never causes a jump to somewhere unexpected.
+func _on_diff_next_pressed() -> void:
+	var center := diff_left.get_first_visible_line() + diff_left.get_visible_line_count() / 2
+	for b in _diff_change_blocks.size():
+		if int(_diff_change_blocks[b]) > center:
+			_goto_diff_row(int(_diff_change_blocks[b]), b + 1)
+			return
+	if not _diff_change_blocks.is_empty(): # wrap to the first change
+		_goto_diff_row(int(_diff_change_blocks[0]), 1)
+
+
+func _on_diff_prev_pressed() -> void:
+	var center := diff_left.get_first_visible_line() + diff_left.get_visible_line_count() / 2
+	for b in range(_diff_change_blocks.size() - 1, -1, -1):
+		if int(_diff_change_blocks[b]) < center - 1:
+			_goto_diff_row(int(_diff_change_blocks[b]), b + 1)
+			return
+	if not _diff_change_blocks.is_empty(): # wrap to the last change
+		var last := _diff_change_blocks.size() - 1
+		_goto_diff_row(int(_diff_change_blocks[last]), last + 1)
 
 
 ## Whether `p4 diff` output shows an actual change. A unified diff always has
@@ -1697,11 +1825,28 @@ func _populate_diff_panes(rows: Array) -> void:
 	var none := Color(0, 0, 0, 0)
 	var del_hi := ACTION_DELETE_COLOR.lerp(Color.WHITE, 0.45)
 	var add_hi := ACTION_ADD_COLOR.lerp(Color.WHITE, 0.45)
+	_diff_change_blocks.clear()
+	var in_block := false
 	var i := 0
 	for r: Dictionary in rows:
+		var kind := String(r.kind)
+		var changed := kind == "pair" or kind == "del" or kind == "add"
+		if changed and not in_block:
+			_diff_change_blocks.append(i)
+		in_block = changed
+		if kind == "gap":
+			var marker := "       ... %d unchanged lines ..." % int(r.count)
+			left_text += marker + "\n"
+			right_text += marker + "\n"
+			left_bg.append(DIFF_BG_FILL)
+			right_bg.append(DIFF_BG_FILL)
+			left_hl.line_spans[i] = [[0, marker.length(), left_hl.gutter_color]]
+			right_hl.line_spans[i] = [[0, marker.length(), right_hl.gutter_color]]
+			i += 1
+			continue
 		left_text += ("%5d  %s\n" % [r.old_line, r.left]) if int(r.old_line) > 0 else "\n"
 		right_text += ("%5d  %s\n" % [r.new_line, r.right]) if int(r.new_line) > 0 else "\n"
-		match String(r.kind):
+		match kind:
 			"pair":
 				left_bg.append(DIFF_BG_DEL)
 				right_bg.append(DIFF_BG_ADD)
@@ -3996,12 +4141,29 @@ func _run_cli_self_test_if_requested() -> void:
 			for r: Dictionary in rows:
 				kinds.append(r.kind)
 			var span := _intraline_span("-0.08553267", "-0.085532665")
+			# Collapse: 10 ctx, 1 add, 10 ctx -> gap(7), 3 ctx, add, 3 ctx, gap(7).
+			var many: Array = []
+			for k in 10:
+				many.append({"kind": "ctx", "old_line": k + 1, "new_line": k + 1,
+						"left": "l", "right": "l"})
+			many.append({"kind": "add", "old_line": 0, "new_line": 11,
+					"left": "", "right": "n"})
+			for k in 10:
+				many.append({"kind": "ctx", "old_line": k + 11, "new_line": k + 12,
+						"left": "l", "right": "l"})
+			var collapsed := _collapse_context(many)
+			var col_kinds: Array = []
+			for r in collapsed:
+				col_kinds.append(r.kind)
 			var ok: bool = kinds == ["ctx", "pair", "ctx", "add", "ctx"] \
 					and rows[1].left == "b" and rows[1].right == "B2" \
 					and rows[3].old_line == 0 and rows[3].right == "x" \
 					and span[0] == Vector2i(10, 11) and span[1] == Vector2i(10, 12) \
-					and _diff_depot_path(sample, "?") == "//depot/f"
-			_log("[selftest] rows: %s  span: %s" % [str(kinds), str(span)])
+					and _diff_depot_path(sample, "?") == "//depot/f" \
+					and col_kinds == ["gap", "ctx", "ctx", "ctx", "add",
+							"ctx", "ctx", "ctx", "gap"] \
+					and int(collapsed[0].count) == 7 and int(collapsed[8].count) == 7
+			_log("[selftest] rows: %s  span: %s  collapsed: %s" % [str(kinds), str(span), str(col_kinds)])
 			_log("[selftest] %s: diff-align" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
