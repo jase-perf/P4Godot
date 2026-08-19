@@ -5,13 +5,9 @@
 
 # P4 for Godot
 
-Perforce (Helix Core) integration for the Godot 4 editor. Pure GDScript, no
-build step: install the addon, enable it, and Godot starts checking out files
-the moment you edit them.
+Perforce P4 (formerly Helix Core) integration for the Godot 4 editor. Pure GDScript, no build step: install the addon, enable it, and Godot starts checking out files the moment you edit them.
 
-Works with your existing `p4` command-line client and inherits its
-configuration — P4CONFIG, tickets, and SSO all work exactly as they do in your
-terminal.
+Works with your existing `p4` command-line client and inherits its configuration — P4CONFIG, tickets, and SSO all work exactly as they do in your terminal.
 
 <!-- 📷 HERO GIF: the signature loop, captured in one take —
      edit a file in the editor → checkout prompt appears → accept → the file
