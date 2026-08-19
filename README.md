@@ -91,8 +91,12 @@ The Godot FileSystem dock gets native Perforce hooks:
 ### Diff viewer
 
 Diff any file against the depot from the dock, the changelist tree, or the
-FileSystem dock. Unified diffs render in a dedicated window with colored
-additions, deletions, and hunk headers.
+FileSystem dock. A p4merge-style side-by-side window shows the depot revision
+on the left and your workspace file on the right, with line numbers, aligned
+rows, colored change bands — and within a changed line, the exact span that
+differs is highlighted, so a one-digit change in a 4000-line scene reads at a
+glance. Line-ending differences are ignored (Godot writes LF; Windows
+workspaces usually sync CRLF), so diffs show only real changes.
 
 <!-- 📷 SCREENSHOT: the diff window on a file with a few added and removed
      lines visible. Suggested file: docs/images/diff-viewer.png -->
@@ -157,6 +161,14 @@ churn version control.
 - **Wrong client or user** — click the connection status in the toolbar and
   pick a different workspace; the choice is stored per-project. A `P4CONFIG`
   file in the workspace root works too and needs no plugin configuration.
+- **Load Error writing `project.godot` when opening the project** — Godot
+  sometimes rewrites `project.godot` at startup (version stamps, plugin
+  state), which fails while the file is read-only under Perforce. The fix is
+  Perforce's always-writable filetype, the same one Unreal projects use for
+  `.uproject`: run `p4 edit -t text+w project.godot` once and submit it, and
+  ask your server admin to add `text+w //....godot` to `p4 typemap` so new
+  Godot projects get it automatically. Pick up any startup edits later with
+  **Reconcile**.
 - **Something unexpected happened** — turn on **Verbose log** and repeat the
   action; the log shows every command and its full output.
 

@@ -1,5 +1,6 @@
 # TODO
 
+- [x] Side-by-side diff viewer (v0.12.0 - p4merge-style: depot#have vs workspace panes from `p4 print -q` + local file, rows aligned via `p4 diff -dul` hunks, full-row add/delete backgrounds, filler rows, baked line-number gutter, intraline changed-span highlighting via a custom SyntaxHighlighter, synced scrolling)
 - [x] Moving p4 commands off of main thread (done in v0.5.0 - worker thread; _apply_changes stays sync by necessity)
 - [x] Files and changelist view (v0.7.0 - changelist tree with opened files per CL)
 - [x] The current Logs should be tucked away into a window only for those who want to see it, and our main view should switch to show changelists and the files checked out in them. (v0.7.0)

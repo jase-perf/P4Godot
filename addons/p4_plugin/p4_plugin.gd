@@ -141,7 +141,11 @@ var tree: Tree
 var context_menu: PopupMenu
 var move_submenu: PopupMenu
 var diff_window: Window
-var diff_view: RichTextLabel
+var diff_left: TextEdit
+var diff_right: TextEdit
+var diff_left_label: Label
+var diff_right_label: Label
+var _diff_scroll_syncing: bool = false
 var new_changelist_button: Button
 var reconcile_button: Button
 var revert_unchanged_button: Button
@@ -367,7 +371,10 @@ func _exit_tree() -> void:
 		log_window = null
 		log_box = null
 		diff_window = null
-		diff_view = null
+		diff_left = null
+		diff_right = null
+		diff_left_label = null
+		diff_right_label = null
 
 
 ## Startup probe: resolve who we are via `p4 -ztag info`, decide availability,
@@ -1385,12 +1392,41 @@ func _on_log_window_close_requested() -> void:
 # Diff viewer
 # ---------------------------------------------------------------------------
 
-## The diff window (a hidden Window child of the dock) hosting a RichTextLabel
-## that renders colored unified-diff text. Repopulated and popped per diff.
+# Side-by-side row backgrounds (alpha over the editor's own base color).
+const DIFF_BG_DEL := Color(0.55, 0.16, 0.16, 0.30)
+const DIFF_BG_ADD := Color(0.18, 0.55, 0.24, 0.25)
+const DIFF_BG_FILL := Color(0.5, 0.5, 0.55, 0.08) # alignment filler rows
+const DIFF_GUTTER_COLS := 7 # "12345  " line-number prefix baked into each line
+
+
+## Per-character foreground coloring for the diff panes: dims the baked-in
+## line-number gutter and brightens the changed span of paired lines. Plain
+## data driven - _populate_diff_panes fills line_spans per rebuild.
+class P4DiffHighlighter extends SyntaxHighlighter:
+	# line index -> Array of [start_col, end_col, Color]
+	var line_spans: Dictionary = {}
+	var default_color := Color(0.83, 0.84, 0.88)
+	var gutter_color := Color(0.55, 0.57, 0.62, 0.8)
+
+	func _get_line_syntax_highlighting(line: int) -> Dictionary:
+		var map := {}
+		map[0] = {"color": gutter_color}
+		map[DIFF_GUTTER_COLS] = {"color": default_color}
+		for s: Array in line_spans.get(line, []):
+			map[int(s[0])] = {"color": s[2]}
+			map[int(s[1])] = {"color": default_color}
+		return map
+
+
+## The diff window: a p4merge-style side-by-side view. Left pane is the depot
+## revision you have, right pane the workspace file, rows aligned by the p4
+## diff hunks (the shorter side of a change is padded with filler rows),
+## full-row backgrounds mark adds/deletes, and within a changed line pair the
+## span that actually differs is brightened. Repopulated and popped per diff.
 func _build_diff_window() -> void:
 	diff_window = Window.new()
 	diff_window.title = "P4 Diff"
-	diff_window.size = Vector2i(820, 560)
+	diff_window.size = Vector2i(1160, 640)
 	diff_window.visible = false
 	diff_window.close_requested.connect(_on_diff_window_close_requested)
 
@@ -1398,29 +1434,72 @@ func _build_diff_window() -> void:
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	diff_window.add_child(root)
 
-	diff_view = RichTextLabel.new()
-	diff_view.bbcode_enabled = true
-	diff_view.scroll_active = true
-	diff_view.selection_enabled = true # let the user copy the diff
-	diff_view.focus_mode = Control.FOCUS_ALL
-	diff_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	# Monospace so diff columns line up; fall back to default if unavailable.
-	var mono := get_editor_interface().get_base_control().get_theme_font("source", "EditorFonts")
-	if mono:
-		diff_view.add_theme_font_override("normal_font", mono)
-		diff_view.add_theme_font_override("bold_font", mono)
-		diff_view.add_theme_font_override("mono_font", mono)
-	root.add_child(diff_view)
+	var headers := HBoxContainer.new()
+	root.add_child(headers)
+	diff_left_label = Label.new()
+	diff_left_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	diff_left_label.clip_text = true
+	headers.add_child(diff_left_label)
+	diff_right_label = Label.new()
+	diff_right_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	diff_right_label.clip_text = true
+	headers.add_child(diff_right_label)
+
+	var split := HSplitContainer.new()
+	split.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	root.add_child(split)
+	diff_left = _make_diff_pane()
+	split.add_child(diff_left)
+	diff_right = _make_diff_pane()
+	split.add_child(diff_right)
+
+	# Either pane scrolls both (rows are 1:1 after alignment padding).
+	diff_left.get_v_scroll_bar().value_changed.connect(
+			_on_diff_pane_scrolled.bind(diff_right, true))
+	diff_right.get_v_scroll_bar().value_changed.connect(
+			_on_diff_pane_scrolled.bind(diff_left, true))
+	diff_left.get_h_scroll_bar().value_changed.connect(
+			_on_diff_pane_scrolled.bind(diff_right, false))
+	diff_right.get_h_scroll_bar().value_changed.connect(
+			_on_diff_pane_scrolled.bind(diff_left, false))
 
 	dock.add_child(diff_window)
+
+
+func _make_diff_pane() -> TextEdit:
+	var te := TextEdit.new()
+	te.editable = false
+	te.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	te.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var hl := P4DiffHighlighter.new()
+	var base := get_editor_interface().get_base_control()
+	if base and base.has_theme_color("font_color", "Editor"):
+		hl.default_color = base.get_theme_color("font_color", "Editor")
+	te.syntax_highlighter = hl
+	# Monospace so columns line up; fall back to the default font if missing.
+	var mono := base.get_theme_font("source", "EditorFonts")
+	if mono:
+		te.add_theme_font_override("font", mono)
+	return te
+
+
+func _on_diff_pane_scrolled(value: float, target: TextEdit, vertical: bool) -> void:
+	if _diff_scroll_syncing or not is_instance_valid(target):
+		return
+	_diff_scroll_syncing = true
+	if vertical:
+		target.get_v_scroll_bar().value = value
+	else:
+		target.get_h_scroll_bar().value = value
+	_diff_scroll_syncing = false
 
 
 func _on_diff_window_close_requested() -> void:
 	diff_window.hide()
 
 
-## Diff res_path (workspace vs the depot revision you have) and show it in the
-## diff window. `p4 diff -dul` is read-only; the `l` flag ignores line-ending
+## Diff res_path (workspace vs the depot revision you have) and show it side by
+## side. `p4 diff -dul` is read-only; the `l` flag ignores line-ending
 ## differences - Godot always writes LF, so on a Windows client (LineEnd:
 ## local, CRLF) every line would otherwise count as changed and the diff
 ## degenerates into remove-all/add-all.
@@ -1428,17 +1507,36 @@ func _diff_path(res_path: String) -> void:
 	if not await _ensure_identity():
 		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
-	var result := await _p4_exec(["diff", "-dul", ProjectSettings.globalize_path(res_path)])
+	var local_path := ProjectSettings.globalize_path(res_path)
+	var result := await _p4_exec(["diff", "-dul", local_path])
 	var text := "" if result.output.is_empty() else String(result.output[0])
 	if not _diff_has_changes(text):
 		await _show_alert("No differences: '%s' matches the depot revision you have." % res_path)
 		return
+	if text.contains("files differ"):
+		await _show_alert("'%s' differs from the depot revision you have, but it is a binary file - there is no text diff to show." % res_path)
+		return
+	var have := await _p4_exec(["print", "-q", local_path + "#have"])
+	if have.exit_code != 0:
+		await _show_alert("Couldn't fetch the depot revision of '%s' - see the P4 Log." % res_path)
+		return
+	var old_text := "" if have.output.is_empty() else String(have.output[0])
+	var f := FileAccess.open(local_path, FileAccess.READ)
+	if f == null:
+		await _show_alert("Couldn't read '%s' from disk." % res_path)
+		return
+	var new_text := f.get_as_text()
+	f.close()
+	var rows := _align_diff(_split_lines(old_text), _split_lines(new_text),
+			_parse_unified_hunks(text))
+	diff_left_label.text = "  %s#have" % _diff_depot_path(text, res_path)
+	diff_right_label.text = "  %s (workspace)" % res_path
+	_populate_diff_panes(rows)
 	diff_window.title = "P4 Diff: %s" % res_path
-	diff_view.text = _diff_to_bbcode(text)
 	diff_window.popup_centered()
 
 
-## Whether `p4 diff -du` output shows an actual change. A unified diff always has
+## Whether `p4 diff` output shows an actual change. A unified diff always has
 ## an "@@" hunk header when content differs; an unchanged-but-opened file emits
 ## only the ---/+++ header. "files differ" is p4's binary-difference message.
 func _diff_has_changes(text: String) -> bool:
@@ -1450,29 +1548,187 @@ func _diff_has_changes(text: String) -> bool:
 	return false
 
 
-## Turn unified-diff text into BBCode with per-line coloring (add=green,
-## remove=red, hunk=cyan, file header=dim). BBCode's '[' is escaped to '[lb]' so
-## code brackets in the diff aren't parsed as tags.
-func _diff_to_bbcode(diff_text: String) -> String:
-	var out := ""
+## The depot path from the diff's "--- //depot/...<TAB>date" header line.
+func _diff_depot_path(diff_text: String, fallback: String) -> String:
 	for raw_line in diff_text.split("\n"):
-		var line := String(raw_line).rstrip("\r") # p4.exe emits CRLF
-		var esc := line.replace("[", "[lb]")
-		var color := ""
-		if line.begins_with("+++") or line.begins_with("---") \
-				or line.begins_with("====") or line.begins_with("diff "):
-			color = "9c9ca8" # neutral - file headers
-		elif line.begins_with("@@"):
-			color = P4_ACCENT.to_html(false) # cyan hunk header
-		elif line.begins_with("+"):
-			color = ACTION_ADD_COLOR.to_html(false) # green
+		var line := String(raw_line).rstrip("\r")
+		if line.begins_with("--- "):
+			return line.trim_prefix("--- ").get_slice("\t", 0)
+	return fallback
+
+
+## Split file/print text into display lines: normalize CRLF (p4.exe emits CRLF
+## and Godot writes LF) and drop the empty artifact after a trailing newline.
+func _split_lines(text: String) -> PackedStringArray:
+	var lines := text.replace("\r\n", "\n").split("\n")
+	if not lines.is_empty() and lines[lines.size() - 1].is_empty():
+		lines.remove_at(lines.size() - 1)
+	return lines
+
+
+## Parse unified-diff hunks into [{old_start, new_start, ops: ["ctx"/"del"/"add"]}].
+## File headers before the first "@@" are skipped; "\ No newline" markers too.
+func _parse_unified_hunks(diff_text: String) -> Array:
+	var hunks: Array = []
+	var current: Dictionary = {}
+	for raw_line in diff_text.split("\n"):
+		var line := String(raw_line).rstrip("\r")
+		if line.begins_with("@@"):
+			var parts := line.split(" ", false) # ["@@", "-A,B", "+C,D", "@@"]
+			if parts.size() < 3:
+				continue
+			current = {
+				"old_start": int(parts[1].trim_prefix("-").get_slice(",", 0)),
+				"new_start": int(parts[2].trim_prefix("+").get_slice(",", 0)),
+				"ops": [],
+			}
+			hunks.append(current)
+		elif current.is_empty():
+			continue # --- / +++ headers (they begin with -/+ but precede any @@)
 		elif line.begins_with("-"):
-			color = ACTION_DELETE_COLOR.to_html(false) # red
-		if color.is_empty():
-			out += esc + "\n"
-		else:
-			out += "[color=#%s]%s[/color]\n" % [color, esc]
-	return out
+			current.ops.append("del")
+		elif line.begins_with("+"):
+			current.ops.append("add")
+		elif line.begins_with(" "):
+			current.ops.append("ctx")
+		# "\ No newline at end of file" and the trailing blank are ignored.
+	return hunks
+
+
+## Build the aligned side-by-side rows for the whole file. Each row:
+## {kind: "ctx"|"pair"|"del"|"add", old_line, new_line (1-based; 0 = filler),
+##  left, right}. Hunks drive the classification and cursor advance; displayed
+## text always comes from the actual files, so a drifted diff can misalign a
+## region but never show wrong content. Runs of deletes followed by adds are
+## paired up ("pair") for intraline highlighting, remainder padded as pure
+## del/add rows.
+func _align_diff(old_lines: PackedStringArray, new_lines: PackedStringArray,
+		hunks: Array) -> Array:
+	var rows: Array = []
+	var oi := 0
+	var ni := 0
+	for hunk in hunks:
+		var hunk_old: int = int(hunk.old_start) - 1
+		while oi < hunk_old and oi < old_lines.size() and ni < new_lines.size():
+			rows.append({"kind": "ctx", "old_line": oi + 1, "new_line": ni + 1,
+					"left": old_lines[oi], "right": new_lines[ni]})
+			oi += 1
+			ni += 1
+		var dels: Array = []
+		var adds: Array = []
+		for op: String in hunk.ops:
+			match op:
+				"ctx":
+					_flush_diff_runs(rows, dels, adds)
+					if oi < old_lines.size() and ni < new_lines.size():
+						rows.append({"kind": "ctx", "old_line": oi + 1, "new_line": ni + 1,
+								"left": old_lines[oi], "right": new_lines[ni]})
+						oi += 1
+						ni += 1
+				"del":
+					if oi < old_lines.size():
+						dels.append([oi + 1, old_lines[oi]])
+						oi += 1
+				"add":
+					if ni < new_lines.size():
+						adds.append([ni + 1, new_lines[ni]])
+						ni += 1
+		_flush_diff_runs(rows, dels, adds)
+	while oi < old_lines.size() and ni < new_lines.size():
+		rows.append({"kind": "ctx", "old_line": oi + 1, "new_line": ni + 1,
+				"left": old_lines[oi], "right": new_lines[ni]})
+		oi += 1
+		ni += 1
+	# Tail imbalance only happens when the diff drifted from the files;
+	# show the leftovers honestly rather than dropping them.
+	while oi < old_lines.size():
+		rows.append({"kind": "del", "old_line": oi + 1, "new_line": 0,
+				"left": old_lines[oi], "right": ""})
+		oi += 1
+	while ni < new_lines.size():
+		rows.append({"kind": "add", "old_line": 0, "new_line": ni + 1,
+				"left": "", "right": new_lines[ni]})
+		ni += 1
+	return rows
+
+
+## Pair up buffered delete/add runs at a run boundary and clear the buffers.
+func _flush_diff_runs(rows: Array, dels: Array, adds: Array) -> void:
+	var n_pair := mini(dels.size(), adds.size())
+	for k in n_pair:
+		rows.append({"kind": "pair", "old_line": dels[k][0], "new_line": adds[k][0],
+				"left": dels[k][1], "right": adds[k][1]})
+	for k in range(n_pair, dels.size()):
+		rows.append({"kind": "del", "old_line": dels[k][0], "new_line": 0,
+				"left": dels[k][1], "right": ""})
+	for k in range(n_pair, adds.size()):
+		rows.append({"kind": "add", "old_line": 0, "new_line": adds[k][0],
+				"left": "", "right": adds[k][1]})
+	dels.clear()
+	adds.clear()
+
+
+## The changed span of a paired line: trim the common prefix and suffix, return
+## [Vector2i(start, end) for a, Vector2i(start, end) for b] in character columns.
+func _intraline_span(a: String, b: String) -> Array:
+	var p := 0
+	var max_p := mini(a.length(), b.length())
+	while p < max_p and a.unicode_at(p) == b.unicode_at(p):
+		p += 1
+	var ea := a.length()
+	var eb := b.length()
+	while ea > p and eb > p and a.unicode_at(ea - 1) == b.unicode_at(eb - 1):
+		ea -= 1
+		eb -= 1
+	return [Vector2i(p, ea), Vector2i(p, eb)]
+
+
+## Fill both panes from the aligned rows: text with a baked line-number gutter,
+## full-row backgrounds, and intraline emphasis spans for paired lines.
+func _populate_diff_panes(rows: Array) -> void:
+	var left_hl := diff_left.syntax_highlighter as P4DiffHighlighter
+	var right_hl := diff_right.syntax_highlighter as P4DiffHighlighter
+	left_hl.line_spans.clear()
+	right_hl.line_spans.clear()
+	var left_text := ""
+	var right_text := ""
+	var left_bg: Array = []
+	var right_bg: Array = []
+	var none := Color(0, 0, 0, 0)
+	var del_hi := ACTION_DELETE_COLOR.lerp(Color.WHITE, 0.45)
+	var add_hi := ACTION_ADD_COLOR.lerp(Color.WHITE, 0.45)
+	var i := 0
+	for r: Dictionary in rows:
+		left_text += ("%5d  %s\n" % [r.old_line, r.left]) if int(r.old_line) > 0 else "\n"
+		right_text += ("%5d  %s\n" % [r.new_line, r.right]) if int(r.new_line) > 0 else "\n"
+		match String(r.kind):
+			"pair":
+				left_bg.append(DIFF_BG_DEL)
+				right_bg.append(DIFF_BG_ADD)
+				var spans := _intraline_span(String(r.left), String(r.right))
+				left_hl.line_spans[i] = [[spans[0].x + DIFF_GUTTER_COLS,
+						spans[0].y + DIFF_GUTTER_COLS, del_hi]]
+				right_hl.line_spans[i] = [[spans[1].x + DIFF_GUTTER_COLS,
+						spans[1].y + DIFF_GUTTER_COLS, add_hi]]
+			"del":
+				left_bg.append(DIFF_BG_DEL)
+				right_bg.append(DIFF_BG_FILL)
+			"add":
+				left_bg.append(DIFF_BG_FILL)
+				right_bg.append(DIFF_BG_ADD)
+			_:
+				left_bg.append(none)
+				right_bg.append(none)
+		i += 1
+	diff_left.text = left_text.trim_suffix("\n")
+	diff_right.text = right_text.trim_suffix("\n")
+	# Backgrounds only apply to existing lines, so this runs after set_text;
+	# every line gets an explicit color so nothing lingers from the last diff.
+	for line in left_bg.size():
+		diff_left.set_line_background_color(line, left_bg[line])
+		diff_right.set_line_background_color(line, right_bg[line])
+	diff_left.get_v_scroll_bar().value = 0
+	diff_left.get_h_scroll_bar().value = 0
 
 
 # ---------------------------------------------------------------------------
@@ -3728,15 +3984,25 @@ func _run_cli_self_test_if_requested() -> void:
 					% [preview.size(), revertable, skipped])
 			get_tree().quit()
 			return
-		if arg == "--p4-selftest-diff-bbcode":
-			# Server-independent: per-line coloring + BBCode escaping.
-			var sample := "--- //depot/a\n+++ /local/a\n@@ -1,2 +1,2 @@\n context\n-old[x]\n+new\n"
-			var bb := _diff_to_bbcode(sample)
-			var ok := bb.contains("[color=#%s]" % ACTION_ADD_COLOR.to_html(false)) \
-					and bb.contains("[color=#%s]" % ACTION_DELETE_COLOR.to_html(false)) \
-					and bb.contains("[color=#%s]" % P4_ACCENT.to_html(false)) \
-					and bb.contains("[lb]x]") # the '[' in old[x] escaped
-			_log("[selftest] %s: diff-bbcode" % ("PASS" if ok else "FAIL"))
+		if arg == "--p4-selftest-diff-align":
+			# Server-independent: hunk parsing, side-by-side row alignment
+			# (pairing + filler), and the intraline changed-span trim.
+			var old_lines := PackedStringArray(["a", "b", "c", "d"])
+			var new_lines := PackedStringArray(["a", "B2", "c", "x", "d"])
+			var sample := "--- //depot/f\t2026-01-01\n+++ C:\\w\\f\t2026-01-01\n" \
+					+ "@@ -1,4 +1,5 @@\n a\n-b\n+B2\n c\n+x\n d\n"
+			var rows := _align_diff(old_lines, new_lines, _parse_unified_hunks(sample))
+			var kinds: Array = []
+			for r: Dictionary in rows:
+				kinds.append(r.kind)
+			var span := _intraline_span("-0.08553267", "-0.085532665")
+			var ok: bool = kinds == ["ctx", "pair", "ctx", "add", "ctx"] \
+					and rows[1].left == "b" and rows[1].right == "B2" \
+					and rows[3].old_line == 0 and rows[3].right == "x" \
+					and span[0] == Vector2i(10, 11) and span[1] == Vector2i(10, 12) \
+					and _diff_depot_path(sample, "?") == "//depot/f"
+			_log("[selftest] rows: %s  span: %s" % [str(kinds), str(span)])
+			_log("[selftest] %s: diff-align" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-diff="):
