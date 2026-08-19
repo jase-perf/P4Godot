@@ -149,6 +149,15 @@ var revert_unchanged_button: Button
 # the gear menu fronting the hidden setting checkboxes.
 var conn_status_button: Button
 var settings_menu: MenuButton
+# Responsive toolbar: the action buttons (_toolbar_actions) live in the top
+# row while they fit, and drop to a second row when the dock is narrow;
+# connection status / settings / Log (_toolbar_right) hold the top row.
+var _toolbar: VBoxContainer
+var _toolbar_top: HBoxContainer
+var _toolbar_second: HBoxContainer
+var _toolbar_actions: HBoxContainer
+var _toolbar_right: HBoxContainer
+var _toolbar_wrapped: bool = false
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 var verbose_log_checkbox: CheckBox
@@ -1088,40 +1097,53 @@ func _build_dock() -> void:
 	dock = VBoxContainer.new()
 	dock.name = "P4"
 
-	# One compact toolbar row. Per-file actions live in the tree's right-click
-	# menu (and the FileSystem dock), not here - the toolbar carries only the
-	# project-wide operations, with connection status and settings on the right.
-	var toolbar := HBoxContainer.new()
-	dock.add_child(toolbar)
-	_add_toolbar_button(toolbar, "Reload", "Refresh",
+	# Toolbar: one row when everything fits, two when the dock is narrow. Per-
+	# file actions live in the tree's right-click menu (and the FileSystem
+	# dock), not here - the toolbar carries only the project-wide operations,
+	# with connection status and settings on the right. _update_toolbar_layout
+	# reparents _toolbar_actions between the rows as the dock resizes.
+	_toolbar = VBoxContainer.new()
+	dock.add_child(_toolbar)
+	_toolbar_top = HBoxContainer.new()
+	_toolbar.add_child(_toolbar_top)
+	_toolbar_second = HBoxContainer.new()
+	_toolbar_second.visible = false
+	_toolbar.add_child(_toolbar_second)
+
+	_toolbar_actions = HBoxContainer.new()
+	_toolbar_top.add_child(_toolbar_actions)
+	_add_toolbar_button(_toolbar_actions, "Reload", "Refresh",
 			"Refresh: re-query Perforce and rebuild the changelist view.",
 			_on_refresh_pressed, true)
-	new_changelist_button = _add_toolbar_button(toolbar, "Add", "New Changelist...",
+	new_changelist_button = _add_toolbar_button(_toolbar_actions, "Add", "New Changelist...",
 			"Create a new empty pending changelist.",
 			_on_new_changelist_pressed)
-	toolbar.add_child(VSeparator.new())
-	reconcile_button = _add_toolbar_button(toolbar, "", "Reconcile...",
+	_toolbar_actions.add_child(VSeparator.new())
+	reconcile_button = _add_toolbar_button(_toolbar_actions, "", "Reconcile...",
 			"Find files changed on disk and open them for add/edit/delete in Perforce.",
 			_on_reconcile_pressed)
-	revert_unchanged_button = _add_toolbar_button(toolbar, "", "Revert Unchanged...",
+	revert_unchanged_button = _add_toolbar_button(_toolbar_actions, "", "Revert Unchanged...",
 			"Revert opened files that have no actual changes (p4 revert -a).",
 			_on_revert_unchanged_pressed)
 
 	var spacer := Control.new()
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	toolbar.add_child(spacer)
+	_toolbar_top.add_child(spacer)
 
+	_toolbar_right = HBoxContainer.new()
+	_toolbar_top.add_child(_toolbar_right)
 	conn_status_button = Button.new()
 	conn_status_button.flat = true
 	conn_status_button.pressed.connect(_on_conn_status_pressed)
-	toolbar.add_child(conn_status_button)
+	_toolbar_right.add_child(conn_status_button)
 	_update_conn_status()
-
-	toolbar.add_child(VSeparator.new())
-	_build_settings_menu(toolbar)
-	_add_toolbar_button(toolbar, "", "Log",
+	_toolbar_right.add_child(VSeparator.new())
+	_build_settings_menu(_toolbar_right)
+	_add_toolbar_button(_toolbar_right, "", "Log",
 			"Show or hide the P4 activity log window.",
 			_on_toggle_log_pressed)
+
+	_toolbar.resized.connect(_on_toolbar_resized)
 
 	# The setting checkboxes stay real nodes - self-tests poke them, hot paths
 	# and _load_settings read/write them - but the row is hidden: the gear menu
@@ -1271,6 +1293,38 @@ func _update_conn_status() -> void:
 func _on_conn_status_pressed() -> void:
 	_login_declined = false
 	_offer_connection_setup()
+
+
+func _on_toolbar_resized() -> void:
+	# resized fires mid-layout; reparenting there is unsafe. Decide after the
+	# layout pass settles. (Repeat deferrals coalesce via the mode check.)
+	call_deferred("_update_toolbar_layout")
+
+
+## One toolbar row when everything fits, two when the dock is narrow: the
+## action buttons drop to a second row while connection status, settings, and
+## Log hold the top. Conditional reparenting rather than an HFlowContainer,
+## because flow wraps left-to-right and would push the status cluster - not
+## the buttons - onto the second row. The minimum-width math uses the two
+## clusters' own minimums, so it is independent of which row the actions are
+## currently in and the mode can't oscillate.
+func _update_toolbar_layout() -> void:
+	if _shutting_down or not is_instance_valid(_toolbar) \
+			or not is_instance_valid(_toolbar_actions):
+		return
+	var one_row_min: float = _toolbar_actions.get_combined_minimum_size().x \
+			+ _toolbar_right.get_combined_minimum_size().x + 16.0
+	var narrow: bool = _toolbar.size.x < one_row_min
+	if narrow == _toolbar_wrapped:
+		return
+	_toolbar_wrapped = narrow
+	_toolbar_actions.get_parent().remove_child(_toolbar_actions)
+	if narrow:
+		_toolbar_second.add_child(_toolbar_actions)
+	else:
+		_toolbar_top.add_child(_toolbar_actions)
+		_toolbar_top.move_child(_toolbar_actions, 0)
+	_toolbar_second.visible = narrow
 
 
 func _log(text: String) -> void:
