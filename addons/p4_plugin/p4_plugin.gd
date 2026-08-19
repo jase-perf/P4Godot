@@ -1018,12 +1018,15 @@ func _on_diff_selected_pressed() -> void:
 
 
 ## Diff res_path (workspace vs the depot revision you have) and show it in the
-## diff window. `p4 diff -du` is read-only.
+## diff window. `p4 diff -dul` is read-only; the `l` flag ignores line-ending
+## differences - Godot always writes LF, so on a Windows client (LineEnd:
+## local, CRLF) every line would otherwise count as changed and the diff
+## degenerates into remove-all/add-all.
 func _diff_path(res_path: String) -> void:
 	if not await _ensure_identity():
 		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
 		return
-	var result := await _p4_exec(["diff", "-du", ProjectSettings.globalize_path(res_path)])
+	var result := await _p4_exec(["diff", "-dul", ProjectSettings.globalize_path(res_path)])
 	var text := "" if result.output.is_empty() else String(result.output[0])
 	if not _diff_has_changes(text):
 		await _show_alert("No differences: '%s' matches the depot revision you have." % res_path)
@@ -1050,7 +1053,8 @@ func _diff_has_changes(text: String) -> bool:
 ## code brackets in the diff aren't parsed as tags.
 func _diff_to_bbcode(diff_text: String) -> String:
 	var out := ""
-	for line in diff_text.split("\n"):
+	for raw_line in diff_text.split("\n"):
+		var line := String(raw_line).rstrip("\r") # p4.exe emits CRLF
 		var esc := line.replace("[", "[lb]")
 		var color := ""
 		if line.begins_with("+++") or line.begins_with("---") \
@@ -1090,6 +1094,8 @@ func _build_tree() -> void:
 	tree.item_activated.connect(_on_tree_item_activated)
 	tree.item_mouse_selected.connect(_on_tree_item_mouse_selected)
 	tree.empty_clicked.connect(_on_tree_empty_clicked)
+	tree.drop_mode_flags = Tree.DROP_MODE_ON_ITEM
+	tree.set_drag_forwarding(_tree_get_drag_data, _tree_can_drop_data, _tree_drop_data)
 	dock.add_child(tree)
 
 	context_menu = PopupMenu.new()
@@ -1189,6 +1195,64 @@ func _open_res_path(res_path: String) -> void:
 		var res := ResourceLoader.load(res_path)
 		if res:
 			get_editor_interface().edit_resource(res)
+
+
+# --- Drag & drop: drag a file row onto another changelist to move it -------
+
+## Drag data for a file row: {type: "p4_file", res_path, change}. Non-file rows
+## (changelist headers, the unavailable notice) aren't draggable.
+func _tree_get_drag_data(at_position: Vector2) -> Variant:
+	var item := tree.get_item_at_position(at_position)
+	if item == null:
+		return null
+	var meta: Variant = item.get_metadata(0)
+	if typeof(meta) != TYPE_DICTIONARY or meta.get("type") != "file":
+		return null
+	var preview := Label.new()
+	preview.text = "  %s  " % String(meta.res_path)
+	var icon := _file_icon(String(meta.res_path))
+	if icon:
+		var row := HBoxContainer.new()
+		var tex := TextureRect.new()
+		tex.texture = icon
+		tex.stretch_mode = TextureRect.STRETCH_KEEP_CENTERED
+		row.add_child(tex)
+		row.add_child(preview)
+		tree.set_drag_preview(row)
+	else:
+		tree.set_drag_preview(preview)
+	return {"type": "p4_file", "res_path": meta.res_path, "change": meta.change}
+
+
+## The changelist a drop at this position would move the file into, or "" when
+## the drop is invalid (not our data, not over a row, or the file's own
+## changelist). Dropping on a file row targets that row's changelist.
+func _tree_drop_target_change(at_position: Vector2, data: Variant) -> String:
+	if typeof(data) != TYPE_DICTIONARY or data.get("type") != "p4_file":
+		return ""
+	var item := tree.get_item_at_position(at_position)
+	if item == null:
+		return ""
+	var meta: Variant = item.get_metadata(0)
+	if typeof(meta) != TYPE_DICTIONARY:
+		return ""
+	var target := ""
+	if meta.get("type") == "cl" or meta.get("type") == "file":
+		target = String(meta.get("change", ""))
+	if target.is_empty() or target == String(data.get("change", "")):
+		return ""
+	return target
+
+
+func _tree_can_drop_data(at_position: Vector2, data: Variant) -> bool:
+	return not _tree_drop_target_change(at_position, data).is_empty()
+
+
+func _tree_drop_data(at_position: Vector2, data: Variant) -> void:
+	var target := _tree_drop_target_change(at_position, data)
+	if target.is_empty():
+		return
+	_move_file_to_changelist(String(data.res_path), target)
 
 
 # Context-menu action ids. Move-to-changelist items use CTX_MOVE_BASE + index
@@ -3199,7 +3263,7 @@ func _run_cli_self_test_if_requested() -> void:
 		if arg.begins_with("--p4-selftest-diff="):
 			# Live, read-only: run p4 diff -du and report change detection.
 			var path := arg.substr("--p4-selftest-diff=".length())
-			var result := await _p4_exec(["diff", "-du", ProjectSettings.globalize_path(path)])
+			var result := await _p4_exec(["diff", "-dul", ProjectSettings.globalize_path(path)])
 			var text := "" if result.output.is_empty() else String(result.output[0])
 			_log("[selftest] diff '%s': has_changes=%s" % [path, _diff_has_changes(text)])
 			get_tree().quit()
