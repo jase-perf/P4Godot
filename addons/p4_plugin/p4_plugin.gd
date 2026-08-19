@@ -31,6 +31,11 @@ extends EditorPlugin
 ##   works in an `allwrite` client where P4 leaves files writable. If a save
 ##   succeeds on a file that isn't checked out (the allwrite case), the file
 ##   is checked out right after so the changelist stays truthful.
+## - Delete / move / rename: deleting or moving a file (or folder) in the
+##   FileSystem dock is caught via FileSystemDock signals and offered to
+##   Perforce - open-for-delete for a deletion, a history-preserving move
+##   (`p4 reconcile -m`) for a rename. Prompts by default, or applies silently
+##   when the "Auto add/edit/delete" setting is on.
 ##
 ## Known limitations:
 ## - Declining checkout on a SCENE reloads the whole scene, discarding ALL of
@@ -43,8 +48,10 @@ extends EditorPlugin
 ## - A failed SCRIPT save with both checkout options disabled only shows
 ##   Godot's generic error: the engine emits no signal on a failed resource
 ##   write (EditorPlugin.resource_saved fires only on success).
-## - FileSystem dock operations (move/rename/delete), project.godot writes,
-##   and edits made outside the editor are not covered.
+## - project.godot writes and edits made OUTSIDE the editor are not covered
+##   (use Reconcile for those). New empty files aren't auto-added either - Godot
+##   emits no create signal - but a new file gets added when you save it or via
+##   Reconcile.
 ## - p4 commands run on a background worker thread (one at a time, in order),
 ##   so a slow or unreachable server no longer stalls the editor. Results are
 ##   cached per file per session as before. Two deliberate exceptions stay on
@@ -68,6 +75,10 @@ const ACTION_ADD_COLOR := Color("138613") # green
 const ACTION_EDIT_COLOR := Color("0084e8") # info blue
 const ACTION_DELETE_COLOR := Color("d11323") # cranberry
 
+# How long a hovered file's cached p4 status stays fresh before the next hover
+# triggers a background refresh (see _prefetch_fstat).
+const FSTAT_CACHE_TTL_SEC := 5.0
+
 
 ## One queued `p4` invocation, executed on the worker thread. `done` is emitted
 ## on the MAIN thread (the worker hands the result back via call_deferred), so
@@ -86,6 +97,36 @@ class P4Request extends RefCounted:
 	func _finish() -> void:
 		completed = true
 		done.emit()
+
+
+## Right-click Perforce actions on files in the editor's FileSystem dock. This is
+## Godot's EditorContextMenuPlugin hook - the same native integration Nick Poole's
+## C++ plugin used, but reachable from GDScript. Menu construction and the action
+## handlers live on the main plugin (this class just forwards), so the logic
+## reuses the plugin's existing worker-thread p4 methods and can be exercised
+## headless.
+class P4FileSystemContextMenu extends EditorContextMenuPlugin:
+	var plugin # the main P4 EditorPlugin (untyped to avoid a cyclic self-type)
+
+	func _popup_menu(paths: PackedStringArray) -> void:
+		if plugin != null:
+			plugin._populate_fs_context_menu(self, paths)
+
+
+## Hover tooltips for files in the FileSystem dock (Godot's
+## EditorResourceTooltipPlugin hook). _make_tooltip_for_path is synchronous, so it
+## only reads the plugin's cached status and asks for a background refresh - it
+## never blocks the editor on a p4 round trip.
+class P4FileSystemTooltip extends EditorResourceTooltipPlugin:
+	var plugin
+
+	func _handles(_type: String) -> bool:
+		return true
+
+	func _make_tooltip_for_path(path: String, _metadata: Dictionary, base: Control) -> Control:
+		if plugin != null:
+			plugin._on_tooltip_for_path(path, base)
+		return base
 
 
 ## Emitted once the startup `p4 info` has resolved, successfully or not.
@@ -107,6 +148,13 @@ var revert_unchanged_button: Button
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 var verbose_log_checkbox: CheckBox
+var auto_open_checkbox: CheckBox
+
+# Native FileSystem-dock hooks (Godot's EditorContextMenuPlugin /
+# EditorResourceTooltipPlugin), registered in _enter_tree. GDScript-reachable -
+# no GDExtension required.
+var _fs_context_menu: P4FileSystemContextMenu
+var _fs_tooltip: P4FileSystemTooltip
 
 # Mirrors verbose_log_checkbox so the logging hot path never touches a UI node.
 # When false, read-only probes (fstat/opened/where/changes/info/change -o and -n
@@ -170,6 +218,14 @@ var _p4_client: String = ""
 var _checked_out_this_session: Dictionary = {}
 var _declined_this_session: Dictionary = {}
 var _pending_save_checkout: Dictionary = {}
+
+# Hover-tooltip status cache: res:// path -> {data: <parsed -ztag fstat record>,
+# time: <unix seconds>}. The tooltip callback is synchronous and must never wait
+# on a p4 round trip, so it renders whatever is cached and kicks a background
+# refresh (_prefetch_fstat) for next time. _fstat_prefetch_inflight dedups the
+# background fetches so repeated hovers don't queue a burst of identical fstats.
+var _fstat_cache: Dictionary = {}
+var _fstat_prefetch_inflight: Dictionary = {}
 
 # res:// path -> true while an edit-time checkout decision for that file is in
 # flight (async fstat probe or open prompt). Keystrokes stream in continuously
@@ -243,6 +299,7 @@ func _enter_tree() -> void:
 
 	_p4_thread = Thread.new()
 	_p4_thread.start(_p4_worker_loop)
+	_register_filesystem_hooks()
 	# Fire-and-forget coroutine: anything that needs the identity awaits
 	# _ensure_identity() instead of assuming this has resolved.
 	_detect_p4_identity()
@@ -252,6 +309,7 @@ func _enter_tree() -> void:
 
 func _exit_tree() -> void:
 	_shutting_down = true
+	_unregister_filesystem_hooks()
 	if get_undo_redo().history_changed.is_connected(_on_undo_redo_history_changed):
 		get_undo_redo().history_changed.disconnect(_on_undo_redo_history_changed)
 	var script_editor := get_editor_interface().get_script_editor()
@@ -320,6 +378,8 @@ func _load_settings() -> void:
 			SETTINGS_SECTION, "checkout_on_save", true)
 	verbose_log_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "verbose_log", false)
+	auto_open_checkbox.button_pressed = settings.get_project_metadata(
+			SETTINGS_SECTION, "auto_open_no_prompt", false)
 	_verbose_log = verbose_log_checkbox.button_pressed
 
 
@@ -331,6 +391,8 @@ func _on_setting_toggled(_pressed: bool) -> void:
 			checkout_on_save_checkbox.button_pressed)
 	settings.set_project_metadata(SETTINGS_SECTION, "verbose_log",
 			verbose_log_checkbox.button_pressed)
+	settings.set_project_metadata(SETTINGS_SECTION, "auto_open_no_prompt",
+			auto_open_checkbox.button_pressed)
 	_verbose_log = verbose_log_checkbox.button_pressed
 
 
@@ -414,7 +476,13 @@ func _handle_edit_inner(res_path: String) -> void:
 		_checked_out_this_session[res_path] = true
 		return
 
-	if auto_checkout_checkbox.button_pressed:
+	if _auto_open():
+		# Auto mode: check out silently, no prompt. A failure (e.g. someone else
+		# holds it exclusively) still needs a decision, so surface it.
+		var result: Dictionary = await _do_checkout(res_path)
+		if not result.ok:
+			await _on_edit_checkout_failed(res_path, result.reason)
+	elif auto_checkout_checkbox.button_pressed:
 		await _prompt_then_checkout(res_path)
 	else:
 		_pending_save_checkout[res_path] = true
@@ -812,6 +880,12 @@ func _build_dock() -> void:
 	verbose_log_checkbox.tooltip_text = "Log every p4 command and its output, including read-only status probes (fstat/opened/where/changes). When off, only state-changing commands are logged."
 	verbose_log_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(verbose_log_checkbox)
+
+	auto_open_checkbox = CheckBox.new()
+	auto_open_checkbox.text = "Auto add/edit/delete"
+	auto_open_checkbox.tooltip_text = "When on, edits, deletes, and moves/renames are opened in Perforce automatically, with no confirmation dialog. When off, deletes and moves prompt first (and edits follow 'Checkout on edit')."
+	auto_open_checkbox.toggled.connect(_on_setting_toggled)
+	settings_row.add_child(auto_open_checkbox)
 
 	_build_tree()
 
@@ -1328,13 +1402,20 @@ func _on_checkout_current_pressed() -> void:
 	if path.is_empty():
 		_log("No current scene/script with a saved path to check out.")
 		return
-	if not await _needs_checkout(ProjectSettings.globalize_path(path)):
-		_checked_out_this_session[path] = true
-		_log("'%s' doesn't need checkout (already opened by you, or not tracked by Perforce)." % path)
+	await _checkout_path(path)
+
+
+## Check out one file: skip if it doesn't need it, otherwise `p4 edit` and surface
+## any failure. Shared by the toolbar "Checkout Active File" button and the
+## FileSystem-dock context menu.
+func _checkout_path(res_path: String) -> void:
+	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
+		_checked_out_this_session[res_path] = true
+		_log("'%s' doesn't need checkout (already opened by you, or not tracked by Perforce)." % res_path)
 		return
-	var result: Dictionary = await _do_checkout(path)
+	var result: Dictionary = await _do_checkout(res_path)
 	if not result.ok:
-		_show_alert("Couldn't check out '%s' - %s." % [path, result.reason])
+		_show_alert("Couldn't check out '%s' - %s." % [res_path, result.reason])
 
 
 ## The file selected in the changelist tree (a file row), or "" if none. The
@@ -2492,6 +2573,434 @@ func _clear_auto_checkout_suppression() -> void:
 
 
 # ---------------------------------------------------------------------------
+# FileSystem dock integration (native tooltips + right-click menu)
+#
+# Two Godot editor hooks, both reachable from GDScript (no GDExtension needed):
+# EditorContextMenuPlugin adds Perforce actions to the FileSystem dock's
+# right-click menu, and EditorResourceTooltipPlugin adds P4 status to a file's
+# hover tooltip. Both delegate to the methods here, so they reuse the same
+# worker-thread p4 plumbing as the rest of the plugin and never block the editor.
+# ---------------------------------------------------------------------------
+
+func _register_filesystem_hooks() -> void:
+	var fsd := get_editor_interface().get_file_system_dock()
+	if fsd and fsd.has_method("add_resource_tooltip_plugin"):
+		var tip := P4FileSystemTooltip.new()
+		tip.plugin = self
+		fsd.add_resource_tooltip_plugin(tip)
+		_fs_tooltip = tip
+	if ClassDB.class_exists("EditorContextMenuPlugin"):
+		var menu := P4FileSystemContextMenu.new()
+		menu.plugin = self
+		add_context_menu_plugin(EditorContextMenuPlugin.CONTEXT_SLOT_FILESYSTEM, menu)
+		_fs_context_menu = menu
+	# Delete / move / rename done in the dock arrive as these signals (emitted
+	# AFTER the on-disk change), so we react by recording the change in Perforce.
+	if fsd:
+		if fsd.has_signal("file_removed") and not fsd.file_removed.is_connected(_on_fs_file_removed):
+			fsd.file_removed.connect(_on_fs_file_removed)
+		if fsd.has_signal("folder_removed") and not fsd.folder_removed.is_connected(_on_fs_folder_removed):
+			fsd.folder_removed.connect(_on_fs_folder_removed)
+		if fsd.has_signal("files_moved") and not fsd.files_moved.is_connected(_on_fs_files_moved):
+			fsd.files_moved.connect(_on_fs_files_moved)
+		if fsd.has_signal("folder_moved") and not fsd.folder_moved.is_connected(_on_fs_folder_moved):
+			fsd.folder_moved.connect(_on_fs_folder_moved)
+
+
+func _unregister_filesystem_hooks() -> void:
+	var fsd := get_editor_interface().get_file_system_dock()
+	if fsd:
+		if fsd.has_signal("file_removed") and fsd.file_removed.is_connected(_on_fs_file_removed):
+			fsd.file_removed.disconnect(_on_fs_file_removed)
+		if fsd.has_signal("folder_removed") and fsd.folder_removed.is_connected(_on_fs_folder_removed):
+			fsd.folder_removed.disconnect(_on_fs_folder_removed)
+		if fsd.has_signal("files_moved") and fsd.files_moved.is_connected(_on_fs_files_moved):
+			fsd.files_moved.disconnect(_on_fs_files_moved)
+		if fsd.has_signal("folder_moved") and fsd.folder_moved.is_connected(_on_fs_folder_moved):
+			fsd.folder_moved.disconnect(_on_fs_folder_moved)
+	if _fs_tooltip and fsd and fsd.has_method("remove_resource_tooltip_plugin"):
+		fsd.remove_resource_tooltip_plugin(_fs_tooltip)
+	_fs_tooltip = null
+	if _fs_context_menu:
+		remove_context_menu_plugin(_fs_context_menu)
+	_fs_context_menu = null
+
+
+## The FileSystem-dock right-click actions as {label, method} - one source of
+## truth shared by the live menu (_populate_fs_context_menu) and the headless
+## self-test. Each method is a `_ctx_*` handler below that receives the selected
+## res:// paths.
+func _fs_context_actions() -> Array:
+	return [
+		{"label": "P4: Check Out", "method": "_ctx_checkout"},
+		{"label": "P4: Mark for Add", "method": "_ctx_add"},
+		{"label": "P4: Get Latest (Sync)", "method": "_ctx_sync"},
+		{"label": "P4: Diff vs Depot", "method": "_ctx_diff"},
+		{"label": "P4: Revert...", "method": "_ctx_revert"},
+		{"label": "P4: Show Status in Log", "method": "_ctx_status"},
+	]
+
+
+## Called by P4FileSystemContextMenu._popup_menu: add the Perforce actions to the
+## dock's right-click menu when the selection contains at least one file. Silent
+## when Perforce is known-unavailable this session.
+func _populate_fs_context_menu(menu: EditorContextMenuPlugin, paths: PackedStringArray) -> void:
+	if _identity_checked and not _p4_available:
+		return
+	if _fs_files_only(paths).is_empty():
+		return
+	for action in _fs_context_actions():
+		menu.add_context_menu_item(String(action.label), Callable(self, String(action.method)))
+
+
+## The res:// file paths in `paths`, dropping folders (a trailing slash or an
+## actual directory on disk): the file-oriented p4 actions here don't recurse.
+func _fs_files_only(paths: PackedStringArray) -> Array:
+	var files: Array = []
+	for p in paths:
+		var res := String(p)
+		if res.ends_with("/"):
+			continue
+		if DirAccess.dir_exists_absolute(ProjectSettings.globalize_path(res)):
+			continue
+		files.append(res)
+	return files
+
+
+func _ctx_checkout(paths: PackedStringArray) -> void:
+	for res in _fs_files_only(paths):
+		await _checkout_path(res)
+
+
+func _ctx_add(paths: PackedStringArray) -> void:
+	for res in _fs_files_only(paths):
+		await _add_path(res)
+
+
+func _ctx_sync(paths: PackedStringArray) -> void:
+	for res in _fs_files_only(paths):
+		await _sync_path(res)
+
+
+func _ctx_revert(paths: PackedStringArray) -> void:
+	for res in _fs_files_only(paths):
+		await _revert_path(res)
+
+
+## Diff acts on one file (the diff window shows one file at a time); if several
+## are selected, diff the first and say so.
+func _ctx_diff(paths: PackedStringArray) -> void:
+	var files := _fs_files_only(paths)
+	if files.is_empty():
+		return
+	if files.size() > 1:
+		_log("Diffing only '%s' (the first of %d selected files)." % [files[0], files.size()])
+	await _diff_path(files[0])
+
+
+func _ctx_status(paths: PackedStringArray) -> void:
+	await _status_to_log(_fs_files_only(paths))
+
+
+## Open res_path for add (`p4 add`). No-ops (with a p4 message) on already-tracked
+## files. Refreshes the changelist tree.
+func _add_path(res_path: String) -> void:
+	if not await _ensure_identity():
+		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		return
+	await _p4_exec_logged(["add", ProjectSettings.globalize_path(res_path)])
+	_request_refresh()
+
+
+## Log a concise Perforce status line for each selected file - a quick read-only
+## "where does P4 think this is" without leaving the editor. Also warms the hover
+## tooltip cache for these files.
+func _status_to_log(files: Array) -> void:
+	if not await _ensure_identity():
+		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		return
+	for res in files:
+		var rec := await _fetch_fstat_record(res)
+		_log("P4 status: %s" % _fstat_summary_line(res, rec))
+
+
+# --- Hover tooltip: a non-blocking per-file status cache -------------------
+
+## Called by P4FileSystemTooltip._make_tooltip_for_path (synchronous): render
+## whatever P4 status is cached for res_path, then kick a background refresh so a
+## later hover is up to date.
+func _on_tooltip_for_path(res_path: String, base: Control) -> void:
+	_decorate_tooltip(res_path, base)
+	if not res_path.ends_with("/"):
+		_prefetch_fstat(res_path) # fire-and-forget coroutine
+
+
+## Append cached P4 status rows to the base tooltip. Reads only the cache, so the
+## first hover of a file (nothing cached yet) just shows Godot's default tooltip;
+## the P4 rows appear from the second hover on, once the background fetch landed.
+func _decorate_tooltip(res_path: String, base: Control) -> void:
+	var cached: Variant = _fstat_cache.get(res_path)
+	if cached == null or base == null:
+		return
+	var rec: Dictionary = cached.data
+	base.add_child(HSeparator.new())
+	if rec.is_empty() or not rec.has("depotFile"):
+		_add_tooltip_label(base, "P4: not in Perforce", Color(0.6, 0.6, 0.6))
+		return
+	var have := String(rec.get("haveRev", "?"))
+	var head := String(rec.get("headRev", have))
+	_add_tooltip_label(base, "P4  %s#%s" % [rec.get("depotFile"), have], P4_ACCENT)
+	if head != have:
+		_add_tooltip_label(base, "head is #%s - out of date" % head, ACTION_DELETE_COLOR)
+	if rec.has("action"):
+		_add_tooltip_label(base, "opened for %s" % rec.get("action"), _action_color(String(rec.get("action"))))
+	if rec.has("ourLock"):
+		_add_tooltip_label(base, "locked by you", ACTION_EDIT_COLOR)
+	var others := _fstat_other_openers(rec)
+	if not others.is_empty():
+		_add_tooltip_label(base, "also open by %s" % ", ".join(others), ACTION_DELETE_COLOR)
+
+
+func _add_tooltip_label(base: Control, text: String, color: Color) -> void:
+	var label := Label.new()
+	label.text = text
+	label.add_theme_color_override("font_color", color)
+	base.add_child(label)
+
+
+## Background-refresh the cached fstat for a hovered file, skipping if one is
+## already in flight or the cache entry is still fresh. Fire-and-forget: the
+## tooltip callback calls this without awaiting.
+func _prefetch_fstat(res_path: String) -> void:
+	if _identity_checked and not _p4_available:
+		return
+	if _fstat_prefetch_inflight.has(res_path):
+		return
+	var cached: Variant = _fstat_cache.get(res_path)
+	if cached != null and Time.get_unix_time_from_system() - float(cached.time) < FSTAT_CACHE_TTL_SEC:
+		return
+	_fstat_prefetch_inflight[res_path] = true
+	await _fetch_fstat_record(res_path)
+	_fstat_prefetch_inflight.erase(res_path)
+
+
+## Run `p4 -ztag fstat` for one file, cache the parsed record (or {} if untracked/
+## unavailable), and return it. Shared by the tooltip prefetch and Show Status.
+func _fetch_fstat_record(res_path: String) -> Dictionary:
+	if not await _ensure_identity():
+		return {}
+	var recs := _parse_ztag(await _p4_exec(["-ztag", "fstat", ProjectSettings.globalize_path(res_path)]))
+	var rec: Dictionary = recs[0] if not recs.is_empty() else {}
+	_fstat_cache[res_path] = {"data": rec, "time": Time.get_unix_time_from_system()}
+	return rec
+
+
+## Everyone other than us who has the file open, from an fstat record's
+## otherOpen0..N fields ("user@client").
+func _fstat_other_openers(rec: Dictionary) -> Array:
+	var openers: Array = []
+	var i := 0
+	while rec.has("otherOpen%d" % i):
+		openers.append(String(rec.get("otherOpen%d" % i)))
+		i += 1
+	return openers
+
+
+## A one-line human summary of an fstat record for res_path (for the log). An
+## empty record means untracked/unknown.
+func _fstat_summary_line(res_path: String, rec: Dictionary) -> String:
+	if rec.is_empty() or not rec.has("depotFile"):
+		return "%s - not in Perforce (or unknown)" % res_path
+	var parts: Array = []
+	var have := String(rec.get("haveRev", "?"))
+	var head := String(rec.get("headRev", have))
+	parts.append("%s#%s" % [rec.get("depotFile"), have])
+	if head != have:
+		parts.append("(head #%s - out of date)" % head)
+	if rec.has("action"):
+		parts.append("opened for %s" % rec.get("action"))
+	if rec.has("ourLock"):
+		parts.append("locked by you")
+	var others := _fstat_other_openers(rec)
+	if not others.is_empty():
+		parts.append("also open by %s" % ", ".join(others))
+	return "%s - %s" % [res_path, " ".join(parts)]
+
+
+# ---------------------------------------------------------------------------
+# FileSystem dock operations: delete / move / rename
+#
+# These FileSystemDock signals fire AFTER Godot has already changed the disk, so
+# we can't intercept like checkout-on-edit does - we react, bringing Perforce in
+# line with what the dock just did. A deletion becomes an open-for-delete; a
+# move/rename is recorded with `p4 reconcile -m` (Perforce move detection), which
+# preserves history when the file's content is unchanged and degrades to a
+# delete + add when Godot rewrote it during the move. These prompt by default;
+# the "Auto add/edit/delete" setting applies them silently. Our own p4 sync/
+# revert/reload never route through these signals, so there's no feedback loop.
+# ---------------------------------------------------------------------------
+
+func _auto_open() -> bool:
+	return auto_open_checkbox != null and auto_open_checkbox.button_pressed
+
+
+## Confirm a delete/move recording, or auto-approve it in "Auto add/edit/delete"
+## mode. The on-disk delete/move already happened, so declining is always safe -
+## it just leaves Perforce a step behind until the next Reconcile.
+func _confirm_fs_action(message: String, ok_text: String, cancel_text: String) -> bool:
+	if _auto_open():
+		return true
+	return await _show_confirm_dialog(message, ok_text, cancel_text)
+
+
+func _on_fs_file_removed(file: String) -> void:
+	await _handle_fs_delete(file, false)
+
+
+func _on_fs_folder_removed(folder: String) -> void:
+	await _handle_fs_delete(folder, true)
+
+
+func _on_fs_files_moved(old_file: String, new_file: String) -> void:
+	await _handle_fs_move(old_file, new_file, false)
+
+
+func _on_fs_folder_moved(old_folder: String, new_folder: String) -> void:
+	await _handle_fs_move(old_folder, new_folder, true)
+
+
+## Record a workspace deletion in Perforce. A folder reconciles its whole subtree
+## for deletes; a single file branches on its fstat state (see _delete_action_for).
+func _handle_fs_delete(res_path: String, is_folder: bool) -> void:
+	if _shutting_down or not await _ensure_identity():
+		return
+	if is_folder:
+		var scope := _as_recursive(ProjectSettings.globalize_path(res_path))
+		var count := _count_tracked(_parse_ztag(await _p4_exec(["-ztag", "fstat", scope])))
+		if count == 0:
+			_log("Deleted folder '%s' - no Perforce-tracked files under it." % res_path)
+			return
+		if not await _confirm_fs_action(
+				("You deleted the folder '%s' (%d Perforce-tracked file(s)).\n\nOpen those " +
+				"files for delete in Perforce so the deletion lands in your changelist?")
+				% [res_path, count], "Open for Delete", "Leave in Perforce"):
+			_log("Left the deleted folder '%s' tracked in Perforce - run Reconcile to record it." % res_path)
+			return
+		await _p4_exec_logged(["reconcile", "-d", scope])
+		_request_refresh()
+		return
+
+	var rec := await _fetch_fstat_record(res_path)
+	var decision := _delete_action_for(rec)
+	if decision == "none":
+		_log("Deleted '%s' - not tracked by Perforce, nothing to record." % res_path)
+		return
+	if not await _confirm_fs_action(
+			("You deleted '%s'.\n\nOpen it for delete in Perforce so the deletion lands in " +
+			"your changelist?") % res_path, "Open for Delete", "Leave in Perforce"):
+		_log("Left '%s' tracked in Perforce - run Reconcile to record the deletion." % res_path)
+		return
+	await _p4_open_for_delete(res_path, decision)
+	_forget_path(res_path)
+	_request_refresh()
+
+
+## Record a workspace move/rename in Perforce, history-preserving where possible.
+func _handle_fs_move(old_res: String, new_res: String, is_folder: bool) -> void:
+	if _shutting_down or not await _ensure_identity():
+		return
+	var tracked: bool
+	if is_folder:
+		tracked = _count_tracked(_parse_ztag(await _p4_exec(
+				["-ztag", "fstat", _as_recursive(ProjectSettings.globalize_path(old_res))]))) > 0
+	else:
+		tracked = _delete_action_for(await _fetch_fstat_record(old_res)) != "none"
+	if not tracked:
+		_log("Moved '%s' -> '%s' - source not tracked by Perforce, nothing to record." % [old_res, new_res])
+		return
+	if not await _confirm_fs_action(
+			("You moved '%s'\n     -> '%s'.\n\nRecord this as a Perforce move? It preserves the " +
+			"file's history (and falls back to delete + add if the contents changed during the " +
+			"move).") % [old_res, new_res], "Record Move", "Skip"):
+		_log("Move of '%s' not recorded in Perforce - run Reconcile if you want it tracked." % old_res)
+		return
+	var result := await _p4_record_move(old_res, new_res, is_folder)
+	if result.exit_code != 0:
+		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+		await _show_alert(("Couldn't record the move of '%s' in Perforce:\n\n%s\n\nThe files are " +
+				"already moved on disk - use Reconcile to record it.") % [old_res, msg])
+	else:
+		_forget_path(old_res)
+		if not is_folder:
+			_checked_out_this_session[new_res] = true
+	_request_refresh()
+
+
+## How to record a single-file deletion, from its `-ztag fstat` record. Pure, so
+## a headless self-test can pin the mapping:
+## - "none":      untracked, or already deleted at head - nothing to do.
+## - "revert":    only open for add (never in the depot) - undo the pending add.
+## - "reconcile": tracked (opened for edit or not) but now missing on disk -
+##                `p4 reconcile -d` records the delete without restoring the file.
+func _delete_action_for(rec: Dictionary) -> String:
+	if rec.is_empty() or not rec.has("depotFile"):
+		return "none"
+	var act := String(rec.get("action", ""))
+	if act == "add" or act == "move/add":
+		return "revert"
+	if act == "" and String(rec.get("headAction", "")) in ["delete", "move/delete"]:
+		return "none"
+	return "reconcile"
+
+
+func _p4_open_for_delete(res_path: String, decision: String) -> void:
+	var global_path := ProjectSettings.globalize_path(res_path)
+	match decision:
+		"revert":
+			await _p4_exec_logged(["revert", global_path])
+		"reconcile":
+			await _p4_exec_logged(["reconcile", "-d", global_path])
+
+
+## Record a move via `p4 reconcile -m`, scoped to just the two paths (or the two
+## subtrees for a folder). Move detection pairs the now-missing source with the
+## new file by content: matched -> a history-preserving move/delete + move/add;
+## unmatched (Godot rewrote it) -> a plain delete + add.
+func _p4_record_move(old_res: String, new_res: String, is_folder: bool) -> Dictionary:
+	var old_g := ProjectSettings.globalize_path(old_res)
+	var new_g := ProjectSettings.globalize_path(new_res)
+	if is_folder:
+		old_g = _as_recursive(old_g)
+		new_g = _as_recursive(new_g)
+	return await _p4_exec_logged(["reconcile", "-m", old_g, new_g])
+
+
+## A local path as a p4 recursive scope (append "/..."), for folder operations.
+func _as_recursive(global_path: String) -> String:
+	if global_path.ends_with("/") or global_path.ends_with("\\"):
+		return global_path + "..."
+	return global_path + "/..."
+
+
+## Count the Perforce-tracked files in a set of `-ztag fstat` records (anything
+## that would need an open-for-delete or a pending-add revert).
+func _count_tracked(recs: Array) -> int:
+	var n := 0
+	for rec in recs:
+		if _delete_action_for(rec) != "none":
+			n += 1
+	return n
+
+
+## Drop a path from every session cache (after it's deleted or moved away).
+func _forget_path(res_path: String) -> void:
+	_checked_out_this_session.erase(res_path)
+	_declined_this_session.erase(res_path)
+	_pending_save_checkout.erase(res_path)
+	_fstat_cache.erase(res_path)
+
+
+# ---------------------------------------------------------------------------
 # CLI self-tests (headless smoke tests; harmless no-ops in normal use)
 #
 #   godot --headless --editor --path <project> -- --p4-selftest-<name>=res://<file>
@@ -2588,6 +3097,59 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] numbered-cl(3): %s" % _selftest_menu_labels())
 			_populate_context_menu({"type": "cl", "change": "124", "desc": "empty", "file_count": 0})
 			_log("[selftest] numbered-cl(0): %s" % _selftest_menu_labels())
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-fs-menu":
+			# Server-independent: folder filtering + the FileSystem-dock action set.
+			var fs_files := _fs_files_only(PackedStringArray(
+					["res://a.gd", "res://sub/", "res://scenes/b.tscn"]))
+			_log("[selftest] fs files kept: %s" % [fs_files])
+			var labels: Array = []
+			for action in _fs_context_actions():
+				labels.append(String(action.label))
+			_log("[selftest] fs-menu: %s" % " | ".join(labels))
+			var ok := fs_files.size() == 2 and ("res://a.gd" in fs_files) \
+					and not ("res://sub/" in fs_files) and labels.size() == 6
+			_log("[selftest] %s: fs-menu" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-fstat-summary":
+			# Server-independent: the human status line from a canned fstat record.
+			var rec := {"depotFile": "//depot/a.gd", "haveRev": "3", "headRev": "5",
+					"action": "edit", "otherOpen0": "bob@bob_ws"}
+			var line := _fstat_summary_line("res://a.gd", rec)
+			_log("[selftest] summary: %s" % line)
+			var untracked := _fstat_summary_line("res://b.gd", {})
+			_log("[selftest] untracked: %s" % untracked)
+			var ok := line.contains("//depot/a.gd#3") and line.contains("out of date") \
+					and line.contains("opened for edit") and line.contains("bob@bob_ws") \
+					and untracked.contains("not in Perforce")
+			_log("[selftest] %s: fstat-summary" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-delete-action":
+			# Server-independent: the delete-recording decision per fstat state,
+			# plus the recursive-scope helper for folder ops.
+			var cases := {
+				"untracked": [{}, "none"],
+				"tracked": [{"depotFile": "//d/a", "headRev": "3"}, "reconcile"],
+				"opened-add": [{"depotFile": "//d/a", "action": "add"}, "revert"],
+				"opened-edit": [{"depotFile": "//d/a", "action": "edit", "headRev": "3"}, "reconcile"],
+				"gone-at-head": [{"depotFile": "//d/a", "headAction": "delete"}, "none"],
+			}
+			var all_ok := true
+			for case_name in cases:
+				var got := _delete_action_for(cases[case_name][0])
+				var want := String(cases[case_name][1])
+				var matched := got == want
+				all_ok = all_ok and matched
+				_log("[selftest] delete-action %s: got=%s want=%s %s"
+						% [case_name, got, want, "OK" if matched else "MISMATCH"])
+			var scope_ok := _as_recursive("C:/p/dir") == "C:/p/dir/..." \
+					and _as_recursive("C:/p/dir/") == "C:/p/dir/..."
+			_log("[selftest] as-recursive: %s" % ("OK" if scope_ok else "BAD"))
+			all_ok = all_ok and scope_ok
+			_log("[selftest] %s: delete-action" % ("PASS" if all_ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-reconcile-preview":
