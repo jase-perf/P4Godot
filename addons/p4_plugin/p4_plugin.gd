@@ -206,6 +206,23 @@ var _shutting_down: bool = false
 # told apart from our own checkout in `p4 opened -a` output.
 var _p4_user: String = ""
 var _p4_client: String = ""
+var _p4_port: String = ""
+
+# Optional per-project connection overrides (persisted in editor metadata,
+# chosen via connection setup). Passed to every command as p4 global flags
+# (-p/-u/-c), so a project binds to the right server/client without touching
+# the user's machine-wide p4 configuration (P4CONFIG, registry, env).
+var _override_port: String = ""
+var _override_user: String = ""
+var _override_client: String = ""
+
+# Ticket-expiry re-login. _login_prompt_active single-flights the prompt (a
+# dead ticket fails many commands at once); _login_declined stops re-prompting
+# after a cancel until the user presses Refresh. _setup_active single-flights
+# the connection setup flow the same way.
+var _login_prompt_active: bool = false
+var _login_declined: bool = false
+var _setup_active: bool = false
 
 # res:// path -> true. Session caches so we don't shell out to p4 on every
 # keystroke/save:
@@ -340,20 +357,255 @@ func _exit_tree() -> void:
 		diff_view = null
 
 
+## Startup probe: resolve who we are via `p4 -ztag info`, decide availability,
+## and when the connection is misconfigured (no server, dead ticket, wrong or
+## missing client) open the interactive connection setup instead of failing
+## quietly into the log.
 func _detect_p4_identity() -> void:
-	var result: Dictionary = await _p4_exec(["info"])
-	if result.exit_code == 0 and not result.output.is_empty():
-		for raw_line in String(result.output[0]).split("\n"):
-			var line: String = raw_line.strip_edges()
-			if line.begins_with("User name:"):
-				_p4_user = line.substr("User name:".length()).strip_edges()
-			elif line.begins_with("Client name:"):
-				_p4_client = line.substr("Client name:".length()).strip_edges()
-		_p4_available = true
-	else:
-		_log("Warning: 'p4 info' failed - is p4 installed and configured? Automatic checkout is disabled for this session.")
+	var status: String = await _probe_connection()
+	_p4_available = status == "ok"
 	_identity_checked = true
 	identity_checked.emit()
+	if status == "ok":
+		_request_refresh()
+		# Surface a dead ticket now (`login -s` fails -> the re-login prompt),
+		# not on the user's first checkout attempt.
+		_p4_exec(["login", "-s"])
+		return
+	_log("Perforce is not ready (%s) - opening connection setup." % status)
+	_offer_connection_setup()
+
+
+## One `p4 -ztag info` probe. On success fills _p4_user/_p4_client/_p4_port and
+## returns "ok"; otherwise names what is wrong: "p4 missing" (CLI not found),
+## "no server" (can't connect), "not logged in", or "no client" (workspace
+## unknown, or its root doesn't contain this project).
+func _probe_connection() -> String:
+	var result: Dictionary = await _p4_exec(["-ztag", "info"])
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	if result.exit_code != 0:
+		if _looks_like_login_error(result):
+			return "not logged in"
+		if text.contains("Connect to server failed") or text.contains("check $P4PORT") \
+				or text.to_lower().contains("tcp connect"):
+			return "no server"
+		return "p4 missing" if text.strip_edges().is_empty() else "no server"
+	var records := _parse_ztag(result)
+	var info: Dictionary = {} if records.is_empty() else records[0]
+	_p4_user = String(info.get("userName", ""))
+	_p4_port = String(info.get("serverAddress", ""))
+	var client := String(info.get("clientName", ""))
+	var root := String(info.get("clientRoot", ""))
+	if client == "*unknown*" or client.is_empty() or not _project_inside_root(root):
+		return "no client"
+	_p4_client = client
+	return "ok"
+
+
+## Whether the project directory lives under `client_root` (case-insensitive,
+## slash-normalized - p4 reports Windows roots with backslashes).
+func _project_inside_root(client_root: String) -> bool:
+	if client_root.is_empty() or client_root == "null":
+		return false
+	var project := ProjectSettings.globalize_path("res://").replace("\\", "/").to_lower()
+	var root := client_root.replace("\\", "/").to_lower()
+	return (project.rstrip("/") + "/").begins_with(root.rstrip("/") + "/")
+
+
+## Interactive connection setup: figure out what's missing (server -> login ->
+## client), ask for just that piece, and re-probe until `p4 info` resolves this
+## project. Workspace suggestions come from the user's existing clients on the
+## server, ranked by whether their root contains this project.
+func _offer_connection_setup() -> void:
+	if _setup_active or _shutting_down:
+		return
+	_setup_active = true
+	var attempts := 0
+	while attempts < 8: # each pass fixes one piece; 8 is a runaway stop, not a budget
+		attempts += 1
+		var status: String = await _probe_connection()
+		if status == "ok":
+			_p4_available = true
+			_save_connection_overrides()
+			_log("Perforce connected: user %s, client %s, server %s." \
+					% [_p4_user, _p4_client, _p4_port])
+			_request_refresh()
+			break
+		if status == "p4 missing":
+			await _show_alert("The p4 command-line client isn't installed (or isn't on PATH).\n\n" +
+					"Install the Helix Command-Line Client (P4) from perforce.com/downloads,\n" +
+					"then press Refresh in the P4 dock.")
+			break
+		if status == "no server":
+			var prefill: String = await _suggest_port()
+			var res: Dictionary = await _show_input_dialog("P4 Connection Setup",
+					"Couldn't reach a Perforce server.\n" +
+					"Enter the server address (host:port, e.g. ssl:p4.example.com:1666):",
+					prefill, false, "Connect")
+			if not res.ok:
+				break
+			_override_port = String(res.text).strip_edges()
+			continue
+		if status == "not logged in":
+			if not await _login_flow():
+				break
+			continue
+		if status == "no client":
+			if not await _pick_client():
+				break
+			continue
+	_setup_active = false
+	if not _p4_available:
+		_log("Perforce is still not configured - press Refresh in the P4 dock to run setup again.")
+
+
+## Best guess for the server-address prompt: a stored override, else whatever
+## `p4 set` reports for P4PORT (env, registry, or an inherited P4CONFIG).
+func _suggest_port() -> String:
+	if not _override_port.is_empty():
+		return _override_port
+	var result: Dictionary = await _p4_exec(["set", "-q", "P4PORT"])
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	for raw_line in text.split("\n"):
+		var line := String(raw_line).strip_edges()
+		if line.begins_with("P4PORT="):
+			return line.substr("P4PORT=".length())
+	return ""
+
+
+## Suggest one of the user's existing workspaces for this project; the picked
+## name becomes the per-project client override. Returns false on cancel.
+func _pick_client() -> bool:
+	var result: Dictionary = await _p4_exec(["-ztag", "clients", "--me"])
+	if result.exit_code != 0:
+		# --me needs 2020.1+; fall back to filtering by user name.
+		var user := _override_user if not _override_user.is_empty() else _p4_user
+		if not user.is_empty():
+			result = await _p4_exec(["-ztag", "clients", "-u", user])
+	var clients: Array = _parse_ztag(result) if result.exit_code == 0 else []
+	var matches: Array = []
+	var others: Array = []
+	for c in clients:
+		if String(c.get("client", "")).is_empty():
+			continue
+		if _project_inside_root(String(c.get("Root", ""))):
+			matches.append(c)
+		else:
+			others.append(c)
+	var ordered: Array = matches + others
+	if ordered.is_empty():
+		var res: Dictionary = await _show_input_dialog("P4 Connection Setup",
+				("No workspaces found for your user on %s.\n" % _p4_port) +
+				"Create one in P4V (or with `p4 client`) whose root contains this project,\n" +
+				"then press Refresh in the P4 dock. Or enter a workspace name to use directly:",
+				"", false, "Use Workspace")
+		if not res.ok or String(res.text).strip_edges().is_empty():
+			return false
+		_override_client = String(res.text).strip_edges()
+		return true
+	var options := PackedStringArray()
+	for c in ordered:
+		options.append("%s   (%s)" % [String(c.get("client", "")), String(c.get("Root", ""))])
+	var head := "Found a workspace whose root contains this project.\n" if not matches.is_empty() \
+			else "None of your workspaces' roots contain this project - pick one anyway,\nor cancel and create a workspace for it first.\n"
+	var picked: Dictionary = await _show_option_dialog("P4 Connection Setup",
+			head + "Workspace to use for this project (stored per-project, per-user):",
+			options, 0, "Use This Workspace")
+	if not picked.ok:
+		return false
+	_override_client = String(ordered[picked.index].get("client", ""))
+	return true
+
+
+## The interactive login loop: password prompt -> `p4 login` (password fed via
+## the stdin temp-file plumbing, so it never appears on a command line or in
+## the log) -> retry on a wrong password. Returns true once logged in.
+func _login_flow() -> bool:
+	var who := _p4_user if not _p4_user.is_empty() else \
+			(_override_user if not _override_user.is_empty() else "your Perforce user")
+	var where := "" if _p4_port.is_empty() else (" on %s" % _p4_port)
+	while true:
+		var res: Dictionary = await _show_input_dialog("P4 Login",
+				"Perforce needs you to log in again%s.\nPassword for %s:" % [where, who],
+				"", false, "Log In", true)
+		if not res.ok:
+			return false
+		var result: Dictionary = await _p4_exec_spec(["login"], String(res.text) + "\n")
+		if result.exit_code == 0:
+			_log("Logged in to Perforce as %s." % who)
+			return true
+		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+		if msg.contains("doesn't exist"):
+			# Wrong Perforce user (e.g. the OS username default). Let them fix
+			# the user name and go around again.
+			var ures: Dictionary = await _show_input_dialog("P4 Login",
+					"That Perforce user doesn't exist on %s.\nUser name to log in as:" % _p4_port,
+					who, false, "Set User")
+			if ures.ok and not String(ures.text).strip_edges().is_empty():
+				_override_user = String(ures.text).strip_edges()
+				who = _override_user
+				continue
+		await _show_alert("Login failed:\n\n%s" % msg)
+	return false # unreachable; while-true exits via return
+
+
+## Auto-prompt wrapper used when the ticket dies mid-session: single-flight,
+## and a cancel suppresses further auto-prompts until the user presses Refresh.
+func _offer_login() -> void:
+	if _login_prompt_active or _login_declined or _setup_active or _shutting_down:
+		return
+	_login_prompt_active = true
+	if await _login_flow():
+		_p4_available = true
+		_request_refresh()
+	else:
+		_login_declined = true
+		_log("Login declined - Perforce operations will fail until you log in. Press Refresh to try again.")
+	_login_prompt_active = false
+
+
+## p4's standard messages for a missing/expired/revoked auth ticket.
+func _looks_like_login_error(result: Dictionary) -> bool:
+	if int(result.get("exit_code", 0)) == 0:
+		return false
+	for chunk in result.get("output", []):
+		var text := String(chunk)
+		if text.contains("please login again") \
+				or text.contains("Perforce password (P4PASSWD) invalid or unset"):
+			return true
+	return false
+
+
+## Called after every plain p4 result: a dead-ticket failure pops one re-login
+## prompt. (Spec-stdin commands skip this - `p4 login` itself is one of them.)
+func _maybe_offer_login(result: Dictionary) -> void:
+	if _looks_like_login_error(result):
+		_offer_login()
+
+
+## p4 global flags for the stored connection overrides; prepended to every
+## command. Empty overrides mean plain inherited configuration, unchanged.
+func _with_connection_flags(args: PackedStringArray) -> PackedStringArray:
+	var flags := PackedStringArray()
+	if not _override_port.is_empty():
+		flags.append_array(["-p", _override_port])
+	if not _override_user.is_empty():
+		flags.append_array(["-u", _override_user])
+	if not _override_client.is_empty():
+		flags.append_array(["-c", _override_client])
+	if flags.is_empty():
+		return args
+	var combined := flags.duplicate()
+	combined.append_array(args)
+	return combined
+
+
+## Persist the connection overrides next to the other per-project settings.
+func _save_connection_overrides() -> void:
+	var settings := get_editor_interface().get_editor_settings()
+	settings.set_project_metadata(SETTINGS_SECTION, "override_port", _override_port)
+	settings.set_project_metadata(SETTINGS_SECTION, "override_user", _override_user)
+	settings.set_project_metadata(SETTINGS_SECTION, "override_client", _override_client)
 
 
 ## Awaitable gate: resolves to _p4_available once the startup `p4 info` check
@@ -381,6 +633,9 @@ func _load_settings() -> void:
 	auto_open_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "auto_open_no_prompt", false)
 	_verbose_log = verbose_log_checkbox.button_pressed
+	_override_port = settings.get_project_metadata(SETTINGS_SECTION, "override_port", "")
+	_override_user = settings.get_project_metadata(SETTINGS_SECTION, "override_user", "")
+	_override_client = settings.get_project_metadata(SETTINGS_SECTION, "override_client", "")
 
 
 func _on_setting_toggled(_pressed: bool) -> void:
@@ -1024,7 +1279,7 @@ func _on_diff_selected_pressed() -> void:
 ## degenerates into remove-all/add-all.
 func _diff_path(res_path: String) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
 	var result := await _p4_exec(["diff", "-dul", ProjectSettings.globalize_path(res_path)])
 	var text := "" if result.output.is_empty() else String(result.output[0])
@@ -1120,8 +1375,8 @@ func _rebuild_tree(model: Dictionary) -> void:
 	var root := tree.create_item()
 	if not model.get("available", false):
 		var row := tree.create_item(root)
-		row.set_text(0, "Perforce unavailable - see the P4 Log.")
-		row.set_selectable(0, false)
+		row.set_text(0, "Perforce unavailable - double-click here to set up the connection.")
+		row.set_metadata(0, {"type": "setup"})
 		return
 	var folder_icon := _theme_icon("Folder")
 	for cl in model.changelists:
@@ -1182,7 +1437,12 @@ func _on_tree_item_activated() -> void:
 	if item == null:
 		return
 	var meta: Variant = item.get_metadata(0)
-	if typeof(meta) != TYPE_DICTIONARY or meta.get("type") != "file":
+	if typeof(meta) != TYPE_DICTIONARY:
+		return
+	if meta.get("type") == "setup":
+		_offer_connection_setup()
+		return
+	if meta.get("type") != "file":
 		return
 	_open_res_path(meta.res_path)
 
@@ -1380,6 +1640,10 @@ func _on_context_menu_id_pressed(id: int) -> void:
 
 
 func _on_refresh_pressed() -> void:
+	_login_declined = false # a manual Refresh re-arms the auto login prompt
+	if _identity_checked and not _p4_available:
+		_detect_p4_identity() # re-probe; reopens connection setup if still broken
+		return
 	_refresh_changelists()
 
 
@@ -1591,7 +1855,7 @@ func _on_reconcile_pressed() -> void:
 
 func _reconcile_flow() -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
 	var preview := await _reconcile_preview()
 	if preview.is_empty():
@@ -1627,7 +1891,7 @@ func _on_revert_unchanged_pressed() -> void:
 
 func _revert_unchanged_flow() -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
 	var preview := await _revert_unchanged_preview()
 	if preview.is_empty():
@@ -1880,7 +2144,7 @@ func _submit_changelist_from_meta(meta: Dictionary) -> void:
 ## files (`submit -d <desc> <scope>`).
 func _submit_changelist(change: String, files: Array) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
 	if files.is_empty():
 		await _show_alert("This changelist has no files to submit.")
@@ -2187,7 +2451,8 @@ func _local_to_res(local_path: String) -> String:
 func _p4_exec(args: PackedStringArray) -> Dictionary:
 	if _p4_thread == null:
 		return _p4_exec_sync(args) # Worker gone (shutdown); it logs on its own.
-	var loud := _should_log_cmd(args)
+	var loud := _should_log_cmd(args) # decided BEFORE the -p/-u/-c flags join in
+	args = _with_connection_flags(args)
 	if loud:
 		_log_p4_cmd(args)
 	var req := P4Request.new()
@@ -2202,6 +2467,7 @@ func _p4_exec(args: PackedStringArray) -> Dictionary:
 	_p4_inflight -= 1
 	var result := {"exit_code": req.exit_code, "output": req.output}
 	_finish_p4_log(args, result, loud)
+	_maybe_offer_login(result)
 	return result
 
 
@@ -2218,8 +2484,9 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 	var tmp := _write_temp_spec(spec_text)
 	if tmp.is_empty():
 		return {"exit_code": -1, "output": ["Could not write a temporary p4 spec file."]}
-	var display_args := args + PackedStringArray(["< (spec on stdin)"])
 	var loud := _should_log_cmd(args) # change -i is always loud (never a probe)
+	args = _with_connection_flags(args)
+	var display_args := args + PackedStringArray(["< (spec on stdin)"])
 	if loud:
 		_log_p4_cmd(display_args)
 	if _p4_thread == null:
@@ -2269,12 +2536,14 @@ func _write_temp_spec(spec_text: String) -> String:
 
 func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
 	var loud := _should_log_cmd(args)
+	args = _with_connection_flags(args)
 	if loud:
 		_log_p4_cmd(args)
 	var output := []
 	var exit_code := OS.execute("p4", args, output, true)
 	var result := {"exit_code": exit_code, "output": output}
 	_finish_p4_log(args, result, loud)
+	_maybe_offer_login(result)
 	return result
 
 
@@ -2318,10 +2587,12 @@ func _is_probe_command(args: PackedStringArray) -> bool:
 			break
 	match sub:
 		"info", "fstat", "opened", "where", "changes", "print", "have", "files", "dirs", \
-		"diff", "diff2":
+		"diff", "diff2", "set", "clients":
 			return true
 		"change":
 			return "-o" in args # change -o reads; change -i / -d mutate
+		"login":
+			return "-s" in args # login -s only reports ticket status
 		_:
 			return false
 
@@ -2457,9 +2728,10 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 
 ## Shows a modal dialog with a text field and returns {ok: bool, text: String}.
 ## Used for changelist descriptions. Serialized through the same _dialog_busy
-## lock as the other dialogs. `multiline` picks a TextEdit vs a LineEdit.
+## lock as the other dialogs. `multiline` picks a TextEdit vs a LineEdit;
+## `secret` masks a single-line field (passwords).
 func _show_input_dialog(title: String, message: String, default_text: String,
-		multiline: bool, ok_text: String) -> Dictionary:
+		multiline: bool, ok_text: String, secret: bool = false) -> Dictionary:
 	if _shutting_down:
 		return {"ok": false, "text": ""}
 	while _dialog_busy:
@@ -2498,6 +2770,7 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 	else:
 		var le := LineEdit.new()
 		le.text = default_text
+		le.secret = secret
 		le.custom_minimum_size = Vector2(420, 0)
 		vbox.add_child(le)
 		input = le
@@ -2527,6 +2800,55 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 	_discard_dialog(dialog)
 	_dialog_busy = false
 	return {"ok": confirmed, "text": text}
+
+
+## Shows a modal dialog with a message and a dropdown of options; returns
+## {ok: bool, index: int}. Used by connection setup to pick a workspace.
+func _show_option_dialog(title: String, message: String, options: PackedStringArray,
+		preselect: int, ok_text: String) -> Dictionary:
+	if _shutting_down:
+		return {"ok": false, "index": -1}
+	while _dialog_busy:
+		await get_tree().process_frame
+	_dialog_busy = true
+	_dialog_result_ready = false
+	_dialog_result_confirmed = false
+
+	var dialog := ConfirmationDialog.new()
+	dialog.title = title
+	dialog.set_ok_button_text(ok_text)
+	var vbox := VBoxContainer.new()
+	var label := Label.new()
+	label.text = message
+	vbox.add_child(label)
+	var picker := OptionButton.new()
+	for opt in options:
+		picker.add_item(opt)
+	if preselect >= 0 and preselect < options.size():
+		picker.select(preselect)
+	picker.custom_minimum_size = Vector2(460, 0)
+	vbox.add_child(picker)
+	dialog.add_child(vbox)
+	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	dialog.canceled.connect(_on_confirm_dialog_canceled)
+	dialog.close_requested.connect(_on_confirm_dialog_canceled)
+	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+
+	if not _selftest_auto_answer.is_empty():
+		await get_tree().process_frame
+		if is_instance_valid(dialog):
+			if _selftest_auto_answer == "confirm":
+				dialog.confirmed.emit()
+			else:
+				dialog.canceled.emit()
+
+	while not _dialog_result_ready:
+		await get_tree().process_frame
+	var confirmed := _dialog_result_confirmed
+	var index: int = picker.selected if (confirmed and is_instance_valid(picker)) else -1
+	_discard_dialog(dialog)
+	_dialog_busy = false
+	return {"ok": confirmed and index >= 0, "index": index}
 
 
 ## Shows a modal OK-only notice (checkout failures and other conditions the
@@ -2770,7 +3092,7 @@ func _ctx_status(paths: PackedStringArray) -> void:
 ## files. Refreshes the changelist tree.
 func _add_path(res_path: String) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
 	await _p4_exec_logged(["add", ProjectSettings.globalize_path(res_path)])
 	_request_refresh()
@@ -2781,7 +3103,7 @@ func _add_path(res_path: String) -> void:
 ## tooltip cache for these files.
 func _status_to_log(files: Array) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable this session - see the P4 Log.")
+		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
 	for res in files:
 		var rec := await _fetch_fstat_record(res)
