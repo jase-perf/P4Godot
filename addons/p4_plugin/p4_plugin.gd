@@ -145,6 +145,10 @@ var diff_view: RichTextLabel
 var new_changelist_button: Button
 var reconcile_button: Button
 var revert_unchanged_button: Button
+# Right side of the toolbar: connection status (click = connection setup) and
+# the gear menu fronting the hidden setting checkboxes.
+var conn_status_button: Button
+var settings_menu: MenuButton
 var auto_checkout_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 var verbose_log_checkbox: CheckBox
@@ -366,6 +370,7 @@ func _detect_p4_identity() -> void:
 	_p4_available = status == "ok"
 	_identity_checked = true
 	identity_checked.emit()
+	_update_conn_status()
 	if status == "ok":
 		_request_refresh()
 		# Surface a dead ticket now (`login -s` fails -> the re-login prompt),
@@ -419,6 +424,9 @@ func _project_inside_root(client_root: String) -> bool:
 func _offer_connection_setup() -> void:
 	if _setup_active or _shutting_down:
 		return
+	if DisplayServer.get_name() == "headless":
+		_log("Connection setup skipped - headless session has nobody to ask.")
+		return
 	_setup_active = true
 	var attempts := 0
 	while attempts < 8: # each pass fixes one piece; 8 is a runaway stop, not a budget
@@ -455,6 +463,7 @@ func _offer_connection_setup() -> void:
 				break
 			continue
 	_setup_active = false
+	_update_conn_status()
 	if not _p4_available:
 		_log("Perforce is still not configured - press Refresh in the P4 dock to run setup again.")
 
@@ -557,6 +566,7 @@ func _offer_login() -> void:
 	_login_prompt_active = true
 	if await _login_flow():
 		_p4_available = true
+		_update_conn_status()
 		_request_refresh()
 	else:
 		_login_declined = true
@@ -1078,42 +1088,46 @@ func _build_dock() -> void:
 	dock = VBoxContainer.new()
 	dock.name = "P4"
 
-	# Flow containers wrap their children, so the dock stays usable whether
-	# the user leaves it in a narrow side slot, floats it, or widens it.
-	var button_row := HFlowContainer.new()
-	dock.add_child(button_row)
-	_add_dock_button(button_row, "Refresh",
-			"Re-query Perforce and rebuild the changelist view.",
-			_on_refresh_pressed)
-	new_changelist_button = _add_dock_button(button_row, "New Changelist...",
+	# One compact toolbar row. Per-file actions live in the tree's right-click
+	# menu (and the FileSystem dock), not here - the toolbar carries only the
+	# project-wide operations, with connection status and settings on the right.
+	var toolbar := HBoxContainer.new()
+	dock.add_child(toolbar)
+	_add_toolbar_button(toolbar, "Reload", "Refresh",
+			"Refresh: re-query Perforce and rebuild the changelist view.",
+			_on_refresh_pressed, true)
+	new_changelist_button = _add_toolbar_button(toolbar, "Add", "New Changelist...",
 			"Create a new empty pending changelist.",
 			_on_new_changelist_pressed)
-	reconcile_button = _add_dock_button(button_row, "Reconcile...",
+	toolbar.add_child(VSeparator.new())
+	reconcile_button = _add_toolbar_button(toolbar, "", "Reconcile...",
 			"Find files changed on disk and open them for add/edit/delete in Perforce.",
 			_on_reconcile_pressed)
-	revert_unchanged_button = _add_dock_button(button_row, "Revert Unchanged...",
+	revert_unchanged_button = _add_toolbar_button(toolbar, "", "Revert Unchanged...",
 			"Revert opened files that have no actual changes (p4 revert -a).",
 			_on_revert_unchanged_pressed)
-	_add_dock_button(button_row, "Checkout Active File",
-			"Run 'p4 edit' on the scene/script open in the active editor tab.",
-			_on_checkout_current_pressed)
-	_add_dock_button(button_row, "Diff Selected File",
-			"Show a diff of the file selected in the changelist tree against its depot revision.",
-			_on_diff_selected_pressed)
-	_add_dock_button(button_row, "Revert Selected File",
-			"Run 'p4 revert' on the file selected in the changelist tree, then reload it from disk.",
-			_on_revert_selected_pressed)
-	_add_dock_button(button_row, "Sync Selected File",
-			"Run 'p4 sync' on the file selected in the changelist tree, then reload it from disk.",
-			_on_sync_selected_pressed)
-	_add_dock_button(button_row, "Reload Selected File",
-			"Reload the file selected in the changelist tree from disk without touching P4.",
-			_on_reload_selected_pressed)
-	_add_dock_button(button_row, "Log",
+
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	toolbar.add_child(spacer)
+
+	conn_status_button = Button.new()
+	conn_status_button.flat = true
+	conn_status_button.pressed.connect(_on_conn_status_pressed)
+	toolbar.add_child(conn_status_button)
+	_update_conn_status()
+
+	toolbar.add_child(VSeparator.new())
+	_build_settings_menu(toolbar)
+	_add_toolbar_button(toolbar, "", "Log",
 			"Show or hide the P4 activity log window.",
 			_on_toggle_log_pressed)
 
+	# The setting checkboxes stay real nodes - self-tests poke them, hot paths
+	# and _load_settings read/write them - but the row is hidden: the gear menu
+	# above is their visible face.
 	var settings_row := HFlowContainer.new()
+	settings_row.visible = false
 	dock.add_child(settings_row)
 
 	auto_checkout_checkbox = CheckBox.new()
@@ -1163,13 +1177,100 @@ func _build_dock() -> void:
 	_request_refresh()
 
 
-func _add_dock_button(parent: Control, text: String, tooltip: String, handler: Callable) -> Button:
+## A flat toolbar button. With `icon_only` the editor-theme icon replaces the
+## label (tooltip carries the name); a missing icon falls back to the label so
+## the button is never blank.
+func _add_toolbar_button(parent: Control, icon_name: String, text: String,
+		tooltip: String, handler: Callable, icon_only: bool = false) -> Button:
 	var button := Button.new()
-	button.text = text
+	button.flat = true
 	button.tooltip_text = tooltip
 	button.pressed.connect(handler)
+	var icon: Texture2D = null if icon_name.is_empty() else _theme_icon(icon_name)
+	if icon:
+		button.icon = icon
+		if not icon_only:
+			button.text = text
+	else:
+		button.text = text
 	parent.add_child(button)
 	return button
+
+
+## The gear menu fronting the four setting checkboxes. Checkable popup items
+## sync from the checkboxes on open and toggle them on click, so the existing
+## persistence (_on_setting_toggled) and every reader stay untouched.
+func _build_settings_menu(parent: Control) -> void:
+	settings_menu = MenuButton.new()
+	settings_menu.flat = true
+	settings_menu.tooltip_text = "P4 plugin settings (stored per-project, per-user)."
+	var gear := _theme_icon("Tools")
+	if gear:
+		settings_menu.icon = gear
+	else:
+		settings_menu.text = "Settings"
+	var popup := settings_menu.get_popup()
+	popup.hide_on_checkable_item_selection = false
+	popup.add_check_item("Checkout on edit", 0)
+	popup.add_check_item("Checkout on save", 1)
+	popup.add_check_item("Auto add/edit/delete", 2)
+	popup.add_check_item("Verbose log", 3)
+	popup.set_item_tooltip(0, "Offer to check out a file the moment it is first modified in the editor.")
+	popup.set_item_tooltip(1, "Automatically check out edited files right before the editor writes them.")
+	popup.set_item_tooltip(2, "Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs.")
+	popup.set_item_tooltip(3, "Log read-only status probes too, not just state-changing commands.")
+	popup.about_to_popup.connect(_sync_settings_menu)
+	popup.id_pressed.connect(_on_settings_menu_id_pressed)
+	parent.add_child(settings_menu)
+
+
+func _settings_menu_checkbox(id: int) -> CheckBox:
+	match id:
+		0: return auto_checkout_checkbox
+		1: return checkout_on_save_checkbox
+		2: return auto_open_checkbox
+		3: return verbose_log_checkbox
+	return null
+
+
+func _sync_settings_menu() -> void:
+	var popup := settings_menu.get_popup()
+	for id in 4:
+		var cb := _settings_menu_checkbox(id)
+		popup.set_item_checked(popup.get_item_index(id), cb != null and cb.button_pressed)
+
+
+func _on_settings_menu_id_pressed(id: int) -> void:
+	var cb := _settings_menu_checkbox(id)
+	if cb:
+		# Setting button_pressed emits toggled, which persists the change.
+		cb.button_pressed = not cb.button_pressed
+		_sync_settings_menu()
+
+
+## Reflect the connection in the toolbar status button: who we are when
+## connected, an invitation to set up when not.
+func _update_conn_status() -> void:
+	if conn_status_button == null:
+		return
+	if _p4_available:
+		conn_status_button.text = "%s @ %s" % [_p4_user, _p4_client]
+		conn_status_button.icon = _theme_icon("StatusSuccess")
+		conn_status_button.tooltip_text = "Connected to %s as %s, workspace %s.\nClick to change the connection." \
+				% [_p4_port, _p4_user, _p4_client]
+	elif _identity_checked:
+		conn_status_button.text = "Not connected"
+		conn_status_button.icon = _theme_icon("StatusError")
+		conn_status_button.tooltip_text = "Perforce is not connected. Click to run connection setup."
+	else:
+		conn_status_button.text = "Connecting..."
+		conn_status_button.icon = null
+		conn_status_button.tooltip_text = "Waiting for the startup p4 info probe."
+
+
+func _on_conn_status_pressed() -> void:
+	_login_declined = false
+	_offer_connection_setup()
 
 
 func _log(text: String) -> void:
@@ -1204,7 +1305,7 @@ func _build_log_window() -> void:
 
 	var log_tools := HBoxContainer.new()
 	log_root.add_child(log_tools)
-	_add_dock_button(log_tools, "Clear Log", "", _on_clear_log_pressed)
+	_add_toolbar_button(log_tools, "", "Clear Log", "Empty the P4 activity log.", _on_clear_log_pressed)
 
 	log_box = TextEdit.new()
 	log_box.editable = false
@@ -1262,14 +1363,6 @@ func _build_diff_window() -> void:
 
 func _on_diff_window_close_requested() -> void:
 	diff_window.hide()
-
-
-func _on_diff_selected_pressed() -> void:
-	var path := _get_selected_res_path()
-	if path.is_empty():
-		_log("Select a file in the changelist tree to diff.")
-		return
-	await _diff_path(path)
 
 
 ## Diff res_path (workspace vs the depot revision you have) and show it in the
@@ -1379,12 +1472,19 @@ func _rebuild_tree(model: Dictionary) -> void:
 		row.set_metadata(0, {"type": "setup"})
 		return
 	var folder_icon := _theme_icon("Folder")
+	var bold := _editor_bold_font()
+	var dim := _dim_color()
 	for cl in model.changelists:
 		var cl_item := tree.create_item(root)
 		var label: String = "Default changelist" if cl.change == "default" \
 				else "#%s  %s" % [cl.change, cl.desc]
 		cl_item.set_text(0, label)
-		cl_item.set_text(1, "(%d)" % cl.files.size())
+		if bold:
+			cl_item.set_custom_font(0, bold)
+		var count: int = cl.files.size()
+		cl_item.set_text(1, "%d file%s" % [count, "" if count == 1 else "s"])
+		cl_item.set_custom_color(1, dim)
+		cl_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
 		cl_item.set_selectable(1, false)
 		cl_item.set_metadata(0, {"type": "cl", "change": cl.change, "desc": cl.desc,
 				"file_count": cl.files.size()})
@@ -1393,8 +1493,12 @@ func _rebuild_tree(model: Dictionary) -> void:
 			cl_item.set_icon_modulate(0, P4_ACCENT) # the P4 brand touch
 		for f in cl.files:
 			var f_item := tree.create_item(cl_item)
-			f_item.set_text(0, f.res_path)
+			# res:// is implied for everything in the tree; dropping it leaves
+			# more room for the paths themselves. Tooltip keeps the full story.
+			f_item.set_text(0, String(f.res_path).trim_prefix("res://"))
+			f_item.set_tooltip_text(0, "%s\n%s" % [f.res_path, f.depot_path])
 			f_item.set_text(1, f.action)
+			f_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
 			f_item.set_custom_color(1, _action_color(f.action))
 			f_item.set_selectable(1, false)
 			var icon := _file_icon(f.res_path)
@@ -1411,6 +1515,20 @@ func _theme_icon(icon_name: String) -> Texture2D:
 	if base and base.has_theme_icon(icon_name, "EditorIcons"):
 		return base.get_theme_icon(icon_name, "EditorIcons")
 	return null
+
+
+func _editor_bold_font() -> Font:
+	var base := get_editor_interface().get_base_control()
+	if base and base.has_theme_font("bold", "EditorFonts"):
+		return base.get_theme_font("bold", "EditorFonts")
+	return null
+
+
+func _dim_color() -> Color:
+	var base := get_editor_interface().get_base_control()
+	if base and base.has_theme_color("font_disabled_color", "Editor"):
+		return base.get_theme_color("font_disabled_color", "Editor")
+	return Color(0.62, 0.62, 0.67)
 
 
 func _file_icon(res_path: String) -> Texture2D:
@@ -1725,14 +1843,6 @@ func _get_current_file_path() -> String:
 	return ""
 
 
-func _on_checkout_current_pressed() -> void:
-	var path := _get_current_file_path()
-	if path.is_empty():
-		_log("No current scene/script with a saved path to check out.")
-		return
-	await _checkout_path(path)
-
-
 ## Check out one file: skip if it doesn't need it, otherwise `p4 edit` and surface
 ## any failure. Shared by the toolbar "Checkout Active File" button and the
 ## FileSystem-dock context menu.
@@ -1761,14 +1871,6 @@ func _get_selected_res_path() -> String:
 	return ""
 
 
-func _on_revert_selected_pressed() -> void:
-	var path := _get_selected_res_path()
-	if path.is_empty():
-		_log("Select a file in the changelist tree to revert.")
-		return
-	await _revert_path(path)
-
-
 ## Revert res_path in Perforce and reload it from disk. Confirms first, naming
 ## the exact file, because revert discards unsaved in-editor changes too - the
 ## user must not lose work in a file they didn't mean to touch. Shared by the
@@ -1786,27 +1888,11 @@ func _revert_path(res_path: String) -> void:
 	_reload_path(res_path)
 
 
-func _on_sync_selected_pressed() -> void:
-	var path := _get_selected_res_path()
-	if path.is_empty():
-		_log("Select a file in the changelist tree to sync.")
-		return
-	await _sync_path(path)
-
-
 ## Sync res_path to the head revision and reload it from disk. Shared by the
 ## toolbar "Sync Selected File" button and the tree's per-row context menu.
 func _sync_path(res_path: String) -> void:
 	await _p4_exec_logged(["sync", ProjectSettings.globalize_path(res_path)])
 	_reload_path(res_path)
-
-
-func _on_reload_selected_pressed() -> void:
-	var path := _get_selected_res_path()
-	if path.is_empty():
-		_log("Select a file in the changelist tree to reload.")
-		return
-	await _reload_path_confirmed(path)
 
 
 ## Confirm-then-reload for the user-initiated Reload actions (toolbar button and
