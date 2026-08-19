@@ -1,13 +1,7 @@
-<!-- 📷 HEADER IMAGE: your custom header goes here.
-     Suggested file: docs/images/header.png (or header.gif).
-     The official P4 logos are in docs/images/ if you want them in the composition:
-       p4-logo-light.svg / p4-logo-dark.svg (wordmark), p4-icon-light.svg / p4-icon-dark.svg (mark only).
-     For a theme-aware header, use the <picture> pattern:
-     <picture>
-       <source media="(prefers-color-scheme: dark)" srcset="docs/images/header-dark.png">
-       <img src="docs/images/header-light.png" alt="P4 for Godot" width="600">
-     </picture>
--->
+
+<p align="center">
+  <img src="docs/images/header.jpg" alt="The Perforce bee and Godot robot plushes in front of the Godot editor" width="850">
+</p>
 
 # P4 for Godot
 
