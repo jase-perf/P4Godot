@@ -786,11 +786,12 @@ func _handle_edit_inner(res_path: String) -> void:
 
 func _prompt_then_checkout(res_path: String) -> void:
 	_log("'%s' isn't checked out - prompting..." % res_path)
-	var proceed: bool = await _show_confirm_dialog(
+	var choices: Array = await _pending_changelist_choices()
+	var picked: Dictionary = await _show_checkout_target_dialog(
 			"'%s' isn't checked out of Perforce yet.\n\nCheck it out now so your change can be saved?" % res_path,
-			"Check Out", "Discard My Changes")
-	if proceed:
-		var result: Dictionary = await _do_checkout(res_path)
+			"Check Out", "Discard My Changes", choices)
+	if picked.ok:
+		var result: Dictionary = await _do_checkout(res_path, picked.change)
 		if not result.ok:
 			await _on_edit_checkout_failed(res_path, result.reason)
 	else:
@@ -916,6 +917,13 @@ func _scene_saved_probe(path: String) -> void:
 		_log("Save of '%s' failed (checkout was refused this save - see above)." % res_path)
 		return
 
+	# Godot saves on Ctrl+S whether or not anything changed. If what it tried
+	# to write matches what's on disk, there is nothing worth checking out -
+	# skip the rescue offer instead of interrupting for a no-op.
+	if _failed_write_was_unchanged(global_path):
+		_log("Save of '%s' failed (read-only), but its content is unchanged - no checkout needed." % res_path)
+		return
+
 	_log("Save of '%s' failed: the file is read-only and not checked out." % res_path)
 	# Batch: Save All emits one scene_saved per failed scene - queue them all
 	# into ONE rescue dialog instead of a popup per file.
@@ -953,7 +961,10 @@ func _dependency_writes_probe(scene_path: String) -> void:
 		if _checked_out_this_session.has(dep_path) or _rescue_paths.has(dep_path):
 			continue
 		var global_path := ProjectSettings.globalize_path(dep_path)
-		if not _has_fresh_failed_write_tmp(global_path):
+		if _fresh_failed_write_tmp(global_path).is_empty():
+			continue
+		if _failed_write_was_unchanged(global_path):
+			_log("Resource '%s' failed to write (read-only), but its content is unchanged - no checkout needed." % dep_path)
 			continue
 		if not await _needs_checkout(global_path):
 			_checked_out_this_session[dep_path] = true
@@ -972,12 +983,18 @@ func _dependency_writes_probe(scene_path: String) -> void:
 ## A safe-save that could not replace its read-only target leaves the temp
 ## file behind; one modified in the last few seconds means a write just
 ## failed. (Verified live: every failed editor save leaves exactly one.)
-func _has_fresh_failed_write_tmp(global_path: String) -> bool:
+## Returns the newest such temp's path, or "" if none. The temp holds the
+## COMPLETE content the editor tried to write (the write finished; only the
+## rename over the read-only target failed), which is what lets
+## _failed_write_was_unchanged() below compare it against the disk file.
+func _fresh_failed_write_tmp(global_path: String) -> String:
 	var dir := DirAccess.open(global_path.get_base_dir())
 	if dir == null:
-		return false
+		return ""
 	var fname := global_path.get_file()
 	var now := Time.get_unix_time_from_system()
+	var best := ""
+	var best_mtime := 0
 	for f in dir.get_files():
 		if not (f.begins_with(fname) and f.ends_with(".tmp")):
 			continue
@@ -985,9 +1002,39 @@ func _has_fresh_failed_write_tmp(global_path: String) -> bool:
 		if not middle.is_valid_int():
 			continue
 		var tmp_path := global_path.get_base_dir().path_join(f)
-		if now - FileAccess.get_modified_time(tmp_path) < 10.0:
-			return true
-	return false
+		var mtime := FileAccess.get_modified_time(tmp_path)
+		if now - mtime < 10.0 and mtime >= best_mtime:
+			best = tmp_path
+			best_mtime = mtime
+	return best
+
+
+## True when the save that just failed would not have changed the file: the
+## abandoned safe-save temp's content matches what is already on disk. Godot
+## rewrites scenes on every Ctrl+S regardless of whether anything changed, so
+## without this check an untouched read-only scene produces a checkout offer
+## that would open a file with zero real edits. Text resources compare with
+## CR stripped (the depot copy may be CRLF while the editor writes LF). A
+## confirmed-identical temp is deleted - it is litter Godot never cleans up,
+## and it would otherwise show up in Reconcile as a file to add.
+func _failed_write_was_unchanged(global_path: String) -> bool:
+	var tmp_path := _fresh_failed_write_tmp(global_path)
+	if tmp_path.is_empty():
+		return false
+	var tmp_bytes := FileAccess.get_file_as_bytes(tmp_path)
+	var cur_bytes := FileAccess.get_file_as_bytes(global_path)
+	if tmp_bytes.is_empty() or cur_bytes.is_empty():
+		return false # Unreadable (or genuinely empty) - don't guess; prompt.
+	var unchanged := tmp_bytes == cur_bytes
+	var text_exts: PackedStringArray = ["tscn", "tres", "gd", "gdshader", "cfg",
+			"godot", "import", "json", "txt", "shader"]
+	if not unchanged and global_path.get_extension().to_lower() in text_exts:
+		var tmp_text := tmp_bytes.get_string_from_utf8().replace("\r\n", "\n")
+		var cur_text := cur_bytes.get_string_from_utf8().replace("\r\n", "\n")
+		unchanged = not tmp_text.is_empty() and tmp_text == cur_text
+	if unchanged:
+		DirAccess.remove_absolute(tmp_path)
+	return unchanged
 
 
 ## One dialog covering every save that failed for lack of a checkout in this
@@ -1025,8 +1072,9 @@ func _run_rescue_flow() -> void:
 				"save again?") % "\n".join(lines)
 		ok_text = "Check Out All and Save"
 
-	var proceed: bool = await _show_confirm_dialog(message, ok_text, "Not Now")
-	if not proceed:
+	var choices: Array = await _pending_changelist_choices()
+	var picked: Dictionary = await _show_checkout_target_dialog(message, ok_text, "Not Now", choices)
+	if not picked.ok:
 		_log("File(s) remain unsaved. Check them out (P4 dock or `p4 edit`) when you're ready.")
 		return
 
@@ -1034,7 +1082,7 @@ func _run_rescue_flow() -> void:
 	var failed_paths: Array = []
 	var failures: Array = []
 	for res_path: String in paths:
-		var result: Dictionary = await _do_checkout(res_path)
+		var result: Dictionary = await _do_checkout(res_path, picked.change)
 		if result.ok:
 			succeeded.append(res_path)
 		else:
@@ -2769,14 +2817,39 @@ func _submit_changelist(change: String, files: Array) -> void:
 ## out by bob (workspace 'bob_ws')" for the exclusive-checkout case, raw p4
 ## text otherwise) so every caller can surface it in whatever dialog fits its
 ## context. Logging happens here; dialogs are the caller's job.
-func _do_checkout(res_path: String) -> Dictionary:
+## `change` targets a pending changelist (`p4 edit -c N`); "" or "default"
+## opens in the default changelist.
+func _do_checkout(res_path: String, change: String = "") -> Dictionary:
 	if not await _ensure_identity():
 		return {"ok": false, "reason": "p4 isn't available this session (see the startup log)"}
 	var global_path := ProjectSettings.globalize_path(res_path)
-	var edit_result: Dictionary = await _p4_exec_logged(["edit", global_path])
+	var edit_args: PackedStringArray = ["edit"]
+	if not change.is_empty() and change != "default":
+		edit_args.append_array(["-c", change])
+	edit_args.append(global_path)
+	var edit_result: Dictionary = await _p4_exec_logged(edit_args)
 	var fstat_result: Dictionary = await _p4_exec(["fstat", global_path])
 	var others := _parse_other_opens(await _p4_exec(["opened", "-a", global_path]))
 	return _resolve_checkout(res_path, edit_result, fstat_result, others)
+
+
+## The changelist targets the checkout dialogs offer: the default changelist
+## first, then every pending numbered changelist owned by us in this client.
+## Queried fresh each time (not from _last_changelists) so the dropdown never
+## offers a changelist that was submitted or deleted since the last dock
+## refresh. Each entry is {change: String, label: String}.
+func _pending_changelist_choices() -> Array:
+	var choices: Array = [{"change": "default", "label": "Default changelist"}]
+	if not await _ensure_identity():
+		return choices
+	for crec in _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
+			"-c", _p4_client, "-u", _p4_user])):
+		var num := String(crec.get("change", ""))
+		if num.is_empty():
+			continue
+		var desc := String(crec.get("desc", "")).strip_edges().get_slice("\n", 0)
+		choices.append({"change": num, "label": "#%s  %s" % [num, desc]})
+	return choices
 
 
 ## Blocking twin of _do_checkout() for _apply_changes(), the pre-write hook
@@ -3409,6 +3482,66 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 	return {"ok": confirmed and index >= 0, "index": index}
 
 
+## The checkout prompt: a confirm dialog with a "Check out to:" dropdown of
+## pending changelists (see _pending_changelist_choices). Returns {ok: bool,
+## change: String} - `change` is "default" or a changelist number, valid only
+## when ok. The dropdown defaults to the first choice (the default changelist).
+func _show_checkout_target_dialog(text: String, ok_text: String,
+		cancel_text: String, choices: Array) -> Dictionary:
+	if _shutting_down:
+		return {"ok": false, "change": "default"}
+	while _dialog_busy:
+		await get_tree().process_frame
+	_dialog_busy = true
+	_dialog_result_ready = false
+	_dialog_result_confirmed = false
+
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Check Out"
+	dialog.set_ok_button_text(ok_text)
+	dialog.set_cancel_button_text(cancel_text)
+	var vbox := VBoxContainer.new()
+	var label := Label.new()
+	label.text = text
+	vbox.add_child(label)
+	var row := HBoxContainer.new()
+	var row_label := Label.new()
+	row_label.text = "Check out to:"
+	row.add_child(row_label)
+	var picker := OptionButton.new()
+	for c in choices:
+		picker.add_item(String(c.label))
+	picker.select(0)
+	picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	picker.custom_minimum_size = Vector2(280, 0)
+	row.add_child(picker)
+	vbox.add_child(row)
+	dialog.add_child(vbox)
+	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	dialog.canceled.connect(_on_confirm_dialog_canceled)
+	dialog.close_requested.connect(_on_confirm_dialog_canceled)
+	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+
+	if not _selftest_auto_answer.is_empty():
+		await get_tree().process_frame
+		if is_instance_valid(dialog):
+			if _selftest_auto_answer == "confirm":
+				dialog.confirmed.emit()
+			else:
+				dialog.canceled.emit()
+
+	while not _dialog_result_ready:
+		await get_tree().process_frame
+	var confirmed := _dialog_result_confirmed
+	var change := "default"
+	if confirmed and is_instance_valid(picker) \
+			and picker.selected >= 0 and picker.selected < choices.size():
+		change = String(choices[picker.selected].change)
+	_discard_dialog(dialog)
+	_dialog_busy = false
+	return {"ok": confirmed, "change": change}
+
+
 ## Shows a modal OK-only notice (checkout failures and other conditions the
 ## user should see without being asked anything). Serialized through the same
 ## _dialog_busy lock as _show_confirm_dialog so alerts and prompts can never
@@ -3998,6 +4131,43 @@ func _run_cli_self_test_if_requested() -> void:
 					_log("[selftest] FAIL: parse-ztag field mismatch")
 			else:
 				_log("[selftest] FAIL: parse-ztag expected 2 records")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-unchanged-save":
+			# Server-independent: a failed safe-save's leftover .tmp vs the disk
+			# file. Same text modulo CRLF -> unchanged (and the tmp is deleted);
+			# different text -> changed; binary extension gets no CRLF tolerance.
+			var base := OS.get_cache_dir().path_join("p4_unchg_test.tscn")
+			var tmp := base + "1234.tmp"
+			var f := FileAccess.open(base, FileAccess.WRITE)
+			f.store_string("line1\r\nline2\r\n")
+			f.close()
+			f = FileAccess.open(tmp, FileAccess.WRITE)
+			f.store_string("line1\nline2\n")
+			f.close()
+			var same := _failed_write_was_unchanged(base)
+			var tmp_deleted := not FileAccess.file_exists(tmp)
+			f = FileAccess.open(tmp, FileAccess.WRITE)
+			f.store_string("line1\nlineX\n")
+			f.close()
+			var diff_detected := not _failed_write_was_unchanged(base)
+			var bin_base := OS.get_cache_dir().path_join("p4_unchg_test.res")
+			var bin_tmp := bin_base + "1234.tmp"
+			f = FileAccess.open(bin_base, FileAccess.WRITE)
+			f.store_string("line1\r\nline2\r\n")
+			f.close()
+			f = FileAccess.open(bin_tmp, FileAccess.WRITE)
+			f.store_string("line1\nline2\n")
+			f.close()
+			var bin_strict := not _failed_write_was_unchanged(bin_base)
+			for leftover in [base, tmp, bin_base, bin_tmp]:
+				DirAccess.remove_absolute(leftover)
+			_log("[selftest] unchanged=%s tmp-deleted=%s diff-detected=%s bin-strict=%s"
+					% [same, tmp_deleted, diff_detected, bin_strict])
+			if same and tmp_deleted and diff_detected and bin_strict:
+				_log("[selftest] PASS: unchanged-save")
+			else:
+				_log("[selftest] FAIL: unchanged-save")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-list-opened":

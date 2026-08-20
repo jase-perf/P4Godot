@@ -18,9 +18,14 @@ Works with your existing `p4` command-line client and inherits its configuration
 
 ### Automatic checkout
 
-- Offers to check out a file the moment you first modify it in the editor.
+- Offers to check out a file the moment you first modify it in the editor —
+  and the prompt has a dropdown to pick which pending changelist to open it
+  in (defaults to the default changelist).
 - Checks out edited files automatically right before the editor saves them.
-- Rescues failed read-only saves with a check-out-and-retry dialog.
+- Rescues failed read-only saves with a check-out-and-retry dialog, with the
+  same changelist dropdown. Saving a file that has no actual changes never
+  prompts: the plugin compares what the editor tried to write against what's
+  on disk and stays quiet when they match.
 - Works in `allwrite` workspaces: if a save succeeds on a file that is not
   checked out, the file is checked out right after, so the changelist stays
   truthful.
