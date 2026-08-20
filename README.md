@@ -23,9 +23,11 @@ Works with your existing `p4` command-line client and inherits its configuration
   in (defaults to the default changelist).
 - Checks out edited files automatically right before the editor saves them.
 - Rescues failed read-only saves with a check-out-and-retry dialog, with the
-  same changelist dropdown. Saving a file that has no actual changes never
-  prompts: the plugin compares what the editor tried to write against what's
-  on disk and stays quiet when they match.
+  same changelist dropdown. Saving a file that has no actual changes stays
+  completely silent: the plugin compares what the editor tried to write
+  against what's on disk, and when they match it skips the checkout offer
+  and dismisses Godot's own "Unable to write to file" error — a no-op save
+  of a read-only file behaves exactly like a no-op save of a writable one.
 - Works in `allwrite` workspaces: if a save succeeds on a file that is not
   checked out, the file is checked out right after, so the changelist stays
   truthful.

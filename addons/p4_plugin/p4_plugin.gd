@@ -317,6 +317,13 @@ var _rescue_probes_inflight: int = 0
 # first await, while still inside the save pass's frame.
 var _rescue_skip_frame: Dictionary = {}
 
+# res:// paths whose no-op failed save wants the editor's "Unable to write"
+# modal dismissed, plus the single-loop guard - the editor reuses ONE
+# AcceptDialog for every save error in a pass, so one scan serves the batch
+# (see _dismiss_save_error_dialog).
+var _error_dismiss_names: Array = []
+var _error_dismiss_running: bool = false
+
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
@@ -890,11 +897,24 @@ func _scene_saved_probe(path: String) -> void:
 	# their failures - have happened. Checked for EVERY scene save: the scene
 	# itself saving fine doesn't mean its companion resources did.
 	call_deferred("_check_failed_dependency_writes", res_path)
+	var global_path := ProjectSettings.globalize_path(res_path)
+	# Fast path, pure filesystem, BEFORE any p4 round trip: the write failed
+	# on a read-only file but would not have changed it (Godot rewrites on
+	# every Ctrl+S whether or not anything changed). Nothing was lost, so a
+	# checkout offer would be noise - and the editor's own "Unable to write to
+	# file" modal (which pops right after this signal handler returns) is pure
+	# alarm, so dismiss it too. Running before the awaits means the dismissal
+	# is armed by the time that dialog appears.
+	if not checkout_was_refused_this_save \
+			and FileAccess.open(global_path, FileAccess.READ_WRITE) == null \
+			and _failed_write_was_unchanged(global_path):
+		_log("Save of '%s' failed (read-only), but its content is unchanged - nothing was lost, no checkout needed." % res_path)
+		await _dismiss_save_error_dialog(res_path)
+		return
 	if not await _ensure_identity():
 		return
 	if _checked_out_this_session.has(res_path):
 		return
-	var global_path := ProjectSettings.globalize_path(res_path)
 	if not await _needs_checkout(global_path):
 		_checked_out_this_session[res_path] = true
 		_pending_save_checkout.erase(res_path)
@@ -915,13 +935,6 @@ func _scene_saved_probe(path: String) -> void:
 
 	if checkout_was_refused_this_save:
 		_log("Save of '%s' failed (checkout was refused this save - see above)." % res_path)
-		return
-
-	# Godot saves on Ctrl+S whether or not anything changed. If what it tried
-	# to write matches what's on disk, there is nothing worth checking out -
-	# skip the rescue offer instead of interrupting for a no-op.
-	if _failed_write_was_unchanged(global_path):
-		_log("Save of '%s' failed (read-only), but its content is unchanged - no checkout needed." % res_path)
 		return
 
 	_log("Save of '%s' failed: the file is read-only and not checked out." % res_path)
@@ -1035,6 +1048,70 @@ func _failed_write_was_unchanged(global_path: String) -> bool:
 	if unchanged:
 		DirAccess.remove_absolute(tmp_path)
 	return unchanged
+
+
+## A failed scene write also pops the editor's own modal - "Unable to write
+## to file '...', file in use, locked or lacking permissions." - and the
+## plugin gets no hook to prevent it. When the failed save carried no changes
+## that modal is pure alarm (nothing was lost, nothing needs doing), so find
+## it and hide it: a plain AcceptDialog under the editor's base control whose
+## text mentions this file. Our own dialogs are ConfirmationDialogs, so the
+## exact-class filter can never hide them. Polls for up to half a second (the
+## modal pops a frame after the scene_saved signal that armed us); if it
+## never shows up - a future editor version wording/structure change - fall
+## back to an explanatory notice so the user is never left staring at an
+## unexplained error with no idea whether their data survived.
+## Save All note: the editor reuses ONE AcceptDialog instance for every save
+## error in the pass, so all no-op failures of one pass share a single
+## dismissal loop (_error_dismiss_names accumulates; the loop matches any of
+## them and one hide covers the whole batch).
+func _dismiss_save_error_dialog(res_path: String) -> void:
+	if not _error_dismiss_names.has(res_path):
+		_error_dismiss_names.append(res_path)
+	if _error_dismiss_running:
+		return
+	_error_dismiss_running = true
+	var found := false
+	for i in range(30):
+		if _shutting_down:
+			_error_dismiss_running = false
+			return
+		var base := get_editor_interface().get_base_control()
+		if base == null:
+			_error_dismiss_running = false
+			return
+		for d in base.find_children("*", "AcceptDialog", true, false):
+			if d.get_class() != "AcceptDialog":
+				continue
+			var dlg: AcceptDialog = d
+			if not dlg.visible:
+				continue
+			for name in _error_dismiss_names:
+				if dlg.dialog_text.contains(String(name).get_file()):
+					dlg.hide()
+					found = true
+					break
+			if found:
+				break
+		if found:
+			break
+		await get_tree().process_frame
+	var names := _error_dismiss_names.duplicate()
+	_error_dismiss_names.clear()
+	_error_dismiss_running = false
+	if not found:
+		var msg: String
+		if names.size() == 1:
+			msg = ("'%s' has no changes to save - the file on disk already matches " +
+					"what the editor tried to write. Nothing was lost and no checkout " +
+					"is needed; the editor's \"Unable to write to file\" message can " +
+					"be ignored.") % names[0]
+		else:
+			msg = ("These files have no changes to save - what the editor tried to " +
+					"write already matches what's on disk:\n\n%s\n\nNothing was lost " +
+					"and no checkout is needed; the editor's \"Unable to write to " +
+					"file\" message can be ignored.") % _file_listing(names)
+		await _show_alert(msg)
 
 
 ## One dialog covering every save that failed for lack of a checkout in this
@@ -4168,6 +4245,32 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: unchanged-save")
 			else:
 				_log("[selftest] FAIL: unchanged-save")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-dismiss-dialog":
+			# Server-independent: the no-op-save dismissal must hide the editor's
+			# plain AcceptDialog that mentions the file, and must NOT touch a
+			# ConfirmationDialog (all of the plugin's own dialogs are those).
+			_selftest_auto_answer = "confirm" # a failed match falls back to an alert - don't hang on it
+			var gui := get_editor_interface().get_base_control()
+			var plain := AcceptDialog.new()
+			plain.dialog_text = "Unable to write to file 'C:\\ws\\level.tscn', file in use, locked or lacking permissions."
+			gui.add_child(plain)
+			plain.visible = true
+			var ours := ConfirmationDialog.new()
+			ours.dialog_text = "Check out level.tscn?"
+			gui.add_child(ours)
+			ours.visible = true
+			await _dismiss_save_error_dialog("res://level.tscn")
+			var plain_hidden := not plain.visible
+			var ours_untouched: bool = ours.visible
+			plain.queue_free()
+			ours.queue_free()
+			_log("[selftest] plain-hidden=%s ours-untouched=%s" % [plain_hidden, ours_untouched])
+			if plain_hidden and ours_untouched:
+				_log("[selftest] PASS: dismiss-dialog")
+			else:
+				_log("[selftest] FAIL: dismiss-dialog")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-list-opened":
