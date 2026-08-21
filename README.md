@@ -23,11 +23,17 @@ Works with your existing `p4` command-line client and inherits its configuration
   in (defaults to the default changelist).
 - Checks out edited files automatically right before the editor saves them.
 - Rescues failed read-only saves with a check-out-and-retry dialog, with the
-  same changelist dropdown. Saving a file that has no actual changes stays
-  completely silent: the plugin compares what the editor tried to write
-  against what's on disk, and when they match it skips the checkout offer
-  and dismisses Godot's own "Unable to write to file" error — a no-op save
-  of a read-only file behaves exactly like a no-op save of a writable one.
+  same changelist dropdown.
+- **Saves never stall or error on read-only files.** Godot rewrites files on
+  every save whether or not anything changed, and writing to a read-only
+  file fails slowly (a multi-second retry stall) and loudly ("Unable to
+  write to file"). The plugin instead backs up each tracked read-only file
+  right before the save and makes it briefly writable, so the write succeeds
+  instantly. Files the save didn't actually change are put back exactly as
+  they were — original bytes, read-only bit, Perforce untouched. Files that
+  did change are checked out right after the save, keeping the changelist
+  truthful; if Perforce refuses that checkout, the disk is restored from the
+  backup and your changes stay safe in the editor.
 - Works in `allwrite` workspaces: if a save succeeds on a file that is not
   checked out, the file is checked out right after, so the changelist stays
   truthful.

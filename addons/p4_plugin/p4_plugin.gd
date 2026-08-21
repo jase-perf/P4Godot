@@ -324,6 +324,15 @@ var _rescue_skip_frame: Dictionary = {}
 var _error_dismiss_names: Array = []
 var _error_dismiss_running: bool = false
 
+# Pre-write pass state (see _prewrite_pass): res:// path -> backup file path
+# for files made temporarily writable so the imminent save can't fail.
+var _prewrite_managed: Dictionary = {}
+var _prewrite_finish_queued: bool = false
+# res:// path -> bool: whether the file is Perforce-tracked and unopened
+# (eligible for the pre-write pass). Filled by one batched fstat per save
+# pass; cleared on every dock refresh so it can't drift far.
+var _prewrite_eligible_cache: Dictionary = {}
+
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
@@ -851,23 +860,185 @@ func _on_edit_checkout_failed(res_path: String, reason: String) -> void:
 ## _on_scene_saved() rescue below - as does the edge case where a save lands
 ## before the startup `p4 info` has resolved (_p4_available still false).
 func _apply_changes() -> void:
-	if not _p4_available or not checkout_on_save_checkbox.button_pressed:
+	if not _p4_available:
 		return
-	var failures: Array = []
-	for res_path: String in _pending_save_checkout.keys():
-		_log("Checking out '%s' before saving..." % res_path)
-		var result: Dictionary = _do_checkout_sync(res_path)
-		if not result.ok:
-			failures.append("- '%s': %s" % [res_path, result.reason])
-			# The write that follows will fail too; the alert below already
-			# explains why, so don't ALSO queue the failed-save rescue dialog.
-			_rescue_skip_frame[res_path] = Engine.get_process_frames()
-	if not failures.is_empty():
-		_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
-				"Unsaved changes to these files stay in the editor, but the files can't " +
-				"be written until they become available (ask the holder to submit, shelve, " +
-				"or revert them). Checkout is retried automatically on your next save.")
-				% "\n".join(failures))
+	if checkout_on_save_checkbox.button_pressed:
+		var failures: Array = []
+		for res_path: String in _pending_save_checkout.keys():
+			_log("Checking out '%s' before saving..." % res_path)
+			var result: Dictionary = _do_checkout_sync(res_path)
+			if not result.ok:
+				failures.append("- '%s': %s" % [res_path, result.reason])
+				# The write that follows will fail too; the alert below already
+				# explains why, so don't ALSO queue the failed-save rescue dialog.
+				_rescue_skip_frame[res_path] = Engine.get_process_frames()
+		if not failures.is_empty():
+			_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
+					"Unsaved changes to these files stay in the editor, but the files can't " +
+					"be written until they become available (ask the holder to submit, shelve, " +
+					"or revert them). Checkout is retried automatically on your next save.")
+					% "\n".join(failures))
+	_prewrite_pass()
+
+
+## The save-can't-fail pass, run synchronously right before the editor
+## writes. Godot rewrites files on every save whether or not anything
+## changed, and a write to a read-only (not checked out) file fails SLOWLY -
+## the safe-save retries the rename over the read-only target with sleeps
+## between attempts (a multi-second editor stall) - and then pops the Load
+## Errors dialog. So instead of letting the write fail: back up every
+## read-only, tracked, unopened file the pass might write and make it
+## briefly writable, so the write succeeds instantly. _finish_prewrite_pass
+## (deferred to right after the writes, which all happen within this frame)
+## then puts back files whose content didn't actually change - original
+## bytes, read-only bit, Perforce untouched - and checks out the ones that
+## did change, rolling the disk back from the backup if Perforce refuses.
+## Every outcome ends exactly where the old failed-save flow ended, minus
+## the stall and the error dialog.
+func _prewrite_pass() -> void:
+	var ready: Array = []    # read-only candidates (res:// paths)
+	var unknown: Array = []  # of those, eligibility not cached yet (OS paths)
+	for res_path: String in _prewrite_candidates():
+		if _prewrite_managed.has(res_path) or _checked_out_this_session.has(res_path) \
+				or _pending_save_checkout.has(res_path) \
+				or _rescue_skip_frame.get(res_path, -1) == Engine.get_process_frames():
+			continue
+		var global_path := ProjectSettings.globalize_path(res_path)
+		if not FileAccess.file_exists(global_path):
+			continue
+		if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
+			continue # Writable - checked out, allwrite, or plain untracked.
+		ready.append(res_path)
+		if not _prewrite_eligible_cache.has(res_path):
+			unknown.append(global_path)
+	if ready.is_empty():
+		return
+	if not unknown.is_empty():
+		# One batched fstat resolves tracked-and-unopened for every unknown
+		# candidate. Synchronous by necessity (the writes start the moment
+		# _apply_changes returns) - the same tradeoff as the pre-save checkout
+		# above. The cache keeps repeat saves at zero extra round trips.
+		var by_client := {}
+		for rec in _parse_ztag(_p4_exec_sync(["-ztag", "fstat"] + unknown)):
+			var cf := String(rec.get("clientFile", ""))
+			if not cf.is_empty():
+				by_client[cf.replace("\\", "/").to_lower()] = rec
+		for res_path: String in ready:
+			if _prewrite_eligible_cache.has(res_path):
+				continue
+			var key := ProjectSettings.globalize_path(res_path).replace("\\", "/").to_lower()
+			var rec: Dictionary = by_client.get(key, {})
+			# Tracked (fstat returned a record) and not opened by us (no action).
+			_prewrite_eligible_cache[res_path] = not rec.is_empty() and not rec.has("action")
+	for res_path: String in ready:
+		if not _prewrite_eligible_cache.get(res_path, false):
+			continue
+		var global_path := ProjectSettings.globalize_path(res_path)
+		var backup := _prewrite_backup_path(res_path)
+		if DirAccess.copy_absolute(global_path, backup) != OK:
+			continue # No backup, no trick - the old failed-save flow still works.
+		if not _set_file_writable(global_path, true):
+			DirAccess.remove_absolute(backup)
+			continue
+		_prewrite_managed[res_path] = backup
+	if not _prewrite_managed.is_empty() and not _prewrite_finish_queued:
+		_prewrite_finish_queued = true
+		call_deferred("_finish_prewrite_pass")
+
+
+## Files the imminent save pass might write: open scenes, their direct
+## .tres/.res dependencies, open scripts, and the inspected resource.
+## Over-approximation is fine: a file made writable that the editor then
+## doesn't write is byte-identical afterwards and is put back untouched.
+func _prewrite_candidates() -> Array:
+	var ei := get_editor_interface()
+	var roots: Array = []
+	for p in ei.get_open_scenes():
+		roots.append(String(p))
+	for s in ei.get_script_editor().get_open_scripts():
+		var sp: String = (s as Script).resource_path
+		if not sp.is_empty():
+			roots.append(sp)
+	var inspected: Object = ei.get_inspector().get_edited_object()
+	if inspected is Resource and not (inspected as Resource).is_built_in() \
+			and not (inspected as Resource).resource_path.is_empty():
+		roots.append((inspected as Resource).resource_path)
+	var out: Array = []
+	var seen := {}
+	for root_path: String in roots:
+		if not root_path.begins_with("res://"):
+			continue
+		if not seen.has(root_path):
+			seen[root_path] = true
+			out.append(root_path)
+		var rext := root_path.get_extension().to_lower()
+		if rext != "tscn" and rext != "scn":
+			continue
+		# Scene saves also write the scene's MODIFIED external resources.
+		for dep: String in ResourceLoader.get_dependencies(root_path):
+			var dep_path := dep.get_slice("::", dep.get_slice_count("::") - 1)
+			var dext := dep_path.get_extension().to_lower()
+			if dep_path.begins_with("res://") and (dext == "tres" or dext == "res") \
+					and not seen.has(dep_path):
+				seen[dep_path] = true
+				out.append(dep_path)
+	return out
+
+
+func _finish_prewrite_pass() -> void:
+	_prewrite_finish_queued = false
+	var managed := _prewrite_managed
+	_prewrite_managed = {}
+	for res_path: String in managed.keys():
+		var backup := String(managed[res_path])
+		var global_path := ProjectSettings.globalize_path(res_path)
+		var cur := FileAccess.get_file_as_bytes(global_path)
+		var old := FileAccess.get_file_as_bytes(backup)
+		if not cur.is_empty() and not old.is_empty() \
+				and _contents_match(cur, old, global_path.get_extension().to_lower()):
+			# No actual change. Restore the ORIGINAL bytes (not just the
+			# read-only bit): the editor writes LF while the synced file may
+			# be CRLF, and leaving the rewrite in place would make a later
+			# `p4 reconcile` flag a file the user never really changed.
+			DirAccess.copy_absolute(backup, global_path)
+			_set_file_writable(global_path, false)
+			DirAccess.remove_absolute(backup)
+			_log("Save of '%s' carried no changes - file restored, Perforce untouched." % res_path)
+			continue
+		_log("'%s' changed on save while not checked out - checking it out to keep the changelist accurate." % res_path)
+		var result: Dictionary = await _do_checkout(res_path)
+		if result.ok:
+			DirAccess.remove_absolute(backup)
+			continue
+		# Perforce refused (exclusive checkout elsewhere, connection loss...).
+		# Put the disk back exactly as a failed save would have left it:
+		# previous content, read-only. The edit still lives in the editor.
+		var restored := DirAccess.copy_absolute(backup, global_path) == OK
+		_set_file_writable(global_path, false)
+		if restored:
+			DirAccess.remove_absolute(backup)
+		_pending_save_checkout[res_path] = true
+		_show_alert(("'%s' was saved but couldn't be checked out - %s.\n\nThe file on " +
+				"disk was restored to its previous content%s; your changes are still in " +
+				"the editor, and the checkout is retried on your next save (once the " +
+				"file becomes available).") % [res_path, result.reason,
+				"" if restored else " (RESTORE FAILED - backup kept at '%s')" % backup])
+
+
+## Flip the OS-level write protection Perforce puts on unopened files.
+## Windows: the FILE_ATTRIBUTE_READONLY flag (exactly what p4 sets and
+## clears). macOS/Linux: p4 uses permission bits (chmod 444), so chmod is
+## the tool - FileAccess.set_read_only_attribute is wrong there (it flips
+## the unrelated immutable flag on macOS and does nothing on Linux).
+func _set_file_writable(global_path: String, writable: bool) -> bool:
+	if OS.get_name() == "Windows":
+		return FileAccess.set_read_only_attribute(global_path, not writable) == OK
+	var out := []
+	return OS.execute("chmod", ["u+w" if writable else "u-w", global_path], out) == 0
+
+
+func _prewrite_backup_path(res_path: String) -> String:
+	return OS.get_cache_dir().path_join("p4_prewrite_%s.bak" % res_path.md5_text())
 
 
 ## Emitted for every scene save ATTEMPT - including failed ones (verified:
@@ -897,6 +1068,11 @@ func _scene_saved_probe(path: String) -> void:
 	# their failures - have happened. Checked for EVERY scene save: the scene
 	# itself saving fine doesn't mean its companion resources did.
 	call_deferred("_check_failed_dependency_writes", res_path)
+	if _prewrite_managed.has(res_path):
+		# The pre-write pass made this file writable; _finish_prewrite_pass
+		# owns its follow-up (restore or checkout). Checked synchronously,
+		# while the dict is still populated for this save pass's frame.
+		return
 	var global_path := ProjectSettings.globalize_path(res_path)
 	# Fast path, pure filesystem, BEFORE any p4 round trip: the write failed
 	# on a read-only file but would not have changed it (Godot rewrites on
@@ -1051,16 +1227,26 @@ func _failed_write_was_unchanged(global_path: String) -> bool:
 	var cur_bytes := FileAccess.get_file_as_bytes(global_path)
 	if tmp_bytes.is_empty() or cur_bytes.is_empty():
 		return false # Unreadable (or genuinely empty) - don't guess; prompt.
-	var unchanged := tmp_bytes == cur_bytes
-	var text_exts: PackedStringArray = ["tscn", "tres", "gd", "gdshader", "cfg",
-			"godot", "import", "json", "txt", "shader"]
-	if not unchanged and global_path.get_extension().to_lower() in text_exts:
-		var tmp_text := tmp_bytes.get_string_from_utf8().replace("\r\n", "\n")
-		var cur_text := cur_bytes.get_string_from_utf8().replace("\r\n", "\n")
-		unchanged = not tmp_text.is_empty() and tmp_text == cur_text
+	var unchanged := _contents_match(tmp_bytes, cur_bytes, global_path.get_extension().to_lower())
 	if unchanged:
 		DirAccess.remove_absolute(tmp_path)
 	return unchanged
+
+
+## Byte equality, with a CR-stripped fallback for known-text resource types
+## (the synced copy may be CRLF while the editor writes LF). Never
+## text-tolerant for binary formats: a lossy UTF-8 decode could mask a real
+## change.
+func _contents_match(a: PackedByteArray, b: PackedByteArray, ext: String) -> bool:
+	if a == b:
+		return true
+	var text_exts: PackedStringArray = ["tscn", "tres", "gd", "gdshader", "cfg",
+			"godot", "import", "json", "txt", "shader"]
+	if not ext in text_exts:
+		return false
+	var a_text := a.get_string_from_utf8().replace("\r\n", "\n")
+	var b_text := b.get_string_from_utf8().replace("\r\n", "\n")
+	return not a_text.is_empty() and a_text == b_text
 
 
 ## A failed scene write also pops the editor's own error UI, and the plugin
@@ -1097,11 +1283,14 @@ func _run_error_dialog_dismissal() -> void:
 		if _shutting_down:
 			_error_dismiss_running = false
 			return
-		var base := get_editor_interface().get_base_control()
-		if base == null:
+		# Scan from the tree root, not base_control: the "Load Errors" dialog
+		# is NOT parented under the editor's base control (verified live
+		# 2026-08-21 - a base_control scan never found it).
+		var scan_root: Node = get_tree().root
+		if scan_root == null:
 			_error_dismiss_running = false
 			return
-		for d in base.find_children("*", "AcceptDialog", true, false):
+		for d in scan_root.find_children("*", "AcceptDialog", true, false):
 			if d.get_class() != "AcceptDialog":
 				continue
 			var dlg: AcceptDialog = d
@@ -1271,6 +1460,8 @@ func _on_resource_saved(res: Resource) -> void:
 	if res_path.is_empty() or not res_path.begins_with("res://") \
 			or _checked_out_this_session.has(res_path):
 		return
+	if _prewrite_managed.has(res_path):
+		return # The pre-write pass owns this file's restore-or-checkout decision.
 	if not await _ensure_identity():
 		return
 	if _checked_out_this_session.has(res_path):
@@ -2422,6 +2613,7 @@ func _refresh_changelists() -> void:
 		_refresh_pending = true
 		return
 	_refresh_inflight = true
+	_prewrite_eligible_cache.clear() # Checkout state may have changed - re-fstat on next save.
 	while true:
 		_refresh_pending = false
 		if not await _ensure_identity():
@@ -4358,6 +4550,43 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: dismiss-dialog")
 			else:
 				_log("[selftest] FAIL: dismiss-dialog")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-prewrite":
+			# Server-independent: the pre-write-pass helpers on a real temp
+			# file - the writable flip both ways, the CRLF-tolerant unchanged
+			# classification, real-change detection, and backup restore.
+			var target := OS.get_cache_dir().path_join("p4_prewrite_test.tscn")
+			var f2 := FileAccess.open(target, FileAccess.WRITE)
+			f2.store_string("node A\r\nnode B\r\n")
+			f2.close()
+			var ro_ok := _set_file_writable(target, false)
+			var locked := FileAccess.open(target, FileAccess.READ_WRITE) == null
+			var backup := _prewrite_backup_path("res://p4_prewrite_test.tscn")
+			var copied := DirAccess.copy_absolute(target, backup) == OK
+			var rw_ok := _set_file_writable(target, true)
+			var unlocked := FileAccess.open(target, FileAccess.READ_WRITE) != null
+			f2 = FileAccess.open(target, FileAccess.WRITE)
+			f2.store_string("node A\nnode B\n") # the editor's rewrite: same content, LF
+			f2.close()
+			var same := _contents_match(FileAccess.get_file_as_bytes(target),
+					FileAccess.get_file_as_bytes(backup), "tscn")
+			f2 = FileAccess.open(target, FileAccess.WRITE)
+			f2.store_string("node A\nnode CHANGED\n")
+			f2.close()
+			var diff_detected := not _contents_match(FileAccess.get_file_as_bytes(target),
+					FileAccess.get_file_as_bytes(backup), "tscn")
+			var restored := DirAccess.copy_absolute(backup, target) == OK \
+					and FileAccess.get_file_as_bytes(target) == FileAccess.get_file_as_bytes(backup)
+			_set_file_writable(target, true)
+			DirAccess.remove_absolute(target)
+			DirAccess.remove_absolute(backup)
+			_log("[selftest] ro=%s locked=%s copied=%s rw=%s unlocked=%s same=%s diff=%s restored=%s"
+					% [ro_ok, locked, copied, rw_ok, unlocked, same, diff_detected, restored])
+			if ro_ok and locked and copied and rw_ok and unlocked and same and diff_detected and restored:
+				_log("[selftest] PASS: prewrite")
+			else:
+				_log("[selftest] FAIL: prewrite")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-list-opened":
