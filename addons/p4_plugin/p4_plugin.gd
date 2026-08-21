@@ -909,7 +909,7 @@ func _scene_saved_probe(path: String) -> void:
 			and FileAccess.open(global_path, FileAccess.READ_WRITE) == null \
 			and _failed_write_was_unchanged(global_path):
 		_log("Save of '%s' failed (read-only), but its content is unchanged - nothing was lost, no checkout needed." % res_path)
-		await _dismiss_save_error_dialog(res_path)
+		_queue_error_dialog_dismissal(res_path)
 		return
 	if not await _ensure_identity():
 		return
@@ -961,8 +961,13 @@ func _check_failed_dependency_writes(scene_path: String) -> void:
 
 
 func _dependency_writes_probe(scene_path: String) -> void:
-	if not await _ensure_identity():
-		return
+	# Filesystem sweep first, BEFORE the p4 identity await: a dependency whose
+	# failed write was a no-op (fresh failed-write temp matching the disk
+	# file) joins the error-dialog dismissal batch immediately, so the
+	# dismissal loop's first scan already covers the scene AND its
+	# dependencies - it never stalls on a p4 round trip. Real failures are
+	# collected for the p4-gated handling below.
+	var failed: Array = []
 	for dep: String in ResourceLoader.get_dependencies(scene_path):
 		# Entries may be "uid://xxx::res://path" - take the path part.
 		var dep_path := dep.get_slice("::", dep.get_slice_count("::") - 1)
@@ -978,8 +983,16 @@ func _dependency_writes_probe(scene_path: String) -> void:
 			continue
 		if _failed_write_was_unchanged(global_path):
 			_log("Resource '%s' failed to write (read-only), but its content is unchanged - no checkout needed." % dep_path)
+			_queue_error_dialog_dismissal(dep_path)
 			continue
-		if not await _needs_checkout(global_path):
+		failed.append({"dep_path": dep_path, "global_path": global_path})
+	if failed.is_empty():
+		return
+	if not await _ensure_identity():
+		return
+	for entry: Dictionary in failed:
+		var dep_path := String(entry.dep_path)
+		if not await _needs_checkout(String(entry.global_path)):
 			_checked_out_this_session[dep_path] = true
 			continue
 		# Re-check after the await: a probe for another scene sharing this
@@ -1050,29 +1063,37 @@ func _failed_write_was_unchanged(global_path: String) -> bool:
 	return unchanged
 
 
-## A failed scene write also pops the editor's own modal - "Unable to write
-## to file '...', file in use, locked or lacking permissions." - and the
-## plugin gets no hook to prevent it. When the failed save carried no changes
-## that modal is pure alarm (nothing was lost, nothing needs doing), so find
-## it and hide it: a plain AcceptDialog under the editor's base control whose
-## text mentions this file. Our own dialogs are ConfirmationDialogs, so the
-## exact-class filter can never hide them. Polls for up to half a second (the
-## modal pops a frame after the scene_saved signal that armed us); if it
-## never shows up - a future editor version wording/structure change - fall
-## back to an explanatory notice so the user is never left staring at an
-## unexplained error with no idea whether their data survived.
-## Save All note: the editor reuses ONE AcceptDialog instance for every save
-## error in the pass, so all no-op failures of one pass share a single
-## dismissal loop (_error_dismiss_names accumulates; the loop matches any of
-## them and one hide covers the whole batch).
-func _dismiss_save_error_dialog(res_path: String) -> void:
+## A failed scene write also pops the editor's own error UI, and the plugin
+## gets no hook to prevent it. When the failed save carried no changes that
+## error is pure alarm (nothing was lost, nothing needs doing), so find it
+## and hide it. The editor surfaces failed writes two ways: a bare
+## AcceptDialog message (show_accept), and the "Load Errors" dialog, whose
+## lines live in a RichTextLabel child while dialog_text stays empty
+## (verified live 2026-08-21 - failed saves use THIS one, listing every
+## failed file of the pass). Matching therefore reads both, and the window
+## is hidden ONLY when every error line in it names a verified no-op file: a
+## dialog also reporting a REAL failure stays up. Our own dialogs are all
+## ConfirmationDialogs, so the exact-class filter can never hide them.
+##
+## All no-op failures of one save pass share one batch: this registrar is
+## synchronous (callable from the probes with no p4 round trip, so the scene
+## and its dependencies are all registered before the deferred loop's first
+## scan), and one hide covers the whole pass. If no dialog ever matches
+## (future editor rewording/restructuring), an explanatory notice appears
+## instead - unless a rescue dialog for a real failure in the same pass is
+## on its way, which explains the situation better than a second popup.
+func _queue_error_dialog_dismissal(res_path: String) -> void:
 	if not _error_dismiss_names.has(res_path):
 		_error_dismiss_names.append(res_path)
 	if _error_dismiss_running:
 		return
 	_error_dismiss_running = true
+	call_deferred("_run_error_dialog_dismissal")
+
+
+func _run_error_dialog_dismissal() -> void:
 	var found := false
-	for i in range(30):
+	for i in range(90):
 		if _shutting_down:
 			_error_dismiss_running = false
 			return
@@ -1086,12 +1107,9 @@ func _dismiss_save_error_dialog(res_path: String) -> void:
 			var dlg: AcceptDialog = d
 			if not dlg.visible:
 				continue
-			for name in _error_dismiss_names:
-				if dlg.dialog_text.contains(String(name).get_file()):
-					dlg.hide()
-					found = true
-					break
-			if found:
+			if _all_error_lines_covered(_accept_dialog_full_text(dlg)):
+				dlg.hide()
+				found = true
 				break
 		if found:
 			break
@@ -1099,19 +1117,54 @@ func _dismiss_save_error_dialog(res_path: String) -> void:
 	var names := _error_dismiss_names.duplicate()
 	_error_dismiss_names.clear()
 	_error_dismiss_running = false
-	if not found:
-		var msg: String
-		if names.size() == 1:
-			msg = ("'%s' has no changes to save - the file on disk already matches " +
-					"what the editor tried to write. Nothing was lost and no checkout " +
-					"is needed; the editor's \"Unable to write to file\" message can " +
-					"be ignored.") % names[0]
-		else:
-			msg = ("These files have no changes to save - what the editor tried to " +
-					"write already matches what's on disk:\n\n%s\n\nNothing was lost " +
-					"and no checkout is needed; the editor's \"Unable to write to " +
-					"file\" message can be ignored.") % _file_listing(names)
-		await _show_alert(msg)
+	if found:
+		return
+	if _rescue_scheduled or not _rescue_paths.is_empty() or _dialog_busy:
+		_log("No changes in %s; the error dialog also reports a real failure, leaving it up." % ", ".join(PackedStringArray(names)))
+		return
+	var msg: String
+	if names.size() == 1:
+		msg = ("'%s' has no changes to save - the file on disk already matches " +
+				"what the editor tried to write. Nothing was lost and no checkout " +
+				"is needed; the editor's \"Unable to write to file\" message can " +
+				"be ignored.") % names[0]
+	else:
+		msg = ("These files have no changes to save - what the editor tried to " +
+				"write already matches what's on disk:\n\n%s\n\nNothing was lost " +
+				"and no checkout is needed; the editor's \"Unable to write to " +
+				"file\" message can be ignored.") % _file_listing(names)
+	await _show_alert(msg)
+
+
+## The two shapes of the editor's failed-write error UI (see above): a
+## message in dialog_text, or lines in a RichTextLabel child. Collect both.
+func _accept_dialog_full_text(dlg: AcceptDialog) -> String:
+	var text := dlg.dialog_text
+	for rtl in dlg.find_children("*", "RichTextLabel", true, false):
+		text += "\n" + (rtl as RichTextLabel).get_parsed_text()
+	return text
+
+
+## True when the text has at least one non-empty line and EVERY non-empty
+## line names a file registered as a verified no-op. The per-line rule is
+## what keeps a mixed dialog (a no-op's line plus a real failure's line)
+## visible.
+func _all_error_lines_covered(text: String) -> bool:
+	var any := false
+	for raw_line in text.split("\n"):
+		# Inline images (the red error dots) surface as U+FFFC in parsed text.
+		var line := raw_line.replace(char(0xFFFC), "").strip_edges()
+		if line.is_empty():
+			continue
+		var covered := false
+		for name in _error_dismiss_names:
+			if line.contains(String(name).get_file()):
+				covered = true
+				break
+		if not covered:
+			return false
+		any = true
+	return any
 
 
 ## One dialog covering every save that failed for lack of a checkout in this
@@ -4248,26 +4301,60 @@ func _run_cli_self_test_if_requested() -> void:
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-dismiss-dialog":
-			# Server-independent: the no-op-save dismissal must hide the editor's
-			# plain AcceptDialog that mentions the file, and must NOT touch a
-			# ConfirmationDialog (all of the plugin's own dialogs are those).
-			_selftest_auto_answer = "confirm" # a failed match falls back to an alert - don't hang on it
+			# Server-independent. The no-op-save dismissal must hide (1) a bare
+			# AcceptDialog whose dialog_text mentions the file and (2) a
+			# Load-Errors-shaped dialog (empty dialog_text, error lines in a
+			# RichTextLabel child) once every line is covered - and must leave
+			# (3) a mixed dialog with an uncovered line, and ConfirmationDialogs
+			# (all of the plugin's own dialogs), untouched.
+			_selftest_auto_answer = "confirm" # resolves case 3's fallback alert
 			var gui := get_editor_interface().get_base_control()
-			var plain := AcceptDialog.new()
-			plain.dialog_text = "Unable to write to file 'C:\\ws\\level.tscn', file in use, locked or lacking permissions."
-			gui.add_child(plain)
-			plain.visible = true
 			var ours := ConfirmationDialog.new()
 			ours.dialog_text = "Check out level.tscn?"
 			gui.add_child(ours)
 			ours.visible = true
-			await _dismiss_save_error_dialog("res://level.tscn")
-			var plain_hidden := not plain.visible
+
+			var bare := AcceptDialog.new()
+			bare.dialog_text = "Unable to write to file 'C:\\ws\\level.tscn', file in use, locked or lacking permissions."
+			gui.add_child(bare)
+			bare.visible = true
+			_queue_error_dialog_dismissal("res://level.tscn")
+			while _error_dismiss_running:
+				await get_tree().process_frame
+			var bare_hidden := not bare.visible
+			bare.queue_free()
+
+			var loaderr := AcceptDialog.new()
+			var rtl := RichTextLabel.new()
+			rtl.text = " Unable to write to file 'C:\\ws\\level.tscn', file in use, locked or lacking permissions.\n" \
+					+ " Unable to write to file 'C:\\ws\\level\\tileset\\tileset.tres', file in use, locked or lacking permissions."
+			loaderr.add_child(rtl)
+			gui.add_child(loaderr)
+			loaderr.visible = true
+			_queue_error_dialog_dismissal("res://level.tscn")
+			_queue_error_dialog_dismissal("res://level/tileset/tileset.tres")
+			while _error_dismiss_running:
+				await get_tree().process_frame
+			var loaderr_hidden := not loaderr.visible
+			loaderr.queue_free()
+
+			var mixed := AcceptDialog.new()
+			var rtl2 := RichTextLabel.new()
+			rtl2.text = " Unable to write to file 'C:\\ws\\level.tscn', file in use, locked or lacking permissions.\n" \
+					+ " Unable to write to file 'C:\\ws\\other.tscn', file in use, locked or lacking permissions."
+			mixed.add_child(rtl2)
+			gui.add_child(mixed)
+			mixed.visible = true
+			_queue_error_dialog_dismissal("res://level.tscn")
+			while _error_dismiss_running:
+				await get_tree().process_frame
+			var mixed_untouched: bool = mixed.visible
 			var ours_untouched: bool = ours.visible
-			plain.queue_free()
+			mixed.queue_free()
 			ours.queue_free()
-			_log("[selftest] plain-hidden=%s ours-untouched=%s" % [plain_hidden, ours_untouched])
-			if plain_hidden and ours_untouched:
+			_log("[selftest] bare-hidden=%s loaderr-hidden=%s mixed-untouched=%s ours-untouched=%s"
+					% [bare_hidden, loaderr_hidden, mixed_untouched, ours_untouched])
+			if bare_hidden and loaderr_hidden and mixed_untouched and ours_untouched:
 				_log("[selftest] PASS: dismiss-dialog")
 			else:
 				_log("[selftest] FAIL: dismiss-dialog")
