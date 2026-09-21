@@ -1,5 +1,15 @@
 # TODO
 
+## Release checklist (Godot Asset Store)
+
+- [ ] Capture README screenshots/GIF (placeholders marked with 📷 comments in README.md) — same captures feed the store's Media tab
+- [ ] Design a store thumbnail that isn't the bare Perforce logo (trademark: combine the P4 mark with the dock / a Godot motif)
+- [ ] Refresh `addons/p4godot/README.md` (it is a copy of the root README — recopy after any README edit)
+- [ ] Decide release version (1.0.0?), bump plugin.cfg, update CHANGELOG, tag, cut a GitHub Release
+- [ ] Warnings pass: open in editor, fix/suppress all script warnings (store review checks this)
+- [ ] Clean-install test: fresh 4.7 project, drop in the release zip, enable, connect
+- [ ] Store submission at <https://store.godotengine.org>: publisher + asset "P4Godot", type Addon, license MIT, source link <https://github.com/jase-perf/P4Godot>, min Godot 4.7, **AI usage disclosure (mandatory)**
+
 - [x] Side-by-side diff viewer (v0.12.0 - p4merge-style: depot#have vs workspace panes from `p4 print -q` + local file, rows aligned via `p4 diff -dul` hunks, full-row add/delete backgrounds, filler rows, baked line-number gutter, intraline changed-span highlighting via a custom SyntaxHighlighter, synced scrolling)
 - [x] Moving p4 commands off of main thread (done in v0.5.0 - worker thread; _apply_changes stays sync by necessity)
 - [x] Files and changelist view (v0.7.0 - changelist tree with opened files per CL)

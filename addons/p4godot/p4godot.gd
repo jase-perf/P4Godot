@@ -66,7 +66,7 @@ extends EditorPlugin
 ##   discards them together with the triggering edit (same rule as the
 ##   scene-reload limitation above).
 
-const SETTINGS_SECTION := "p4_plugin"
+const SETTINGS_SECTION := "p4godot"
 
 # A light P4 brand accent over Godot's native theme (from the Perforce Force UI
 # palette). The dock otherwise uses editor theme colors/icons so it reads native.
@@ -361,7 +361,7 @@ func _enter_tree() -> void:
 	# Fire-and-forget coroutine: anything that needs the identity awaits
 	# _ensure_identity() instead of assuming this has resolved.
 	_detect_p4_identity()
-	_log("P4 plugin loaded.")
+	_log("P4Godot loaded.")
 	_run_cli_self_test_if_requested()
 
 
@@ -1485,7 +1485,7 @@ func _on_resource_saved(res: Resource) -> void:
 
 func _build_dock() -> void:
 	dock = VBoxContainer.new()
-	dock.name = "P4"
+	dock.name = "P4G"
 
 	# Toolbar: one row when everything fits, two when the dock is narrow. Per-
 	# file actions live in the tree's right-click menu (and the FileSystem
@@ -1615,7 +1615,7 @@ func _add_toolbar_button(parent: Control, icon_name: String, text: String,
 func _build_settings_menu(parent: Control) -> void:
 	settings_menu = MenuButton.new()
 	settings_menu.flat = true
-	settings_menu.tooltip_text = "P4 plugin settings (stored per-project, per-user)."
+	settings_menu.tooltip_text = "P4Godot settings (stored per-project, per-user)."
 	var gear := _theme_icon("Tools")
 	if gear:
 		settings_menu.icon = gear

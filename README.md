@@ -3,15 +3,15 @@
   <img src="docs/images/header.jpg" alt="The Perforce bee and Godot robot plushes in front of the Godot editor" width="850">
 </p>
 
-# P4 for Godot
+# P4Godot
 
-Perforce P4 (formerly Helix Core) integration for the Godot 4 editor. Pure GDScript, no build step: install the addon, enable it, and Godot starts checking out files the moment you edit them.
+P4Godot (P4G for short) is a Perforce P4 (formerly Helix Core) integration for the Godot 4 editor. Pure GDScript, no build step: install the addon, enable it, and Godot starts checking out files the moment you edit them.
 
 Works with your existing `p4` command-line client and inherits its configuration — P4CONFIG, tickets, and SSO all work exactly as they do in your terminal.
 
 <!-- 📷 HERO GIF: the signature loop, captured in one take —
      edit a file in the editor → checkout prompt appears → accept → the file
-     shows up under the default changelist in the P4 dock.
+     shows up under the default changelist in the P4G dock.
      Suggested file: docs/images/hero-checkout.gif -->
 
 ## Features
@@ -59,7 +59,7 @@ your terminal, P4V, and other projects are untouched.
 
 ### Changelist dock
 
-The P4 dock shows your pending changelists and the files opened in each.
+The P4G dock shows your pending changelists and the files opened in each.
 From there you can:
 
 - **Create, edit, submit, and delete changelists** — the default changelist
@@ -133,18 +133,18 @@ status probes when you need to troubleshoot.
 
 ## Installation
 
-1. Copy the `addons/p4_plugin` folder into your project's `addons/` directory
+1. Copy the `addons/p4godot` folder into your project's `addons/` directory
    (create it if it doesn't exist).
 2. In Godot, open **Project → Project Settings → Plugins** and enable
-   **P4 Perforce Integration**.
-3. The **P4** dock appears at the bottom of the editor. If `p4 info` resolves
+   **P4Godot**.
+3. The **P4G** dock appears at the bottom of the editor. If `p4 info` resolves
    your workspace, you're done — edit a file and watch it get checked out.
    Otherwise the connection setup flow opens and walks you through server,
    login, and workspace.
 
 ## Settings
 
-All settings live in the gear menu on the P4 dock toolbar and are stored
+All settings live in the gear menu on the P4G dock toolbar and are stored
 per-project, per-user — never written into project files, so they don't
 churn version control.
 

@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Source archives (Asset Store zips, GitHub "Download ZIP" and release
+# archives) contain only the addon; everything else is stripped.
+/**        export-ignore
+/addons    !export-ignore
+/addons/** !export-ignore
