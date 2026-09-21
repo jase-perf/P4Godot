@@ -34,7 +34,7 @@ extends EditorPlugin
 ## - Delete / move / rename: deleting or moving a file (or folder) in the
 ##   FileSystem dock is caught via FileSystemDock signals and offered to
 ##   Perforce - open-for-delete for a deletion, a history-preserving move
-##   (`p4 reconcile -m`) for a rename. Prompts by default, or applies silently
+##   (`p4 reconcile -M`) for a rename. Prompts by default, or applies silently
 ##   when the "Auto add/edit/delete" setting is on.
 ##
 ## Known limitations:
@@ -333,6 +333,11 @@ var _prewrite_finish_queued: bool = false
 # pass; cleared on every dock refresh so it can't drift far.
 var _prewrite_eligible_cache: Dictionary = {}
 
+# Read-only .import files made writable for an in-progress reimport: global
+# path -> original bytes. See _on_resources_reimporting.
+var _reimport_backups: Dictionary = {}
+const REIMPORT_CONFIRM_THRESHOLD := 20
+
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
@@ -350,13 +355,17 @@ func _enter_tree() -> void:
 	# edit: commit_action() emits history_changed; version_changed only fires
 	# from undo()/redo() (verified in editor_undo_redo_manager.cpp).
 	get_undo_redo().history_changed.connect(_on_undo_redo_history_changed)
-	get_editor_interface().get_script_editor().editor_script_changed.connect(
+	EditorInterface.get_script_editor().editor_script_changed.connect(
 			_on_active_script_changed)
 	scene_saved.connect(_on_scene_saved)
 	resource_saved.connect(_on_resource_saved)
+	var efs := EditorInterface.get_resource_filesystem()
+	efs.resources_reimporting.connect(_on_resources_reimporting)
+	efs.resources_reimported.connect(_on_resources_reimported)
 
 	_p4_thread = Thread.new()
 	_p4_thread.start(_p4_worker_loop)
+	_sweep_cache_dir()
 	_register_filesystem_hooks()
 	# Fire-and-forget coroutine: anything that needs the identity awaits
 	# _ensure_identity() instead of assuming this has resolved.
@@ -368,9 +377,15 @@ func _enter_tree() -> void:
 func _exit_tree() -> void:
 	_shutting_down = true
 	_unregister_filesystem_hooks()
+	var efs := EditorInterface.get_resource_filesystem()
+	if efs:
+		if efs.resources_reimporting.is_connected(_on_resources_reimporting):
+			efs.resources_reimporting.disconnect(_on_resources_reimporting)
+		if efs.resources_reimported.is_connected(_on_resources_reimported):
+			efs.resources_reimported.disconnect(_on_resources_reimported)
 	if get_undo_redo().history_changed.is_connected(_on_undo_redo_history_changed):
 		get_undo_redo().history_changed.disconnect(_on_undo_redo_history_changed)
-	var script_editor := get_editor_interface().get_script_editor()
+	var script_editor := EditorInterface.get_script_editor()
 	if script_editor and script_editor.editor_script_changed.is_connected(_on_active_script_changed):
 		script_editor.editor_script_changed.disconnect(_on_active_script_changed)
 	_disconnect_current_code_edit()
@@ -658,7 +673,7 @@ func _with_connection_flags(args: PackedStringArray) -> PackedStringArray:
 
 ## Persist the connection overrides next to the other per-project settings.
 func _save_connection_overrides() -> void:
-	var settings := get_editor_interface().get_editor_settings()
+	var settings := EditorInterface.get_editor_settings()
 	settings.set_project_metadata(SETTINGS_SECTION, "override_port", _override_port)
 	settings.set_project_metadata(SETTINGS_SECTION, "override_user", _override_user)
 	settings.set_project_metadata(SETTINGS_SECTION, "override_client", _override_client)
@@ -679,7 +694,7 @@ func _ensure_identity() -> bool:
 # ---------------------------------------------------------------------------
 
 func _load_settings() -> void:
-	var settings := get_editor_interface().get_editor_settings()
+	var settings := EditorInterface.get_editor_settings()
 	auto_checkout_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "auto_checkout_on_edit", true)
 	checkout_on_save_checkbox.button_pressed = settings.get_project_metadata(
@@ -695,7 +710,7 @@ func _load_settings() -> void:
 
 
 func _on_setting_toggled(_pressed: bool) -> void:
-	var settings := get_editor_interface().get_editor_settings()
+	var settings := EditorInterface.get_editor_settings()
 	settings.set_project_metadata(SETTINGS_SECTION, "auto_checkout_on_edit",
 			auto_checkout_checkbox.button_pressed)
 	settings.set_project_metadata(SETTINGS_SECTION, "checkout_on_save",
@@ -718,7 +733,7 @@ func _on_undo_redo_history_changed() -> void:
 	if _suppress_auto_checkout:
 		return
 
-	var scene_root := get_editor_interface().get_edited_scene_root()
+	var scene_root := EditorInterface.get_edited_scene_root()
 	if scene_root != null:
 		var scene_path := scene_root.get_scene_file_path()
 		if not scene_path.is_empty():
@@ -727,7 +742,7 @@ func _on_undo_redo_history_changed() -> void:
 	# A standalone resource opened from the FileSystem dock (e.g. a .tres not
 	# belonging to any scene) commits into a history that isn't tied to the
 	# edited scene root above - catch it via the Inspector instead.
-	var edited_object := get_editor_interface().get_inspector().get_edited_object()
+	var edited_object := EditorInterface.get_inspector().get_edited_object()
 	if edited_object is Resource:
 		var res: Resource = edited_object
 		if not res.is_built_in() and not res.resource_path.is_empty():
@@ -738,7 +753,7 @@ func _on_active_script_changed(script: Script) -> void:
 	_disconnect_current_code_edit()
 	if script == null or script.resource_path.is_empty():
 		return
-	var current_editor := get_editor_interface().get_script_editor().get_current_editor()
+	var current_editor := EditorInterface.get_script_editor().get_current_editor()
 	if current_editor == null:
 		return
 	var base_editor := current_editor.get_base_editor()
@@ -873,12 +888,25 @@ func _apply_changes() -> void:
 				# explains why, so don't ALSO queue the failed-save rescue dialog.
 				_rescue_skip_frame[res_path] = Engine.get_process_frames()
 		if not failures.is_empty():
-			_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
-					"Unsaved changes to these files stay in the editor, but the files can't " +
-					"be written until they become available (ask the holder to submit, shelve, " +
-					"or revert them). Checkout is retried automatically on your next save.")
-					% "\n".join(failures))
-	_prewrite_pass()
+			if OS.get_name() == "Windows":
+				_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
+						"Unsaved changes to these files stay in the editor, but the files can't " +
+						"be written until they become available (ask the holder to submit, shelve, " +
+						"or revert them). Checkout is retried automatically on your next save.")
+						% "\n".join(failures))
+			else:
+				# macOS/Linux saves replace the file by rename, which a read-only
+				# target doesn't block: the write lands anyway (_scene_saved_probe
+				# and _on_resource_saved then leave the file writable).
+				_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
+						"The files are saved to disk anyway but are NOT checked out, so " +
+						"Perforce doesn't know about the change yet. Checkout is retried " +
+						"automatically on your next save; Reconcile also picks them up.")
+						% "\n".join(failures))
+		# Only with checkout-on-save on: the pass ends by checking out whatever
+		# the save changed. With it off, a read-only file's save fails and the
+		# rescue dialog asks first.
+		_prewrite_pass()
 
 
 ## The save-can't-fail pass, run synchronously right before the editor
@@ -890,14 +918,13 @@ func _apply_changes() -> void:
 ## read-only, tracked, unopened file the pass might write and make it
 ## briefly writable, so the write succeeds instantly. _finish_prewrite_pass
 ## (deferred to right after the writes, which all happen within this frame)
-## then puts back files whose content didn't actually change - original
-## bytes, read-only bit, Perforce untouched - and checks out the ones that
-## did change, rolling the disk back from the backup if Perforce refuses.
-## Every outcome ends exactly where the old failed-save flow ended, minus
-## the stall and the error dialog.
+## then makes files whose content didn't actually change read-only again -
+## Perforce untouched - and checks out the ones that did change. A save that
+## landed is never rolled back: if Perforce refuses the checkout, the file
+## stays as saved and writable, and the user is told it isn't in a changelist.
 func _prewrite_pass() -> void:
-	var ready: Array = []    # read-only candidates (res:// paths)
-	var unknown: Array = []  # of those, eligibility not cached yet (OS paths)
+	var candidates: Array = []  # read-only candidates (res:// paths)
+	var unknown: Array = []     # of those, eligibility not cached yet (OS paths)
 	for res_path: String in _prewrite_candidates():
 		if _prewrite_managed.has(res_path) or _checked_out_this_session.has(res_path) \
 				or _pending_save_checkout.has(res_path) \
@@ -908,10 +935,10 @@ func _prewrite_pass() -> void:
 			continue
 		if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
 			continue # Writable - checked out, allwrite, or plain untracked.
-		ready.append(res_path)
+		candidates.append(res_path)
 		if not _prewrite_eligible_cache.has(res_path):
 			unknown.append(global_path)
-	if ready.is_empty():
+	if candidates.is_empty():
 		return
 	if not unknown.is_empty():
 		# One batched fstat resolves tracked-and-unopened for every unknown
@@ -923,14 +950,14 @@ func _prewrite_pass() -> void:
 			var cf := String(rec.get("clientFile", ""))
 			if not cf.is_empty():
 				by_client[cf.replace("\\", "/").to_lower()] = rec
-		for res_path: String in ready:
+		for res_path: String in candidates:
 			if _prewrite_eligible_cache.has(res_path):
 				continue
 			var key := ProjectSettings.globalize_path(res_path).replace("\\", "/").to_lower()
 			var rec: Dictionary = by_client.get(key, {})
 			# Tracked (fstat returned a record) and not opened by us (no action).
 			_prewrite_eligible_cache[res_path] = not rec.is_empty() and not rec.has("action")
-	for res_path: String in ready:
+	for res_path: String in candidates:
 		if not _prewrite_eligible_cache.get(res_path, false):
 			continue
 		var global_path := ProjectSettings.globalize_path(res_path)
@@ -951,15 +978,14 @@ func _prewrite_pass() -> void:
 ## Over-approximation is fine: a file made writable that the editor then
 ## doesn't write is byte-identical afterwards and is put back untouched.
 func _prewrite_candidates() -> Array:
-	var ei := get_editor_interface()
 	var roots: Array = []
-	for p in ei.get_open_scenes():
+	for p in EditorInterface.get_open_scenes():
 		roots.append(String(p))
-	for s in ei.get_script_editor().get_open_scripts():
+	for s in EditorInterface.get_script_editor().get_open_scripts():
 		var sp: String = (s as Script).resource_path
 		if not sp.is_empty():
 			roots.append(sp)
-	var inspected: Object = ei.get_inspector().get_edited_object()
+	var inspected: Object = EditorInterface.get_inspector().get_edited_object()
 	if inspected is Resource and not (inspected as Resource).is_built_in() \
 			and not (inspected as Resource).resource_path.is_empty():
 		roots.append((inspected as Resource).resource_path)
@@ -994,35 +1020,35 @@ func _finish_prewrite_pass() -> void:
 		var global_path := ProjectSettings.globalize_path(res_path)
 		var cur := FileAccess.get_file_as_bytes(global_path)
 		var old := FileAccess.get_file_as_bytes(backup)
-		if not cur.is_empty() and not old.is_empty() \
-				and _contents_match(cur, old, global_path.get_extension().to_lower()):
-			# No actual change. Restore the ORIGINAL bytes (not just the
-			# read-only bit): the editor writes LF while the synced file may
-			# be CRLF, and leaving the rewrite in place would make a later
-			# `p4 reconcile` flag a file the user never really changed.
-			DirAccess.copy_absolute(backup, global_path)
+		if cur == old or (not cur.is_empty() and not old.is_empty() \
+				and _contents_match(cur, old, global_path.get_extension().to_lower())):
+			# No actual change: only the read-only bit goes back. The bytes stay
+			# as the editor left them - copying the backup over would move the
+			# file's modified time behind the editor's back, and its next focus-in
+			# scan would offer to "reload from disk" (discarding unsaved edits).
+			# An LF rewrite of a CRLF file is invisible to `p4 reconcile` anyway.
 			_set_file_writable(global_path, false)
 			DirAccess.remove_absolute(backup)
-			_log("Save of '%s' carried no changes - file restored, Perforce untouched." % res_path)
+			if cur != old:
+				_log("Save of '%s' only changed line endings - left unopened." % res_path)
 			continue
+		DirAccess.remove_absolute(backup)
 		_log("'%s' changed on save while not checked out - checking it out to keep the changelist accurate." % res_path)
 		var result: Dictionary = await _do_checkout(res_path)
-		if result.ok:
-			DirAccess.remove_absolute(backup)
+		if result.ok or _shutting_down:
 			continue
 		# Perforce refused (exclusive checkout elsewhere, connection loss...).
-		# Put the disk back exactly as a failed save would have left it:
-		# previous content, read-only. The edit still lives in the editor.
-		var restored := DirAccess.copy_absolute(backup, global_path) == OK
-		_set_file_writable(global_path, false)
-		if restored:
-			DirAccess.remove_absolute(backup)
-		_pending_save_checkout[res_path] = true
-		_show_alert(("'%s' was saved but couldn't be checked out - %s.\n\nThe file on " +
-				"disk was restored to its previous content%s; your changes are still in " +
-				"the editor, and the checkout is retried on your next save (once the " +
-				"file becomes available).") % [res_path, result.reason,
-				"" if restored else " (RESTORE FAILED - backup kept at '%s')" % backup])
+		# The editor already recorded this save as done, so rolling the disk
+		# back would silently lose the edit. Keep it, writable, so `p4 sync`
+		# refuses to overwrite it and Reconcile finds it.
+		# (Its next save retries the checkout via the "saved while not checked
+		# out" path in _scene_saved_probe / _on_resource_saved.)
+		_set_file_writable(global_path, true)
+		_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
+				"Perforce doesn't know about this change yet. The file is left writable " +
+				"so a sync won't overwrite it; checkout is retried on your next save, and " +
+				"Reconcile also picks it up once the file becomes available.")
+				% [res_path, result.reason])
 
 
 ## Flip the OS-level write protection Perforce puts on unopened files.
@@ -1033,12 +1059,142 @@ func _finish_prewrite_pass() -> void:
 func _set_file_writable(global_path: String, writable: bool) -> bool:
 	if OS.get_name() == "Windows":
 		return FileAccess.set_read_only_attribute(global_path, not writable) == OK
-	var out := []
-	return OS.execute("chmod", ["u+w" if writable else "u-w", global_path], out) == 0
+	var perms: int = FileAccess.get_unix_permissions(global_path)
+	if writable:
+		perms |= FileAccess.UNIX_WRITE_OWNER
+	else:
+		perms &= ~(FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_WRITE_GROUP | FileAccess.UNIX_WRITE_OTHER)
+	return FileAccess.set_unix_permissions(global_path, perms) == OK
+
+
+## Whether the save that just happened actually wrote `global_path`. Windows
+## refuses to replace a read-only file, so there "writable" is the answer.
+## macOS/Linux safe-saves write a temp file and rename it over the target,
+## which a read-only target doesn't block (the new file even inherits the
+## read-only mode) - so a fresh modified time is the only reliable evidence.
+func _save_landed(global_path: String) -> bool:
+	if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
+		return true
+	if OS.get_name() == "Windows":
+		return false
+	var age := Time.get_unix_time_from_system() - float(FileAccess.get_modified_time(global_path))
+	return age >= 0.0 and age < 10.0
+
+
+## Scratch folder for pre-write backups and temporary p4 spec files. Swept of
+## stale leftovers (a crash mid-save or mid-login) at startup.
+func _p4godot_cache_dir() -> String:
+	var dir := OS.get_cache_dir().path_join("p4godot")
+	DirAccess.make_dir_recursive_absolute(dir)
+	return dir
+
+
+func _sweep_cache_dir() -> void:
+	var dir := _p4godot_cache_dir()
+	var now := Time.get_unix_time_from_system()
+	for f in DirAccess.get_files_at(dir):
+		var path := dir.path_join(f)
+		if now - float(FileAccess.get_modified_time(path)) > 3600.0:
+			DirAccess.remove_absolute(path)
 
 
 func _prewrite_backup_path(res_path: String) -> String:
-	return OS.get_cache_dir().path_join("p4_prewrite_%s.bak" % res_path.md5_text())
+	# Keyed by the absolute path: two open projects can share a res:// path.
+	var global_path := ProjectSettings.globalize_path(res_path)
+	return _p4godot_cache_dir().path_join("prewrite_%s.bak" % global_path.md5_text())
+
+
+## Every reimport rewrites `<asset>.import` whether or not anything changed
+## (EditorFileSystem::_reimport_file), and when that write fails it also skips
+## the `.godot/imported/*.md5` that marks the import done - so in a read-only
+## workspace every reimported asset errors ("Cannot open file ... .import") and
+## reimports again on the next launch, forever. A fresh sync with no .godot/
+## folder hits it for every asset in the project.
+##
+## resources_reimporting fires synchronously right before the imports run, and
+## plugins initialize before the startup scan, so this covers startup too:
+## back up each read-only .import (in memory - they're small) and make it
+## writable. _on_resources_reimported then sorts them out.
+func _on_resources_reimporting(resources: PackedStringArray) -> void:
+	for res_path in resources:
+		var global_path := ProjectSettings.globalize_path(String(res_path) + ".import")
+		if _reimport_backups.has(global_path) or not FileAccess.file_exists(global_path):
+			continue
+		if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
+			continue # Writable: checked out, allwrite, or untracked.
+		var bytes := FileAccess.get_file_as_bytes(global_path)
+		if bytes.is_empty() or not _set_file_writable(global_path, true):
+			continue
+		_reimport_backups[global_path] = bytes
+
+
+## After a reimport: .import files whose content didn't change go back to
+## read-only, keeping the bytes Godot wrote (it caches the .import md5 right
+## after writing, so putting the old bytes back would trigger yet another
+## reimport; an LF rewrite of a CRLF file is invisible to `p4 reconcile`).
+## Changed ones - an importer upgrade, new import defaults - are checked out.
+func _on_resources_reimported(resources: PackedStringArray) -> void:
+	var changed := _classify_reimported(resources)
+	if not changed.is_empty():
+		await _checkout_reimported(changed)
+
+
+## Returns the global paths of backed-up .import files the reimport really
+## changed; unchanged ones are made read-only again. Split out for selftests.
+func _classify_reimported(resources: PackedStringArray) -> Array:
+	var changed: Array = []
+	for res_path in resources:
+		var global_path := ProjectSettings.globalize_path(String(res_path) + ".import")
+		if not _reimport_backups.has(global_path):
+			continue
+		var old: PackedByteArray = _reimport_backups[global_path]
+		_reimport_backups.erase(global_path)
+		var cur := FileAccess.get_file_as_bytes(global_path)
+		if cur == old or (not cur.is_empty() and _contents_match(cur, old, "import")):
+			_set_file_writable(global_path, false)
+		else:
+			changed.append(global_path)
+	return changed
+
+
+## Check out .import files a reimport really changed, like a save would. A
+## Godot upgrade can change hundreds at once, so big batches ask first.
+## Anything not checked out stays writable (as written), so `p4 sync` won't
+## overwrite it and Reconcile finds it later.
+func _checkout_reimported(global_paths: Array) -> void:
+	var sample := ", ".join(global_paths.slice(0, 5).map(
+			func(p: String) -> String: return ProjectSettings.localize_path(p)))
+	if global_paths.size() > 5:
+		sample += ", ..."
+	if not checkout_on_save_checkbox.button_pressed or not await _ensure_identity():
+		_log("Reimport changed %d .import file(s) that aren't checked out - left writable for Reconcile: %s"
+				% [global_paths.size(), sample])
+		return
+	if global_paths.size() > REIMPORT_CONFIRM_THRESHOLD:
+		var ok: bool = await _show_confirm_dialog(("Godot's reimport changed %d .import files " +
+				"that aren't checked out (this usually follows a Godot upgrade or a change to " +
+				"import defaults).\n\nCheck them out now? If not, they stay writable and " +
+				"Reconcile picks them up later.") % global_paths.size(), "Check Out", "Not Now")
+		if not ok:
+			_log("Left %d changed .import file(s) writable and unopened - Reconcile picks them up." % global_paths.size())
+			return
+	var opened := {}
+	for i in range(0, global_paths.size(), 50):
+		var chunk: Array = global_paths.slice(i, i + 50)
+		await _p4_exec_logged(["edit"] + chunk)
+		# p4 edit can exit 0 on a refusal - trust the resulting state instead.
+		for rec in _parse_ztag(await _p4_exec(["-ztag", "fstat"] + chunk)):
+			if rec.has("action"):
+				opened[String(rec.get("clientFile", "")).replace("\\", "/").to_lower()] = true
+	var failed: Array = []
+	for p: String in global_paths:
+		if not opened.has(p.replace("\\", "/").to_lower()):
+			failed.append(ProjectSettings.localize_path(p))
+	_log("Reimport changed %d .import file(s); checked out %d." % [global_paths.size(),
+			global_paths.size() - failed.size()])
+	if not failed.is_empty():
+		_log("Couldn't check out (left writable for Reconcile): %s" % ", ".join(failed))
+	_request_refresh()
 
 
 ## Emitted for every scene save ATTEMPT - including failed ones (verified:
@@ -1096,16 +1252,23 @@ func _scene_saved_probe(path: String) -> void:
 		_pending_save_checkout.erase(res_path)
 		return
 
-	# Not checked out. Whether the write actually succeeded tells us which
-	# situation we're in: writable file = the save went through without a
-	# checkout (allwrite client), read-only file = the save just failed.
-	if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
-		_log("'%s' was saved while not checked out (allwrite client?) - checking it out to keep the changelist accurate." % res_path)
+	# Not checked out. Whether the write actually landed tells us which
+	# situation we're in: landed = the save went through without a checkout
+	# (allwrite client, or macOS/Linux, where read-only doesn't block a save),
+	# not landed = the save just failed.
+	if _save_landed(global_path):
+		if checkout_was_refused_this_save:
+			# macOS/Linux: saved despite the refusal (already reported). Keep
+			# it writable so `p4 sync` refuses to overwrite the edit.
+			_set_file_writable(global_path, true)
+			return
+		_log("'%s' was saved while not checked out - checking it out to keep the changelist accurate." % res_path)
 		var result: Dictionary = await _do_checkout(res_path)
 		if not result.ok:
+			_set_file_writable(global_path, true)
 			_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
 					"Perforce doesn't know about this change yet. Once the file becomes " +
-					"available, use 'Checkout Current File' (or `p4 reconcile`) so the " +
+					"available, use 'Checkout Current File' (or Reconcile) so the " +
 					"change lands in a changelist.") % [res_path, result.reason])
 		return
 
@@ -1346,8 +1509,8 @@ func _all_error_lines_covered(text: String) -> bool:
 		if line.is_empty():
 			continue
 		var covered := false
-		for name in _error_dismiss_names:
-			if line.contains(String(name).get_file()):
+		for dismiss_name in _error_dismiss_names:
+			if line.contains(String(dismiss_name).get_file()):
 				covered = true
 				break
 		if not covered:
@@ -1441,14 +1604,14 @@ func _run_rescue_flow() -> void:
 				_log("Saving '%s' still failed (error %d)." % [res_path, err])
 	if scenes.is_empty():
 		return
-	var scene_root := get_editor_interface().get_edited_scene_root()
+	var scene_root := EditorInterface.get_edited_scene_root()
 	if scenes.size() == 1 and scene_root \
 			and scene_root.get_scene_file_path() == scenes[0]:
-		get_editor_interface().save_scene()
+		EditorInterface.save_scene()
 	else:
 		# Multiple scenes, or the rescued scene isn't the active tab - re-run
 		# Save All; already-saved scenes are cheap no-ops the second time.
-		get_editor_interface().save_all_scenes()
+		EditorInterface.save_all_scenes()
 
 
 ## Success-only (the engine emits no signal for a failed resource write).
@@ -1462,20 +1625,28 @@ func _on_resource_saved(res: Resource) -> void:
 		return
 	if _prewrite_managed.has(res_path):
 		return # The pre-write pass owns this file's restore-or-checkout decision.
+	var global_path := ProjectSettings.globalize_path(res_path)
+	if _rescue_skip_frame.get(res_path, -1) == Engine.get_process_frames():
+		# The pre-save checkout was just refused and reported. resource_saved
+		# only fires for writes that landed (macOS/Linux ignore read-only on
+		# save): keep the file writable so `p4 sync` won't overwrite the edit.
+		_set_file_writable(global_path, true)
+		return
 	if not await _ensure_identity():
 		return
 	if _checked_out_this_session.has(res_path):
 		return # Re-check: a save-time checkout may have resolved during the await.
-	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
+	if not await _needs_checkout(global_path):
 		_checked_out_this_session[res_path] = true
 		_pending_save_checkout.erase(res_path)
 		return
-	_log("'%s' was saved while not checked out (allwrite client?) - checking it out to keep the changelist accurate." % res_path)
+	_log("'%s' was saved while not checked out - checking it out to keep the changelist accurate." % res_path)
 	var result: Dictionary = await _do_checkout(res_path)
 	if not result.ok:
+		_set_file_writable(global_path, true)
 		_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
 				"Perforce doesn't know about this change yet. Once the file becomes " +
-				"available, use 'Checkout Current File' (or `p4 reconcile`) so the " +
+				"available, use 'Checkout Current File' (or Reconcile) so the " +
 				"change lands in a changelist.") % [res_path, result.reason])
 
 
@@ -1875,7 +2046,7 @@ func _make_diff_pane() -> TextEdit:
 	te.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	te.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	var hl := P4DiffHighlighter.new()
-	var base := get_editor_interface().get_base_control()
+	var base := EditorInterface.get_base_control()
 	if base and base.has_theme_color("font_color", "Editor"):
 		hl.default_color = base.get_theme_color("font_color", "Editor")
 	te.syntax_highlighter = hl
@@ -2013,7 +2184,7 @@ func _update_diff_nav(ordinal: int) -> void:
 ## Stateless prev/next: measured from what is on screen now, so manual
 ## scrolling between clicks never causes a jump to somewhere unexpected.
 func _on_diff_next_pressed() -> void:
-	var center := diff_left.get_first_visible_line() + diff_left.get_visible_line_count() / 2
+	var center := diff_left.get_first_visible_line() + floori(diff_left.get_visible_line_count() / 2.0)
 	for b in _diff_change_blocks.size():
 		if int(_diff_change_blocks[b]) > center:
 			_goto_diff_row(int(_diff_change_blocks[b]), b + 1)
@@ -2023,7 +2194,7 @@ func _on_diff_next_pressed() -> void:
 
 
 func _on_diff_prev_pressed() -> void:
-	var center := diff_left.get_first_visible_line() + diff_left.get_visible_line_count() / 2
+	var center := diff_left.get_first_visible_line() + floori(diff_left.get_visible_line_count() / 2.0)
 	for b in range(_diff_change_blocks.size() - 1, -1, -1):
 		if int(_diff_change_blocks[b]) < center - 1:
 			_goto_diff_row(int(_diff_change_blocks[b]), b + 1)
@@ -2335,21 +2506,21 @@ func _rebuild_tree(model: Dictionary) -> void:
 ## An editor theme icon by name, or null if this build doesn't have it (so
 ## set_icon(null) just leaves the row icon-less rather than erroring).
 func _theme_icon(icon_name: String) -> Texture2D:
-	var base := get_editor_interface().get_base_control()
+	var base := EditorInterface.get_base_control()
 	if base and base.has_theme_icon(icon_name, "EditorIcons"):
 		return base.get_theme_icon(icon_name, "EditorIcons")
 	return null
 
 
 func _editor_bold_font() -> Font:
-	var base := get_editor_interface().get_base_control()
+	var base := EditorInterface.get_base_control()
 	if base and base.has_theme_font("bold", "EditorFonts"):
 		return base.get_theme_font("bold", "EditorFonts")
 	return null
 
 
 func _dim_color() -> Color:
-	var base := get_editor_interface().get_base_control()
+	var base := EditorInterface.get_base_control()
 	if base and base.has_theme_color("font_disabled_color", "Editor"):
 		return base.get_theme_color("font_disabled_color", "Editor")
 	return Color(0.62, 0.62, 0.67)
@@ -2392,11 +2563,11 @@ func _on_tree_item_activated() -> void:
 func _open_res_path(res_path: String) -> void:
 	var ext := res_path.get_extension().to_lower()
 	if ext == "tscn" or ext == "scn":
-		get_editor_interface().open_scene_from_path(res_path)
+		EditorInterface.open_scene_from_path(res_path)
 	else:
 		var res := ResourceLoader.load(res_path)
 		if res:
-			get_editor_interface().edit_resource(res)
+			EditorInterface.edit_resource(res)
 
 
 # --- Drag & drop: drag a file row onto another changelist to move it -------
@@ -2656,11 +2827,11 @@ func _fold_opened_into_cache(model: Dictionary) -> void:
 ## The file the manual buttons act on: the active script when the Script
 ## editor is in front, otherwise the edited scene.
 func _get_current_file_path() -> String:
-	var script_editor := get_editor_interface().get_script_editor()
+	var script_editor := EditorInterface.get_script_editor()
 	var script := script_editor.get_current_script()
 	if script_editor.is_visible_in_tree() and script and not script.resource_path.is_empty():
 		return script.resource_path
-	var scene_root := get_editor_interface().get_edited_scene_root()
+	var scene_root := EditorInterface.get_edited_scene_root()
 	if scene_root and not scene_root.get_scene_file_path().is_empty():
 		return scene_root.get_scene_file_path()
 	if script and not script.resource_path.is_empty():
@@ -2882,12 +3053,12 @@ func _revert_unchanged_flow() -> void:
 ## whose edits haven't been written to disk yet.
 func _open_editor_files() -> Dictionary:
 	var open: Dictionary = {}
-	for scene_path in get_editor_interface().get_open_scenes():
+	for scene_path in EditorInterface.get_open_scenes():
 		open[String(scene_path)] = true
-	for scr in get_editor_interface().get_script_editor().get_open_scripts():
+	for scr in EditorInterface.get_script_editor().get_open_scripts():
 		if scr and not scr.resource_path.is_empty():
 			open[scr.resource_path] = true
-	var edited := get_editor_interface().get_inspector().get_edited_object()
+	var edited := EditorInterface.get_inspector().get_edited_object()
 	if edited is Resource and not edited.resource_path.is_empty():
 		open[edited.resource_path] = true
 	return open
@@ -3662,7 +3833,7 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 	# Do NOT add_child(dialog) first: popup_exclusive_centered() parents the
 	# dialog itself (Window::_try_parent_dialog()) and silently no-ops - the
 	# dialog never shows, with no error - if it already has a parent.
-	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -3736,7 +3907,7 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -3785,7 +3956,7 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -3842,7 +4013,7 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -3883,7 +4054,7 @@ func _show_alert(text: String) -> void:
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(get_editor_interface().get_base_control())
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -3944,9 +4115,9 @@ func _reload_path(res_path: String) -> void:
 
 	var ext := res_path.get_extension().to_lower()
 	if ext == "tscn" or ext == "scn":
-		if res_path in get_editor_interface().get_open_scenes():
+		if res_path in EditorInterface.get_open_scenes():
 			_log("Reloading scene '%s'..." % res_path)
-			get_editor_interface().reload_scene_from_path(res_path)
+			EditorInterface.reload_scene_from_path(res_path)
 		else:
 			_log("'%s' isn't open in a tab - nothing to reload." % res_path)
 	elif ext == "gd" or ext == "cs":
@@ -3954,12 +4125,12 @@ func _reload_path(res_path: String) -> void:
 		# script buffer (reload_open_files() only reloads on an on-disk mtime
 		# change, which a declined checkout never causes). Costs the tab.
 		_log("Closing and discarding unsaved changes to script '%s'..." % res_path)
-		get_editor_interface().get_script_editor().close_file(res_path)
+		EditorInterface.get_script_editor().close_file(res_path)
 	else:
 		_log("Reloading resource '%s' from disk..." % res_path)
 		var reloaded := ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_REPLACE)
 		if reloaded:
-			get_editor_interface().edit_resource(reloaded)
+			EditorInterface.edit_resource(reloaded)
 	_checked_out_this_session.erase(res_path)
 	_declined_this_session.erase(res_path)
 	_pending_save_checkout.erase(res_path)
@@ -3982,7 +4153,7 @@ func _clear_auto_checkout_suppression() -> void:
 # ---------------------------------------------------------------------------
 
 func _register_filesystem_hooks() -> void:
-	var fsd := get_editor_interface().get_file_system_dock()
+	var fsd := EditorInterface.get_file_system_dock()
 	if fsd and fsd.has_method("add_resource_tooltip_plugin"):
 		var tip := P4FileSystemTooltip.new()
 		tip.plugin = self
@@ -4007,7 +4178,7 @@ func _register_filesystem_hooks() -> void:
 
 
 func _unregister_filesystem_hooks() -> void:
-	var fsd := get_editor_interface().get_file_system_dock()
+	var fsd := EditorInterface.get_file_system_dock()
 	if fsd:
 		if fsd.has_signal("file_removed") and fsd.file_removed.is_connected(_on_fs_file_removed):
 			fsd.file_removed.disconnect(_on_fs_file_removed)
@@ -4232,7 +4403,7 @@ func _fstat_summary_line(res_path: String, rec: Dictionary) -> String:
 # These FileSystemDock signals fire AFTER Godot has already changed the disk, so
 # we can't intercept like checkout-on-edit does - we react, bringing Perforce in
 # line with what the dock just did. A deletion becomes an open-for-delete; a
-# move/rename is recorded with `p4 reconcile -m` (Perforce move detection), which
+# move/rename is recorded with `p4 reconcile -M` (Perforce move detection), which
 # preserves history when the file's content is unchanged and degrades to a
 # delete + add when Godot rewrote it during the move. These prompt by default;
 # the "Auto add/edit/delete" setting applies them silently. Our own p4 sync/
@@ -4301,7 +4472,21 @@ func _handle_fs_delete(res_path: String, is_folder: bool) -> void:
 		return
 	await _p4_open_for_delete(res_path, decision)
 	_forget_path(res_path)
+	# Godot deletes an asset's .import (and a script's .uid) along with it.
+	for sidecar: String in _sidecars_of(res_path):
+		if FileAccess.file_exists(ProjectSettings.globalize_path(sidecar)):
+			continue
+		var side_decision := _delete_action_for(await _fetch_fstat_record(sidecar))
+		if side_decision != "none":
+			await _p4_open_for_delete(sidecar, side_decision)
+			_forget_path(sidecar)
 	_request_refresh()
+
+
+## Companion files Godot moves and deletes together with a file: an imported
+## asset's `.import`, and the `.uid` of scripts and shaders (Godot 4.4+).
+func _sidecars_of(res_path: String) -> Array:
+	return [res_path + ".import", res_path + ".uid"]
 
 
 ## Record a workspace move/rename in Perforce, history-preserving where possible.
@@ -4361,8 +4546,8 @@ func _p4_open_for_delete(res_path: String, decision: String) -> void:
 			await _p4_exec_logged(["reconcile", "-d", global_path])
 
 
-## Record a move via `p4 reconcile -m`, scoped to just the two paths (or the two
-## subtrees for a folder). Move detection pairs the now-missing source with the
+## Record a move via `p4 reconcile -M`, scoped to just the two paths plus their
+## sidecars (or the two subtrees for a folder). Move detection pairs the now-missing source with the
 ## new file by content: matched -> a history-preserving move/delete + move/add;
 ## unmatched (Godot rewrote it) -> a plain delete + add.
 func _p4_record_move(old_res: String, new_res: String, is_folder: bool) -> Dictionary:
@@ -4371,7 +4556,14 @@ func _p4_record_move(old_res: String, new_res: String, is_folder: bool) -> Dicti
 	if is_folder:
 		old_g = _as_recursive(old_g)
 		new_g = _as_recursive(new_g)
-	return await _p4_exec_logged(["reconcile", "-m", old_g, new_g])
+		return await _p4_exec_logged(["reconcile", "-M", old_g, new_g])
+	var args: PackedStringArray = ["reconcile", "-M", old_g, new_g]
+	# Godot moved the .import / .uid sidecar too; record it in the same pass.
+	for i in _sidecars_of(old_res).size():
+		var new_side := ProjectSettings.globalize_path(_sidecars_of(new_res)[i])
+		if FileAccess.file_exists(new_side):
+			args.append_array([ProjectSettings.globalize_path(_sidecars_of(old_res)[i]), new_side])
+	return await _p4_exec_logged(args)
 
 
 ## A local path as a p4 recursive scope (append "/..."), for folder operations.
@@ -4500,7 +4692,7 @@ func _run_cli_self_test_if_requested() -> void:
 			# (3) a mixed dialog with an uncovered line, and ConfirmationDialogs
 			# (all of the plugin's own dialogs), untouched.
 			_selftest_auto_answer = "confirm" # resolves case 3's fallback alert
-			var gui := get_editor_interface().get_base_control()
+			var gui := EditorInterface.get_base_control()
 			var ours := ConfirmationDialog.new()
 			ours.dialog_text = "Check out level.tscn?"
 			gui.add_child(ours)
@@ -4587,6 +4779,72 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: prewrite")
 			else:
 				_log("[selftest] FAIL: prewrite")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-save-guards":
+			# Server-independent, on real files under user:// (never the project):
+			# 1. _finish_prewrite_pass leaves an LF-only rewrite in place (no
+			#    copy-back that would move the mtime) and makes it read-only.
+			# 2. The reimport guard flips read-only .import files writable, then
+			#    re-locks an unchanged one (keeping Godot's LF bytes) and reports a
+			#    changed one, leaving it writable.
+			var dir := "user://p4_selftest_guards"
+			DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dir))
+			var put := func(res: String, text: String) -> void:
+				var gp := ProjectSettings.globalize_path(res)
+				_set_file_writable(gp, true)
+				var fw := FileAccess.open(gp, FileAccess.WRITE)
+				fw.store_string(text)
+				fw.close()
+			var is_rw := func(res: String) -> bool:
+				return FileAccess.open(ProjectSettings.globalize_path(res), FileAccess.READ_WRITE) != null
+			var body := "[remap]\r\n\r\nimporter=\"texture\"\r\n"
+			# 1. Pre-write finish, unchanged content.
+			var scene := dir + "/a.tscn"
+			put.call(scene, "node A\r\n")
+			var scene_g := ProjectSettings.globalize_path(scene)
+			var backup := _prewrite_backup_path(scene)
+			DirAccess.copy_absolute(scene_g, backup)
+			_prewrite_managed[scene] = backup
+			put.call(scene, "node A\n") # the editor's LF rewrite
+			_finish_prewrite_pass()
+			var pw_kept := FileAccess.get_file_as_string(scene_g) == "node A\n"
+			var pw_locked: bool = not is_rw.call(scene)
+			var pw_backup_gone := not FileAccess.file_exists(backup)
+			# 2. Reimport guard.
+			var same_res := dir + "/same.png"
+			var changed_res := dir + "/changed.png"
+			put.call(same_res + ".import", body)
+			put.call(changed_res + ".import", body)
+			_set_file_writable(ProjectSettings.globalize_path(same_res + ".import"), false)
+			_set_file_writable(ProjectSettings.globalize_path(changed_res + ".import"), false)
+			var both := PackedStringArray([same_res, changed_res])
+			_on_resources_reimporting(both)
+			var ri_unlocked: bool = is_rw.call(same_res + ".import") and is_rw.call(changed_res + ".import")
+			put.call(same_res + ".import", body.replace("\r\n", "\n"))
+			put.call(changed_res + ".import", body.replace("\r\n", "\n") + "uid=\"uid://abc\"\n")
+			var changed := _classify_reimported(both)
+			var ri_same_locked: bool = not is_rw.call(same_res + ".import")
+			var ri_same_lf := FileAccess.get_file_as_string(
+					ProjectSettings.globalize_path(same_res + ".import")) == body.replace("\r\n", "\n")
+			var ri_changed: bool = changed.size() == 1 \
+					and changed[0] == ProjectSettings.globalize_path(changed_res + ".import") \
+					and is_rw.call(changed_res + ".import")
+			var ri_drained := _reimport_backups.is_empty()
+			# 3. Move/delete sidecars.
+			var sidecars_ok := _sidecars_of("res://a.png") == ["res://a.png.import", "res://a.png.uid"]
+			for f in DirAccess.get_files_at(ProjectSettings.globalize_path(dir)):
+				_set_file_writable(ProjectSettings.globalize_path(dir.path_join(f)), true)
+				DirAccess.remove_absolute(ProjectSettings.globalize_path(dir.path_join(f)))
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(dir))
+			_log("[selftest] pw-kept=%s pw-locked=%s pw-backup-gone=%s ri-unlocked=%s ri-same-locked=%s ri-same-lf=%s ri-changed=%s ri-drained=%s sidecars=%s"
+					% [pw_kept, pw_locked, pw_backup_gone, ri_unlocked, ri_same_locked, ri_same_lf,
+					ri_changed, ri_drained, sidecars_ok])
+			if pw_kept and pw_locked and pw_backup_gone and ri_unlocked and ri_same_locked \
+					and ri_same_lf and ri_changed and ri_drained and sidecars_ok:
+				_log("[selftest] PASS: save-guards")
+			else:
+				_log("[selftest] FAIL: save-guards")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-list-opened":
@@ -4821,7 +5079,7 @@ func _run_cli_self_test_if_requested() -> void:
 			await _selftest_drain_frames()
 			_log("[selftest] pending-for-save: %s" % [_pending_save_checkout.keys()])
 			await _selftest_make_current(path)
-			get_editor_interface().save_scene()
+			EditorInterface.save_scene()
 			await _selftest_drain_frames()
 			await _selftest_report_opened(path)
 			get_tree().quit()
@@ -4832,7 +5090,7 @@ func _run_cli_self_test_if_requested() -> void:
 			checkout_on_save_checkbox.set_pressed_no_signal(false)
 			await _selftest_simulate_edit(path)
 			await _selftest_make_current(path)
-			var save_err := get_editor_interface().save_scene()
+			var save_err := EditorInterface.save_scene()
 			_log("[selftest] save_scene() returned error code %d" % save_err)
 			await _selftest_drain_frames()
 			await _selftest_report_opened(path)
@@ -4844,7 +5102,7 @@ func _run_cli_self_test_if_requested() -> void:
 			# scene save) without touching the scene's own content.
 			var path := arg.substr("--p4-selftest-save-current=".length())
 			await _selftest_make_current(path)
-			get_editor_interface().save_scene()
+			EditorInterface.save_scene()
 			await _selftest_drain_frames()
 			await _selftest_drain_frames()
 			get_tree().quit()
@@ -4860,7 +5118,7 @@ func _run_cli_self_test_if_requested() -> void:
 			# Let the async edit-time flows settle before saving, so the save
 			# pass starts from the same state the old synchronous code had.
 			await _selftest_drain_frames()
-			get_editor_interface().save_all_scenes()
+			EditorInterface.save_all_scenes()
 			await _selftest_drain_frames()
 			await _selftest_drain_frames()
 			for p in paths:
@@ -4878,21 +5136,21 @@ func _selftest_menu_labels() -> String:
 
 func _selftest_simulate_edit(path: String) -> void:
 	_log("[selftest] Opening '%s' and simulating a real commit_action()..." % path)
-	get_editor_interface().open_scene_from_path(path)
+	EditorInterface.open_scene_from_path(path)
 	await get_tree().process_frame
 	await get_tree().process_frame
 	# Main::start auto-opens the project's MAIN scene at a nondeterministic
 	# point during boot (see _selftest_make_current) - it can steal the
 	# current tab between our open and our commit, making the edit land on
 	# the wrong scene. Refocus until the requested scene is actually current.
-	var scene_root := get_editor_interface().get_edited_scene_root()
+	var scene_root := EditorInterface.get_edited_scene_root()
 	for attempt in range(10):
 		if scene_root != null and scene_root.get_scene_file_path() == path:
 			break
-		get_editor_interface().open_scene_from_path(path)
+		EditorInterface.open_scene_from_path(path)
 		await get_tree().process_frame
 		await get_tree().process_frame
-		scene_root = get_editor_interface().get_edited_scene_root()
+		scene_root = EditorInterface.get_edited_scene_root()
 	if scene_root == null or scene_root.get_scene_file_path() != path:
 		_log("[selftest] FAILED: couldn't make '%s' the edited scene" % path)
 		return
@@ -4914,10 +5172,10 @@ func _selftest_simulate_edit(path: String) -> void:
 ## plugin init - EditorInterface.save_scene() would then save the main scene
 ## instead of the scene under test.
 func _selftest_make_current(path: String) -> void:
-	get_editor_interface().open_scene_from_path(path)
+	EditorInterface.open_scene_from_path(path)
 	await get_tree().process_frame
 	await get_tree().process_frame
-	var root := get_editor_interface().get_edited_scene_root()
+	var root := EditorInterface.get_edited_scene_root()
 	_log("[selftest] current scene at save time: '%s'" % (root.get_scene_file_path() if root else "<none>"))
 
 
