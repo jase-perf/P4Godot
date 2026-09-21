@@ -86,6 +86,7 @@ const FSTAT_CACHE_TTL_SEC := 5.0
 ## anywhere outside the queue itself.
 class P4Request extends RefCounted:
 	signal done
+	var bin: String = "p4" # copied from _p4_bin on the main thread
 	var args: PackedStringArray
 	# When set, p4 is run through the platform shell with this file redirected
 	# onto its stdin (for `p4 change -i`, whose spec input OS.execute can't feed).
@@ -237,6 +238,13 @@ var _p4_port: String = ""
 # chosen via connection setup). Passed to every command as p4 global flags
 # (-p/-u/-c), so a project binds to the right server/client without touching
 # the user's machine-wide p4 configuration (P4CONFIG, registry, env).
+# The p4 executable (see _resolve_p4_bin); "" until found. Read by the worker
+# only through the copy each P4Request carries.
+var _p4_bin: String = ""
+const P4_PATH_SETTING := "p4godot/p4_executable"
+# The last connection probe's p4 output, for setup prompts that quote it.
+var _last_probe_text: String = ""
+
 var _override_port: String = ""
 var _override_user: String = ""
 var _override_client: String = ""
@@ -338,6 +346,9 @@ var _prewrite_eligible_cache: Dictionary = {}
 var _reimport_backups: Dictionary = {}
 const REIMPORT_CONFIRM_THRESHOLD := 20
 
+# Global paths whose last `p4 fstat` failed (see _remember_no_checkout).
+var _fstat_failed: Dictionary = {}
+
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
@@ -363,6 +374,7 @@ func _enter_tree() -> void:
 	efs.resources_reimporting.connect(_on_resources_reimporting)
 	efs.resources_reimported.connect(_on_resources_reimported)
 
+	_p4_bin = _resolve_p4_bin()
 	_p4_thread = Thread.new()
 	_p4_thread.start(_p4_worker_loop)
 	_sweep_cache_dir()
@@ -447,15 +459,28 @@ func _detect_p4_identity() -> void:
 ## "no server" (can't connect), "not logged in", or "no client" (workspace
 ## unknown, or its root doesn't contain this project).
 func _probe_connection() -> String:
+	if _p4_bin.is_empty():
+		_p4_bin = _resolve_p4_bin() # retried on every probe: p4 may have been installed since
+		if _p4_bin.is_empty():
+			return "p4 missing"
 	var result: Dictionary = await _p4_exec(["-ztag", "info"])
 	var text := "" if result.output.is_empty() else String(result.output[0])
+	_last_probe_text = text
 	if result.exit_code != 0:
 		if _looks_like_login_error(result):
 			return "not logged in"
+		if text.contains("IDENTIFICATION HAS CHANGED"):
+			return "fingerprint changed"
+		if text.contains("'p4 trust'"):
+			return "not trusted"
 		if text.contains("Connect to server failed") or text.contains("check $P4PORT") \
 				or text.to_lower().contains("tcp connect"):
 			return "no server"
-		return "p4 missing" if text.strip_edges().is_empty() else "no server"
+		# macOS/Linux run p4 through a shell: a missing binary is exit 127.
+		if text.strip_edges().is_empty() or result.exit_code == 127 \
+				or text.contains("command not found") or text.contains(": not found"):
+			return "p4 missing"
+		return "no server"
 	var records := _parse_ztag(result)
 	var info: Dictionary = {} if records.is_empty() else records[0]
 	_p4_user = String(info.get("userName", ""))
@@ -466,6 +491,53 @@ func _probe_connection() -> String:
 		return "no client"
 	_p4_client = client
 	return "ok"
+
+
+## The executable to run: the resolved one, else plain "p4" (whose failure the
+## connection probe then reports as "p4 missing").
+func _p4_cmd() -> String:
+	return _p4_bin if not _p4_bin.is_empty() else "p4"
+
+
+## Find a working p4 executable, or "". Godot launched from the macOS Dock or
+## Finder gets launchd's minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
+## hides Homebrew's p4 - so after the PATH lookup, try the usual install
+## locations. The "p4godot/p4_executable" editor setting is tried first.
+func _resolve_p4_bin() -> String:
+	var settings := EditorInterface.get_editor_settings()
+	if not settings.has_setting(P4_PATH_SETTING):
+		settings.set_setting(P4_PATH_SETTING, "")
+	settings.set_initial_value(P4_PATH_SETTING, "", false)
+	settings.add_property_info({"name": P4_PATH_SETTING, "type": TYPE_STRING,
+			"hint": PROPERTY_HINT_GLOBAL_FILE})
+	var home := OS.get_environment("HOME")
+	var candidates := PackedStringArray()
+	var configured := String(settings.get_setting(P4_PATH_SETTING)).strip_edges()
+	if not configured.is_empty():
+		candidates.append(configured)
+	candidates.append("p4")
+	match OS.get_name():
+		"Windows":
+			candidates.append_array(["C:/Program Files/Perforce/p4.exe",
+					"C:/Program Files (x86)/Perforce/p4.exe"])
+		"macOS":
+			candidates.append_array(["/opt/homebrew/bin/p4", "/usr/local/bin/p4",
+					home.path_join("bin/p4")])
+		_:
+			candidates.append_array(["/usr/local/bin/p4", "/usr/bin/p4",
+					"/opt/perforce/bin/p4", home.path_join("bin/p4")])
+	for c in candidates:
+		if c != "p4" and not FileAccess.file_exists(c):
+			continue
+		var out := []
+		if OS.execute(c, _os_args(["-V"]), out, true) == 0 \
+				and not out.is_empty() and String(out[0]).contains("Perforce"):
+			if c != "p4":
+				_log("Using p4 at %s." % c)
+			return c
+	if not configured.is_empty():
+		_log("The %s editor setting ('%s') isn't a working p4." % [P4_PATH_SETTING, configured])
+	return ""
 
 
 ## Whether the project directory lives under `client_root` (case-insensitive,
@@ -501,9 +573,29 @@ func _offer_connection_setup() -> void:
 			_request_refresh()
 			break
 		if status == "p4 missing":
-			await _show_alert("The p4 command-line client isn't installed (or isn't on PATH).\n\n" +
-					"Install the Helix Command-Line Client (P4) from perforce.com/downloads,\n" +
-					"then press Refresh in the P4 dock.")
+			await _show_alert("Couldn't find the p4 command-line client.\n\n" +
+					"Install it from perforce.com/downloads (on Windows it comes with P4V;\n" +
+					"on macOS, `brew install --cask p4` works), then press Refresh in the P4G dock.\n\n" +
+					"If p4 is installed somewhere unusual, set its full path in\n" +
+					"Editor Settings > P4godot > P4 Executable.")
+			break
+		if status == "not trusted":
+			var fp_re := RegEx.create_from_string("(?:[0-9A-Fa-f]{2}:){15,}[0-9A-Fa-f]{2}")
+			var fp_match := fp_re.search(_last_probe_text)
+			var fp := fp_match.get_string() if fp_match else "(see the P4 Log)"
+			var trust: bool = await _show_confirm_dialog(("This computer hasn't connected to this " +
+					"Perforce server over SSL before.\n\nServer fingerprint:\n%s\n\nTrust it only if it " +
+					"matches the fingerprint your server admin gave you (or the one P4V showed you).")
+					% fp, "Trust This Server", "Cancel")
+			if not trust:
+				break
+			await _p4_exec_logged(["trust", "-y"])
+			continue
+		if status == "fingerprint changed":
+			await _show_alert("WARNING: this Perforce server's SSL fingerprint has CHANGED since " +
+					"this computer last connected.\n\nThat can mean the server was reinstalled - or " +
+					"that something is intercepting the connection. Ask your server admin before " +
+					"trusting the new fingerprint (`p4 trust -f -y` in a terminal).")
 			break
 		if status == "no server":
 			var prefill: String = await _suggest_port()
@@ -799,7 +891,7 @@ func _handle_edit_inner(res_path: String) -> void:
 	if not await _ensure_identity():
 		return
 	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
-		_checked_out_this_session[res_path] = true
+		_remember_no_checkout(res_path, ProjectSettings.globalize_path(res_path))
 		return
 
 	if _auto_open():
@@ -946,12 +1038,17 @@ func _prewrite_pass() -> void:
 		# _apply_changes returns) - the same tradeoff as the pre-save checkout
 		# above. The cache keeps repeat saves at zero extra round trips.
 		var by_client := {}
-		for rec in _parse_ztag(_p4_exec_sync(["-ztag", "fstat"] + unknown)):
+		var fstat_result := _p4_exec_sync(["-ztag", "fstat"] + unknown)
+		var recs := _parse_ztag(fstat_result)
+		for rec in recs:
 			var cf := String(rec.get("clientFile", ""))
 			if not cf.is_empty():
 				by_client[cf.replace("\\", "/").to_lower()] = rec
+		# A failed fstat with no records (server unreachable, dead ticket) is
+		# "unknown", not "untracked": skip the pass for now, cache nothing.
+		var fstat_failed: bool = int(fstat_result.exit_code) != 0 and recs.is_empty()
 		for res_path: String in candidates:
-			if _prewrite_eligible_cache.has(res_path):
+			if _prewrite_eligible_cache.has(res_path) or fstat_failed:
 				continue
 			var key := ProjectSettings.globalize_path(res_path).replace("\\", "/").to_lower()
 			var rec: Dictionary = by_client.get(key, {})
@@ -1248,7 +1345,7 @@ func _scene_saved_probe(path: String) -> void:
 	if _checked_out_this_session.has(res_path):
 		return
 	if not await _needs_checkout(global_path):
-		_checked_out_this_session[res_path] = true
+		_remember_no_checkout(res_path, global_path)
 		_pending_save_checkout.erase(res_path)
 		return
 
@@ -1332,7 +1429,7 @@ func _dependency_writes_probe(scene_path: String) -> void:
 	for entry: Dictionary in failed:
 		var dep_path := String(entry.dep_path)
 		if not await _needs_checkout(String(entry.global_path)):
-			_checked_out_this_session[dep_path] = true
+			_remember_no_checkout(dep_path, String(entry.global_path))
 			continue
 		# Re-check after the await: a probe for another scene sharing this
 		# dependency may have queued (or checked out) the file meanwhile.
@@ -1637,7 +1734,7 @@ func _on_resource_saved(res: Resource) -> void:
 	if _checked_out_this_session.has(res_path):
 		return # Re-check: a save-time checkout may have resolved during the await.
 	if not await _needs_checkout(global_path):
-		_checked_out_this_session[res_path] = true
+		_remember_no_checkout(res_path, global_path)
 		_pending_save_checkout.erase(res_path)
 		return
 	_log("'%s' was saved while not checked out - checking it out to keep the changelist accurate." % res_path)
@@ -2844,7 +2941,7 @@ func _get_current_file_path() -> String:
 ## FileSystem-dock context menu.
 func _checkout_path(res_path: String) -> void:
 	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
-		_checked_out_this_session[res_path] = true
+		_remember_no_checkout(res_path, ProjectSettings.globalize_path(res_path))
 		_log("'%s' doesn't need checkout (already opened by you, or not tracked by Perforce)." % res_path)
 		return
 	var result: Dictionary = await _do_checkout(res_path)
@@ -2887,8 +2984,36 @@ func _revert_path(res_path: String) -> void:
 ## Sync res_path to the head revision and reload it from disk. Shared by the
 ## toolbar "Sync Selected File" button and the tree's per-row context menu.
 func _sync_path(res_path: String) -> void:
-	await _p4_exec_logged(["sync", ProjectSettings.globalize_path(res_path)])
-	_reload_path(res_path)
+	var result: Dictionary = await _p4_exec_logged(["sync", ProjectSettings.globalize_path(res_path)])
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	# Only a sync that rewrote the file changes anything the editor shows ("up
+	# to date", or an opened file getting a resolve scheduled, doesn't).
+	var rewrote: bool = int(result.exit_code) == 0 and (text.contains(" - updating ") \
+			or text.contains(" - added as ") or text.contains(" - refreshing ") \
+			or text.contains(" - replacing ") or text.contains(" - deleted as "))
+	_request_refresh()
+	if not rewrote:
+		return
+	EditorInterface.get_resource_filesystem().scan()
+	if not _is_open_in_editor(res_path):
+		return
+	var reload: bool = await _show_confirm_dialog(("Sync updated '%s', which is open in the " +
+			"editor.\n\nReload it now? Unsaved changes to it in the editor will be lost.") % res_path,
+			"Reload", "Keep Editor Version")
+	if reload:
+		_reload_path(res_path)
+	else:
+		_log("Kept the editor's version of '%s' - saving it would overwrite the synced revision." % res_path)
+
+
+## Whether res_path is open as a scene tab or in the script editor.
+func _is_open_in_editor(res_path: String) -> bool:
+	if res_path in EditorInterface.get_open_scenes():
+		return true
+	for s in EditorInterface.get_script_editor().get_open_scripts():
+		if (s as Script).resource_path == res_path:
+			return true
+	return false
 
 
 ## Confirm-then-reload for the user-initiated Reload actions (toolbar button and
@@ -3245,6 +3370,8 @@ func _submit_changelist(change: String, files: Array) -> void:
 	if not await _ensure_identity():
 		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
+	# The dock's file list can be stale; confirm (and submit) what's opened now.
+	files = await _submit_file_list(change, files)
 	if files.is_empty():
 		await _show_alert("This changelist has no files to submit.")
 		return
@@ -3267,7 +3394,7 @@ func _submit_changelist(change: String, files: Array) -> void:
 	var file_lines: Array = []
 	var shown: int = mini(files.size(), 20)
 	for i in range(shown):
-		file_lines.append("    %s  (%s)" % [files[i].res_path, files[i].action])
+		file_lines.append("    %s  (%s)" % [files[i].label, files[i].action])
 	if files.size() > shown:
 		file_lines.append("    ...and %d more" % (files.size() - shown))
 	var label := "the default changelist" if change == "default" else "changelist #%s" % change
@@ -3282,7 +3409,13 @@ func _submit_changelist(change: String, files: Array) -> void:
 
 	var result: Dictionary
 	if change == "default":
-		result = await _p4_exec_logged(["submit", "-d", desc, _project_scope()])
+		# A spec on stdin listing exactly the confirmed files: nothing opened
+		# while the dialog was up rides along, and the description never
+		# passes through a command line.
+		var spec := "Change: new\n\nDescription:\n" + _indent_spec_text(desc) + "\nFiles:\n"
+		for f in files:
+			spec += "\t%s\n" % f.depot_path
+		result = await _p4_exec_spec(["submit", "-i"], spec)
 	else:
 		result = await _p4_exec_logged(["submit", "-c", change])
 
@@ -3291,14 +3424,37 @@ func _submit_changelist(change: String, files: Array) -> void:
 		_log("Submit complete." if submitted.is_empty() else "Submitted as change %s." % submitted)
 		# Submitted files are no longer opened - drop them from the caches.
 		for f in files:
-			_checked_out_this_session.erase(f.res_path)
-			_pending_save_checkout.erase(f.res_path)
+			_checked_out_this_session.erase(f.label)
+			_pending_save_checkout.erase(f.label)
 	else:
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
-		await _show_alert(("Submit failed:\n\n%s\n\nThe changelist is unchanged. Common causes: " +
-				"files are out of date and need syncing/resolving first, or the server rejected " +
-				"the change.") % msg)
+		await _show_alert(("Submit failed:\n\n%s\n\nNothing reached the depot. If the message " +
+				"above names a changelist number, Perforce moved the files into that pending " +
+				"changelist - fix the problem (usually: sync and resolve out-of-date files) and " +
+				"submit it from the dock.") % msg)
 	_request_refresh()
+
+
+## The files a submit will include, queried fresh: the default changelist's
+## files under this project (the scope a default submit covers), or every file
+## in a numbered changelist - including any outside the project, which
+## `submit -c` takes along. Each entry: {depot_path, action, label}, where the
+## label is the res:// path when known, else the depot path.
+func _submit_file_list(change: String, known: Array) -> Array:
+	var res_by_depot := {}
+	for f in known:
+		res_by_depot[String(f.depot_path)] = String(f.res_path)
+	var args: PackedStringArray = ["-ztag", "opened", "-c", change]
+	if change == "default":
+		args.append(_project_scope())
+	var out: Array = []
+	for rec in _parse_ztag(await _p4_exec(args)):
+		var depot := String(rec.get("depotFile", ""))
+		if depot.is_empty():
+			continue
+		out.append({"depot_path": depot, "action": String(rec.get("action", "")),
+				"label": String(res_by_depot.get(depot, depot))})
+	return out
 
 
 # ---------------------------------------------------------------------------
@@ -3412,16 +3568,26 @@ func _needs_checkout(global_path: String) -> bool:
 
 func _needs_checkout_from(result: Dictionary, global_path: String) -> bool:
 	var text := "" if result.output.is_empty() else String(result.output[0])
+	_fstat_failed.erase(global_path)
 	if text.contains("no such file(s)") or text.contains("not in client view") \
 			or text.contains("not under client's root"):
 		return false
 	if _fstat_shows_our_open(text):
 		return false
 	if result.exit_code != 0:
+		_fstat_failed[global_path] = true
 		_log("Warning: 'p4 fstat' failed (exit %d) for '%s'%s" % [result.exit_code, global_path,
 				"" if text.is_empty() else ": " + text.strip_edges().get_slice("\n", 0)])
 		return false
 	return true
+
+
+## Cache "no checkout needed" for the session - unless that answer came from a
+## failed fstat (a network blip, an expired ticket), which must not switch
+## checkout off for this file until the editor restarts.
+func _remember_no_checkout(res_path: String, global_path: String) -> void:
+	if not _fstat_failed.has(global_path):
+		_checked_out_this_session[res_path] = true
 
 
 func _fstat_shows_our_open(fstat_text: String) -> bool:
@@ -3573,13 +3739,18 @@ func _local_to_res(local_path: String) -> String:
 ## Async `p4 <args>` via the worker thread. Returns {exit_code, output}. Commands
 ## are logged to the log window per the Verbose setting (see _should_log_cmd).
 func _p4_exec(args: PackedStringArray) -> Dictionary:
+	if _shutting_down:
+		# Continuations that resume during teardown must not start new p4
+		# commands (they'd run blocking on the main thread while the editor quits).
+		return {"exit_code": -1, "output": [""]}
 	if _p4_thread == null:
-		return _p4_exec_sync(args) # Worker gone (shutdown); it logs on its own.
+		return _p4_exec_sync(args)
 	var loud := _should_log_cmd(args) # decided BEFORE the -p/-u/-c flags join in
 	args = _with_connection_flags(args)
 	if loud:
 		_log_p4_cmd(args)
 	var req := P4Request.new()
+	req.bin = _p4_cmd()
 	req.args = args
 	_p4_inflight += 1
 	_p4_queue_mutex.lock()
@@ -3605,6 +3776,8 @@ func _p4_exec_logged(args: PackedStringArray) -> Dictionary:
 ## platform shell with the file redirected in. Goes through the same worker queue
 ## as _p4_exec so it stays serialized; resumes on the main thread.
 func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
+	if _shutting_down:
+		return {"exit_code": -1, "output": [""]}
 	var tmp := _write_temp_spec(spec_text)
 	if tmp.is_empty():
 		return {"exit_code": -1, "output": ["Could not write a temporary p4 spec file."]}
@@ -3615,12 +3788,13 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 		_log_p4_cmd(display_args)
 	if _p4_thread == null:
 		var out := []
-		var code := _p4_execute_with_stdin(args, tmp, out)
+		var code := _p4_execute_with_stdin(_p4_cmd(), args, tmp, out)
 		DirAccess.remove_absolute(tmp)
 		var sync_result := {"exit_code": code, "output": out}
 		_finish_p4_log(display_args, sync_result, loud)
 		return sync_result
 	var req := P4Request.new()
+	req.bin = _p4_cmd()
 	req.args = args
 	req.stdin_path = tmp
 	_p4_inflight += 1
@@ -3638,33 +3812,77 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 
 
 ## Runs on the worker thread: p4 through the platform shell with the spec file
-## on stdin. Uses only OS + its args (no plugin state) so it is thread-safe.
-func _p4_execute_with_stdin(args: PackedStringArray, stdin_path: String, output: Array) -> int:
+## on stdin. Static - only OS and its arguments - so it is thread-safe. Every
+## word is quoted for the shell that parses it.
+static func _p4_execute_with_stdin(bin: String, args: PackedStringArray, stdin_path: String,
+		output: Array) -> int:
+	var words := PackedStringArray([bin])
+	words.append_array(args)
 	if OS.get_name() == "Windows":
-		var cmd := "p4 " + " ".join(args) + " < \"" + stdin_path.replace("/", "\\") + "\""
+		var cmd := ""
+		for w in words:
+			cmd += _cmd_quote(w) + " "
+		cmd += "< " + _cmd_quote(stdin_path.replace("/", "\\"))
 		return OS.execute("cmd.exe", ["/c", cmd], output, true)
-	var sh_cmd := "p4 " + " ".join(args) + " < '" + stdin_path + "'"
-	return OS.execute("sh", ["-c", sh_cmd], output, true)
+	var sh_cmd := ""
+	for w in words:
+		sh_cmd += _sh_quote(w) + " "
+	sh_cmd += "< " + _sh_quote(stdin_path)
+	return OS.execute("sh", _os_args(["-c", sh_cmd]), output, true)
+
+
+## cmd.exe word quoting. Perforce names and paths can't contain `"`, so wrapping
+## in quotes is enough to neutralize spaces and & | < > ^ ( ).
+static func _cmd_quote(word: String) -> String:
+	for c in " &|<>^()%!,;=":
+		if word.contains(c):
+			return "\"" + word + "\""
+	return word if not word.is_empty() else "\"\""
+
+
+## POSIX shell word quoting: single quotes, with embedded ones spliced as '\''.
+static func _sh_quote(word: String) -> String:
+	return "'" + word.replace("'", "'\\''") + "'"
+
+
+## Godot's OS.execute on macOS/Linux runs the command through popen(), wrapping
+## each argument in bare double quotes (drivers/unix/os_unix.cpp in 4.7), so a
+## `$`, backtick, `"` or `\` inside an argument would be read by the shell - a
+## changelist description with `$VER` or backticks would be mangled or even
+## run. Escape exactly those. Windows hands arguments to CreateProcess (no shell).
+static func _os_args(args: PackedStringArray) -> PackedStringArray:
+	if OS.get_name() == "Windows":
+		return args
+	var out := PackedStringArray()
+	for a in args:
+		out.append(a.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$").replace("`", "\\`"))
+	return out
 
 
 func _write_temp_spec(spec_text: String) -> String:
-	var path := OS.get_cache_dir().path_join("p4_spec_%d.txt" % Time.get_ticks_usec())
+	var path := _p4godot_cache_dir().path_join("spec_%d.txt" % Time.get_ticks_usec())
 	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f == null:
 		_log("Could not open a temp spec file at '%s'." % path)
 		return ""
+	if OS.get_name() != "Windows":
+		# The login password travels through this file: owner-only, and deleted
+		# right after p4 reads it (stale leftovers are swept at startup).
+		FileAccess.set_unix_permissions(path, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
 	f.store_string(spec_text)
 	f.close()
 	return path
 
 
 func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
+	if _shutting_down:
+		return {"exit_code": -1, "output": [""]}
 	var loud := _should_log_cmd(args)
 	args = _with_connection_flags(args)
 	if loud:
 		_log_p4_cmd(args)
 	var output := []
-	var exit_code := OS.execute("p4", args, output, true)
+	var exit_code := OS.execute(_p4_cmd(), _os_args(args), output, true)
 	var result := {"exit_code": exit_code, "output": output}
 	_finish_p4_log(args, result, loud)
 	_maybe_offer_login(result)
@@ -3796,9 +4014,9 @@ func _p4_worker_loop() -> void:
 		_p4_queue_mutex.unlock()
 		var output := []
 		if req.stdin_path.is_empty():
-			req.exit_code = OS.execute("p4", req.args, output, true)
+			req.exit_code = OS.execute(req.bin, _os_args(req.args), output, true)
 		else:
-			req.exit_code = _p4_execute_with_stdin(req.args, req.stdin_path, output)
+			req.exit_code = _p4_execute_with_stdin(req.bin, req.args, req.stdin_path, output)
 		req.output = output
 		req.call_deferred("_finish")
 
@@ -4779,6 +4997,42 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: prewrite")
 			else:
 				_log("[selftest] FAIL: prewrite")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-exec-quoting":
+			# Needs a local p4 binary, no server. Pins the shell quoting helpers,
+			# then runs `p4 -V` through the spec-on-stdin shell path with a temp
+			# file in a directory whose name has a space and an ampersand (and,
+			# on Windows, through the absolute "C:/Program Files/..." p4 if present).
+			var sh_ok := _sh_quote("it's") == "'it'\\''s'"
+			var cmd_ok := _cmd_quote("a b") == "\"a b\"" and _cmd_quote("ab") == "ab" \
+					and _cmd_quote("x&y") == "\"x&y\""
+			var esc := _os_args(PackedStringArray(["$V `x` \"q\" \\"]))
+			var os_ok := esc[0] == ("$V `x` \"q\" \\" if OS.get_name() == "Windows"
+					else "\\$V \\`x\\` \\\"q\\\" \\\\")
+			var odd_dir := ProjectSettings.globalize_path("user://p4 selftest & quoting")
+			DirAccess.make_dir_recursive_absolute(odd_dir)
+			var stdin_file := odd_dir.path_join("in put.txt")
+			var fw := FileAccess.open(stdin_file, FileAccess.WRITE)
+			fw.store_string("ignored\n")
+			fw.close()
+			var bins := [_p4_cmd()]
+			if OS.get_name() == "Windows" and FileAccess.file_exists("C:/Program Files/Perforce/p4.exe"):
+				bins.append("C:/Program Files/Perforce/p4.exe")
+			var runs_ok := true
+			for b: String in bins:
+				var out := []
+				var code := _p4_execute_with_stdin(b, PackedStringArray(["-V"]), stdin_file, out)
+				var ran := code == 0 and not out.is_empty() and String(out[0]).contains("Perforce")
+				_log("[selftest] stdin-exec bin=%s exit=%d ran=%s" % [b, code, ran])
+				runs_ok = runs_ok and ran
+			DirAccess.remove_absolute(stdin_file)
+			DirAccess.remove_absolute(odd_dir)
+			_log("[selftest] sh=%s cmd=%s os-args=%s stdin-runs=%s bin=%s" % [sh_ok, cmd_ok, os_ok, runs_ok, _p4_bin])
+			if sh_ok and cmd_ok and os_ok and runs_ok and not _p4_bin.is_empty():
+				_log("[selftest] PASS: exec-quoting")
+			else:
+				_log("[selftest] FAIL: exec-quoting")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-save-guards":
