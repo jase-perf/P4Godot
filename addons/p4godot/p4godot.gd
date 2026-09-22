@@ -349,6 +349,9 @@ const REIMPORT_CONFIRM_THRESHOLD := 20
 # Global paths whose last `p4 fstat` failed (see _remember_no_checkout).
 var _fstat_failed: Dictionary = {}
 
+# Last-seen UndoRedo version per editor history id (see _history_advanced).
+var _history_versions: Dictionary = {}
+
 # See _shader_files.
 var _shader_files_cache: Array = []
 var _shader_files_dirty: bool = true
@@ -835,7 +838,7 @@ func _on_undo_redo_history_changed() -> void:
 	var scene_root := EditorInterface.get_edited_scene_root()
 	if scene_root != null:
 		var scene_path := scene_root.get_scene_file_path()
-		if not scene_path.is_empty():
+		if not scene_path.is_empty() and _history_advanced(scene_root):
 			_handle_edit(scene_path)
 
 	# A standalone resource opened from the FileSystem dock (e.g. a .tres not
@@ -844,8 +847,25 @@ func _on_undo_redo_history_changed() -> void:
 	var edited_object := EditorInterface.get_inspector().get_edited_object()
 	if edited_object is Resource:
 		var res: Resource = edited_object
-		if not res.is_built_in() and not res.resource_path.is_empty():
+		if not res.is_built_in() and not res.resource_path.is_empty() \
+				and _history_advanced(res):
 			_handle_edit(res.resource_path)
+
+
+## history_changed also fires without any edit: clear_history() (e.g. switching
+## to a scene tab whose instanced sub-scene changed) and set_history_as_unsaved.
+## Only a committed action (or a redo) raises the history's UndoRedo version,
+## so act only when it went up since we last looked. Versions start at 1.
+func _history_advanced(obj: Object) -> bool:
+	var ur := get_undo_redo()
+	var hid := ur.get_object_history_id(obj)
+	var history := ur.get_history_undo_redo(hid)
+	if history == null:
+		return true # Can't tell - keep the old behavior (prompt).
+	var ver := history.get_version()
+	var prev: int = _history_versions.get(hid, 1)
+	_history_versions[hid] = ver
+	return ver > prev
 
 
 func _on_active_script_changed(script: Script) -> void:
@@ -5420,6 +5440,27 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] %s: create-changelist" % ("PASS" if del.exit_code == 0 else "FAIL"))
 			else:
 				_log("[selftest] FAIL: create-changelist (no number returned)")
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-history-gate="):
+			# Live: a history_changed with no edit (clear_history, as a tab switch
+			# does) must NOT check the scene out; a real commit_action must.
+			# Leaves the scene opened - revert afterwards.
+			var path := arg.substr("--p4-selftest-history-gate=".length())
+			var global := ProjectSettings.globalize_path(path)
+			_selftest_auto_answer = "confirm"
+			auto_checkout_checkbox.set_pressed_no_signal(true)
+			await _selftest_make_current(path)
+			await _selftest_drain_frames()
+			var ur := get_undo_redo()
+			ur.clear_history(ur.get_object_history_id(EditorInterface.get_edited_scene_root()), false)
+			await _selftest_drain_frames()
+			var opened_after_clear := not await _needs_checkout(global)
+			await _selftest_simulate_edit(path)
+			await _selftest_drain_frames()
+			var opened_after_edit := not await _needs_checkout(global)
+			_log("[selftest] opened after clear_history=%s, after real edit=%s" % [opened_after_clear, opened_after_edit])
+			_log("[selftest] %s: history-gate" % ("PASS" if not opened_after_clear and opened_after_edit else "FAIL"))
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-fs-checkout="):
