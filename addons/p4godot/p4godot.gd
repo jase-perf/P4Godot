@@ -345,6 +345,8 @@ var _prewrite_eligible_cache: Dictionary = {}
 # path -> original bytes. See _on_resources_reimporting.
 var _reimport_backups: Dictionary = {}
 const REIMPORT_CONFIRM_THRESHOLD := 20
+# The Import dock's Reimport button, hooked by _hook_import_dock.
+var _import_reimport_button: Button = null
 
 # Global path -> Time.get_ticks_msec() of its last failed `p4 fstat` (see
 # _remember_no_checkout and the keystroke throttle in _handle_edit).
@@ -394,6 +396,7 @@ func _enter_tree() -> void:
 	efs.resources_reimporting.connect(_on_resources_reimporting)
 	efs.resources_reimported.connect(_on_resources_reimported)
 	efs.filesystem_changed.connect(_on_filesystem_changed)
+	call_deferred("_hook_import_dock")
 
 	_p4_bin = _resolve_p4_bin()
 	_p4_thread = Thread.new()
@@ -418,6 +421,10 @@ func _exit_tree() -> void:
 			efs.resources_reimported.disconnect(_on_resources_reimported)
 		if efs.filesystem_changed.is_connected(_on_filesystem_changed):
 			efs.filesystem_changed.disconnect(_on_filesystem_changed)
+	if is_instance_valid(_import_reimport_button) \
+			and _import_reimport_button.button_down.is_connected(_on_import_reimport_down):
+		_import_reimport_button.button_down.disconnect(_on_import_reimport_down)
+	_import_reimport_button = null
 	if get_undo_redo().history_changed.is_connected(_on_undo_redo_history_changed):
 		get_undo_redo().history_changed.disconnect(_on_undo_redo_history_changed)
 	var script_editor := EditorInterface.get_script_editor()
@@ -1401,15 +1408,103 @@ func _prewrite_backup_path(res_path: String) -> String:
 ## writable. _on_resources_reimported then sorts them out.
 func _on_resources_reimporting(resources: PackedStringArray) -> void:
 	for res_path in resources:
-		var global_path := ProjectSettings.globalize_path(String(res_path) + ".import")
-		if _reimport_backups.has(global_path) or not FileAccess.file_exists(global_path):
-			continue
-		if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
-			continue # Writable: checked out, allwrite, or untracked.
-		var bytes := FileAccess.get_file_as_bytes(global_path)
-		if bytes.is_empty() or not _set_file_writable(global_path, true):
-			continue
-		_reimport_backups[global_path] = bytes
+		_arm_reimport_guard(ProjectSettings.globalize_path(String(res_path) + ".import"))
+
+
+## Back up a read-only .import and make it writable for an imminent write.
+## Returns true if it armed (false: already armed, missing, or writable).
+func _arm_reimport_guard(global_path: String) -> bool:
+	if _reimport_backups.has(global_path) or not FileAccess.file_exists(global_path):
+		return false
+	if FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
+		return false # Writable: checked out, allwrite, or untracked.
+	var bytes := FileAccess.get_file_as_bytes(global_path)
+	if bytes.is_empty() or not _set_file_writable(global_path, true):
+		return false
+	_reimport_backups[global_path] = bytes
+	return true
+
+
+## The Import dock writes new settings into each selected asset's .import
+## BEFORE any plugin hook runs (ImportDock::_reimport_attempt saves, then calls
+## reimport_files), so on a read-only .import the settings change fails. Its
+## Reimport button's button_down fires before the pressed handler that does
+## that save: arm the reimport guard for the dock's files then. The save
+## succeeds, and _on_resources_reimported checks out whatever really changed
+## (or re-locks it).
+func _hook_import_dock() -> void:
+	var import_dock := _find_node_of_class(get_tree().root, "ImportDock")
+	if import_dock == null:
+		return
+	for b in import_dock.find_children("*", "Button", true, false):
+		# Created with the untranslated text "Reimport" (TTRC); it only reads
+		# "Reimport (*)" later, while settings are pending.
+		if b.get_class() == "Button" and String((b as Button).text) == "Reimport":
+			_import_reimport_button = b
+			if not b.button_down.is_connected(_on_import_reimport_down):
+				b.button_down.connect(_on_import_reimport_down)
+			return
+
+
+func _find_node_of_class(root: Node, cls: String) -> Node:
+	if root.get_class() == cls:
+		return root
+	for c in root.get_children():
+		var found := _find_node_of_class(c, cls)
+		if found:
+			return found
+	return null
+
+
+func _on_import_reimport_down() -> void:
+	var armed := PackedStringArray()
+	for res_path: String in _import_dock_targets():
+		if _arm_reimport_guard(ProjectSettings.globalize_path(res_path + ".import")):
+			armed.append(res_path)
+	if armed.is_empty():
+		return
+	# Normally settled by _on_resources_reimported. If no reimport comes (the
+	# user cancels Godot's importer-change confirmation), re-lock them later.
+	get_tree().create_timer(30.0).timeout.connect(_settle_armed_reimports.bind(armed))
+
+
+func _settle_armed_reimports(res_paths: PackedStringArray) -> void:
+	if _shutting_down:
+		return
+	var changed := _classify_reimported(res_paths)
+	if not changed.is_empty():
+		await _checkout_reimported(changed)
+
+
+## What the Import dock is editing: the FileSystem selection (folders expanded
+## to the imported files under them) plus the resource open in the inspector,
+## which the dock also follows. Only assets that have a .import count.
+func _import_dock_targets() -> Array:
+	var out: Array = []
+	var roots: Array = Array(EditorInterface.get_selected_paths())
+	var edited: Object = EditorInterface.get_inspector().get_edited_object()
+	if edited is Resource and not (edited as Resource).resource_path.is_empty():
+		roots.append((edited as Resource).resource_path)
+	for p: String in roots:
+		if p.ends_with("/"):
+			_collect_imported(p, out)
+		elif FileAccess.file_exists(ProjectSettings.globalize_path(p + ".import")) and not p in out:
+			out.append(p)
+	return out
+
+
+func _collect_imported(dir_path: String, out: Array) -> void:
+	if out.size() >= 500:
+		return
+	var gd := ProjectSettings.globalize_path(dir_path)
+	for f in DirAccess.get_files_at(gd):
+		if f.ends_with(".import"):
+			var asset := dir_path.path_join(f.trim_suffix(".import"))
+			if not asset in out:
+				out.append(asset)
+	for d in DirAccess.get_directories_at(gd):
+		if not d.begins_with("."):
+			_collect_imported(dir_path.path_join(d) + "/", out)
 
 
 ## After a reimport: .import files whose content didn't change go back to
@@ -5829,6 +5924,50 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] %s: create-changelist" % ("PASS" if del.exit_code == 0 else "FAIL"))
 			else:
 				_log("[selftest] FAIL: create-changelist (no number returned)")
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-import-dock="):
+			# Live: the Import dock hook. Part 1 presses the real Reimport button
+			# with unchanged settings (armed, then re-locked, not opened). Part 2
+			# changes a parameter while armed, as the dock's own save does, and
+			# reimports (checked out). Leaves the .import opened - revert after.
+			var path := arg.substr("--p4-selftest-import-dock=".length())
+			var gp_imp := ProjectSettings.globalize_path(path + ".import")
+			var is_rw := func() -> bool: return FileAccess.open(gp_imp, FileAccess.READ_WRITE) != null
+			EditorInterface.select_file(path)
+			await _selftest_drain_frames()
+			var hooked := is_instance_valid(_import_reimport_button)
+			var armed := false
+			var relocked := false
+			if hooked:
+				_import_reimport_button.button_down.emit()
+				armed = is_rw.call() and _reimport_backups.has(gp_imp)
+				_import_reimport_button.pressed.emit()
+				await _selftest_drain_frames()
+				# Headless, the dock may not have picked up the selection, so the
+				# press reimports nothing - exactly a user's cancel. Then the 30 s
+				# fallback timer must re-lock it.
+				var until := Time.get_ticks_msec() + 40000
+				while (is_rw.call() or _reimport_backups.has(gp_imp)) and Time.get_ticks_msec() < until:
+					await get_tree().create_timer(0.5).timeout
+				relocked = not is_rw.call() and not _reimport_backups.has(gp_imp)
+			var untouched: bool = await _needs_checkout(gp_imp)
+			# Part 2: a real settings change.
+			if hooked:
+				_import_reimport_button.button_down.emit()
+			else:
+				_arm_reimport_guard(gp_imp)
+			var cf := ConfigFile.new()
+			cf.load(gp_imp)
+			cf.set_value("params", "mipmaps/generate", not bool(cf.get_value("params", "mipmaps/generate", false)))
+			cf.save(gp_imp)
+			EditorInterface.get_resource_filesystem().reimport_files(PackedStringArray([path]))
+			await _selftest_drain_frames()
+			var checked_out := not await _needs_checkout(gp_imp)
+			_log("[selftest] hooked=%s armed=%s relocked=%s untouched=%s changed-checked-out=%s"
+					% [hooked, armed, relocked, untouched, checked_out])
+			_log("[selftest] %s: import-dock" % ("PASS" if hooked and armed and relocked
+					and untouched and checked_out else "FAIL"))
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-history-gate="):

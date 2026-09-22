@@ -155,6 +155,9 @@ P4Godot makes those files writable just long enough for Godot's write:
 - If Perforce refuses a checkout, for example because someone else holds an
   exclusive lock, the saved file stays on disk and writable, so a sync can't
   overwrite it. P4Godot tells you it isn't in a changelist yet.
+- Changing an asset's settings in the Import dock works even when its
+  `.import` isn't checked out. The file is checked out if the settings really
+  changed.
 
 ### Guided connection setup
 
@@ -289,21 +292,19 @@ find it on its own.
 - **Edits made outside the editor aren't detected automatically.** Use
   **Reconcile** to pick them up. The same applies to `project.godot`, which
   Godot writes without telling plugins.
-- **Changing import settings on an asset that isn't checked out fails.** The
-  Import dock writes the `.import` file before any plugin can step in. Check
-  out the asset first (right-click → **P4: Check Out**, which takes its
-  `.import` along), then change its settings.
 - **New files aren't added automatically**, because Godot doesn't announce
   them (the "Auto add/edit/delete" setting doesn't cover adds). Add them with
   right-click → **P4: Mark for Add**, or with Reconcile.
 - **Import groups** (atlas textures and other assets imported as a group)
   aren't covered by the read-only reimport handling. Check out their
   `.import` files before reimporting.
-- **File names containing `@`, `#`, `%`, or `*`** aren't escaped for
-  Perforce yet, so P4 actions on them fail.
-- **No timeouts on p4 commands.** If the server stops responding in the
-  middle of a command, the dock waits for it, and a save waits for its
-  status check and checkout too.
+- **An unreachable server costs one long wait.** If the server stops
+  answering mid-command, p4 gives up after 2 minutes (30 seconds for the
+  checks right before a save). But connecting to a server that's
+  unreachable, for example after a VPN drop, takes the operating system's
+  connect timeout (about 21 seconds on Windows). After one such failure,
+  saves and status checks skip the server for a minute and saves go ahead
+  without checkout. Press Refresh to retry sooner.
 - **Single sign-on:** the login prompt asks for a password. With SSO, log in
   once with `p4 login` or P4V, and P4Godot uses that ticket.
 - **Shelving** isn't implemented yet.

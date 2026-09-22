@@ -27,8 +27,20 @@ Setup:
 | 8 | Right-click a tracked `.png` → **P4: Check Out**. | `p4 opened` lists the `.png` and its `.png.import`. Revert afterwards. |
 | 9 | Editor Settings → search "Executable Path". Set it to a bad path and restart Godot. | The setting exists under **Perforce**. After the restart the Log names the bad setting and falls back to the Homebrew p4. Clear it again. |
 
-If a step fails, turn on **Verbose log** in the gear menu, repeat it, and
-save the Log contents.
+If a step fails, turn on **Verbose log** in the settings menu, repeat it,
+and save the Log contents.
+
+## Any platform: GUI-only checks (5 minutes)
+
+The headless self-tests can't click through Godot's own docks, so check these
+by hand:
+
+| # | Do this | Expect |
+|---|---|---|
+| 1 | Select a tracked texture that isn't checked out. In the Import dock, change a setting (e.g. Mipmaps → Generate) and press **Reimport**. | No "Cannot save" error. `p4 opened` lists its `.import`, and the setting stuck. |
+| 2 | Select it again and press **Reimport** without changing anything. | Nothing new is opened; the `.import` stays read-only. |
+| 3 | Add a file named `icon@2x.png` to the project, right-click → **P4: Mark for Add**, submit it, then rename it in the FileSystem dock. | The add and submit work. The rename is recorded as `move/add` + `move/delete`. Clean up afterwards. |
+| 4 | Switch scene tabs between two tracked scenes you haven't edited. | No checkout prompt. |
 
 ## Screenshots for the README
 

@@ -13,12 +13,12 @@
 ## After 0.14.0 — from the 2026-09-21 release review
 
 - [ ] Verify on macOS: p4 discovery from a Dock-launched Godot, `$`/backtick descriptions, saves of read-only files (POSIX safe-save replaces read-only files, so `_save_landed` uses mtime), `_set_file_writable` via unix permissions, SSL trust prompt.
-- [ ] Timeouts: no p4 command has one; `_apply_changes` runs blocking checkouts on save. Circuit-breaker after "Connect to server failed", and/or `execute_with_pipe` + `OS.kill` on a deadline.
-- [ ] Escape `@ # % *` in file paths passed to p4 (`%40 %23 %25 %2A`; `add -f` takes raw paths) and unescape depot paths in output.
+- [x] (0.14.0) Timeouts: `-vnet.maxwait` on every command (120 s / 30 s pre-save) + circuit breaker. Still open: the OS connect timeout (~21 s on Windows) for an unreachable host - only `execute_with_pipe` + `OS.kill` on a deadline would cut it.
+- [x] (0.14.0) Escape `@ # % *` in local-path args (central `_escape_path_args`); add/reconcile take raw names + `-f`. Depot paths are still shown escaped in the UI (`%40`).
 - [ ] Connection overrides live in `.godot/editor/project_metadata.cfg`; if `.godot/` gets submitted, teammates inherit them. Move to the per-user editor config dir keyed by project path, and warn in Reconcile when `.godot/` paths appear.
 - [x] (0.14.0, `_history_advanced`, verified with a negative control) `history_changed` also fires from `clear_history` on tab switches, which prompted checkout for an untouched scene.
 - [ ] Error-dialog dismissal matches by basename substring (`level.tscn` also covers `sublevel.tscn`); match the full path.
-- [ ] Import dock: settings changes on a read-only `.import` fail (Godot writes it before any hook). Workaround shipped: FileSystem Check Out takes the `.import` along.
+- [x] (0.14.0) Import dock: the Reimport button's button_down arms the reimport guard before the dock saves `.import` settings. Import groups are still uncovered (Godot never reports group members to plugins).
 
 ## Allwrite workspaces + change detection (Godot) — designed, not started
 

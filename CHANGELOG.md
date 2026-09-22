@@ -31,7 +31,18 @@ First public release.
   The `.import` and `.uid` files Godot moves or deletes alongside an asset
   are recorded too.
 - FileSystem-dock **P4: Check Out** on an imported asset also checks out its
-  `.import`, so import-settings changes can be saved.
+  `.import`.
+- Changing import settings in the Import dock works on assets whose
+  `.import` isn't checked out. Godot writes the settings before any plugin
+  hook, so P4Godot arms its read-only handling when the Reimport button is
+  pressed, and checks the file out if the settings really changed.
+- File names containing `@`, `#`, `%`, or `*` (like `icon@2x.png`) work with
+  every P4 action. They're escaped for Perforce, and add and reconcile get
+  `-f`.
+- p4 commands give up on a server that stops answering: 2 minutes in the
+  background, 30 seconds right before a save. After a connection failure,
+  saves and status checks skip the server for a minute, so a dropped VPN
+  costs one wait instead of one per command.
 - The default changelist submits exactly the files the confirmation lists.
   They're fetched fresh, and files opened while the dialog is up aren't
   included. Numbered-changelist confirmations list files outside the project
