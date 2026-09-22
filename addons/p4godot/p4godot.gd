@@ -350,6 +350,12 @@ const REIMPORT_CONFIRM_THRESHOLD := 20
 # _remember_no_checkout and the keystroke throttle in _handle_edit).
 var _fstat_failed: Dictionary = {}
 
+# Network limits and the circuit breaker (see _with_connection_flags).
+const NET_MAXWAIT_SEC := 120     # background commands: bound a hung server
+const NET_MAXWAIT_SAVE_SEC := 30 # the blocking calls right before a save
+const UNREACHABLE_BACKOFF_MSEC := 60000
+var _unreachable_until_msec: int = 0
+
 # Last-seen UndoRedo version per editor history id (see _history_advanced).
 var _history_versions: Dictionary = {}
 
@@ -777,19 +783,46 @@ func _maybe_offer_login(result: Dictionary) -> void:
 
 ## p4 global flags for the stored connection overrides; prepended to every
 ## command. Empty overrides mean plain inherited configuration, unchanged.
-func _with_connection_flags(args: PackedStringArray) -> PackedStringArray:
-	var flags := PackedStringArray()
+## Also: `-vnet.maxwait` makes p4 give up on a server that stops answering (it
+## bounds each network read; verified: "TCP receive exceeded maximum configured
+## duration"). It can't shorten the OS's TCP connect timeout (~21 s on
+## Windows) for an unreachable host - the circuit breaker covers that.
+func _with_connection_flags(args: PackedStringArray, maxwait_sec: int = NET_MAXWAIT_SEC) -> PackedStringArray:
+	var flags := PackedStringArray(["-vnet.maxwait=%d" % maxwait_sec])
 	if not _override_port.is_empty():
 		flags.append_array(["-p", _override_port])
 	if not _override_user.is_empty():
 		flags.append_array(["-u", _override_user])
 	if not _override_client.is_empty():
 		flags.append_array(["-c", _override_client])
-	if flags.is_empty():
-		return args
 	var combined := flags.duplicate()
 	combined.append_array(args)
 	return combined
+
+
+## Circuit breaker: after a connect failure or network timeout, the blocking
+## pre-save calls and background status queries skip the server for a minute,
+## so a dropped VPN costs one ~21 s wait instead of one per command.
+func _note_connectivity(result: Dictionary) -> void:
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	if text.contains("Connect to server failed") or text.contains("TCP connect to") \
+			or text.contains("exceeded maximum configured duration"):
+		if not _server_unreachable():
+			_log("The Perforce server isn't answering - saves won't wait on it for the next minute (press Refresh to retry sooner).")
+		_unreachable_until_msec = Time.get_ticks_msec() + UNREACHABLE_BACKOFF_MSEC
+	elif int(result.get("exit_code", -1)) == 0:
+		_unreachable_until_msec = 0
+
+
+func _server_unreachable() -> bool:
+	return _unreachable_until_msec != 0 and Time.get_ticks_msec() < _unreachable_until_msec
+
+
+## A fast failure for a status query skipped by the circuit breaker. Worded
+## like p4's own connect failure so every caller treats it as "unknown".
+func _skipped_result() -> Dictionary:
+	return {"exit_code": 1, "output": ["Perforce client error:\n\tConnect to server failed; " +
+			"check $P4PORT. (P4Godot skipped this: the server wasn't answering moments ago.)"]}
 
 
 ## Persist the connection overrides next to the other per-project settings.
@@ -1019,6 +1052,17 @@ func _on_edit_checkout_failed(res_path: String, reason: String) -> void:
 ## before the startup `p4 info` has resolved (_p4_available still false).
 func _apply_changes() -> void:
 	if not _p4_available:
+		return
+	if _server_unreachable():
+		# Don't stall the save on a server that just failed to answer. Files
+		# that aren't checked out follow the no-checkout save paths (and on
+		# macOS/Linux are left writable so a sync can't overwrite them).
+		if not _pending_save_checkout.is_empty():
+			_log("Saving without checking out %s - the Perforce server isn't answering. Check out or Reconcile once it's back." % ", ".join(_pending_save_checkout.keys()))
+		for res_path: String in _pending_save_checkout.keys():
+			_rescue_skip_frame[res_path] = Engine.get_process_frames()
+		if checkout_on_save_checkbox.button_pressed:
+			_prewrite_pass() # cached eligibility only; its status query is skipped
 		return
 	if checkout_on_save_checkbox.button_pressed:
 		var failures: Array = []
@@ -2412,7 +2456,13 @@ func _diff_path(res_path: String) -> void:
 	if text.contains("files differ"):
 		await _show_alert("'%s' differs from the depot revision you have, but it is a binary file - there is no text diff to show." % res_path)
 		return
-	var have := await _p4_exec(["print", "-q", local_path + "#have"])
+	# Revision syntax goes on the depot path from the diff header: it comes back
+	# from p4 already escaped (a local path with @/#/% in it can't carry "#have").
+	var depot_path := _diff_depot_path(text, "")
+	if not depot_path.begins_with("//"):
+		await _show_alert("Couldn't find the depot path of '%s' in the diff - see the P4 Log." % res_path)
+		return
+	var have := await _p4_exec(["print", "-q", depot_path + "#have"])
 	if have.exit_code != 0:
 		await _show_alert("Couldn't fetch the depot revision of '%s' - see the P4 Log." % res_path)
 		return
@@ -4000,8 +4050,13 @@ func _p4_exec(args: PackedStringArray, offer_login: bool = true) -> Dictionary:
 		return {"exit_code": -1, "output": [""]}
 	if _p4_thread == null:
 		return _p4_exec_sync(args)
+	# Circuit breaker: status queries skip a server that just stopped answering
+	# (connection probes and logins always try - they're how it recovers).
+	if _server_unreachable() and _is_probe_command(args) \
+			and not _p4_subcommand(args) in ["info", "login"]:
+		return _skipped_result()
 	var loud := _should_log_cmd(args) # decided BEFORE the -p/-u/-c flags join in
-	args = _with_connection_flags(args)
+	args = _with_connection_flags(_escape_path_args(args))
 	if loud:
 		_log_p4_cmd(args)
 	var req := P4Request.new()
@@ -4017,9 +4072,18 @@ func _p4_exec(args: PackedStringArray, offer_login: bool = true) -> Dictionary:
 	_p4_inflight -= 1
 	var result := {"exit_code": req.exit_code, "output": req.output}
 	_finish_p4_log(args, result, loud)
+	_note_connectivity(result)
 	if offer_login:
 		_maybe_offer_login(result)
 	return result
+
+
+## The p4 subcommand in `args` (the first word that isn't a flag).
+static func _p4_subcommand(args: PackedStringArray) -> String:
+	for a in args:
+		if not a.begins_with("-"):
+			return a
+	return ""
 
 
 ## Retained as a semantic alias; _p4_exec now logs every command and its output.
@@ -4038,7 +4102,7 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 	if tmp.is_empty():
 		return {"exit_code": -1, "output": ["Could not write a temporary p4 spec file."]}
 	var loud := _should_log_cmd(args) # change -i is always loud (never a probe)
-	args = _with_connection_flags(args)
+	args = _with_connection_flags(_escape_path_args(args))
 	var display_args := args + PackedStringArray(["< (spec on stdin)"])
 	if loud:
 		_log_p4_cmd(display_args)
@@ -4064,6 +4128,7 @@ func _p4_exec_spec(args: PackedStringArray, spec_text: String) -> Dictionary:
 	DirAccess.remove_absolute(tmp)
 	var result := {"exit_code": req.exit_code, "output": req.output}
 	_finish_p4_log(display_args, result, loud)
+	_note_connectivity(result)
 	return result
 
 
@@ -4099,6 +4164,55 @@ static func _cmd_quote(word: String) -> String:
 ## POSIX shell word quoting: single quotes, with embedded ones spliced as '\''.
 static func _sh_quote(word: String) -> String:
 	return "'" + word.replace("'", "'\\''") + "'"
+
+
+## Perforce reads @ # % * in a file argument as revision/wildcard syntax, so a
+## file named `icon@2x.png` must be passed as `icon%402x.png`. Output gives local
+## paths (clientFile, where's third column) raw and depot paths escaped, so only
+## arguments need this. `p4 add` is the exception: it wants the raw name plus -f.
+static func _p4_escape_path(path: String) -> String:
+	return path.replace("%", "%25").replace("@", "%40").replace("#", "%23").replace("*", "%2A")
+
+
+## An absolute local path (C:/... or /...), as opposed to a depot/client path
+## (//...), a flag, or a value.
+static func _is_local_path(arg: String) -> bool:
+	if arg.length() >= 3 and arg[1] == ":" and (arg[2] == "/" or arg[2] == "\\"):
+		return true
+	return arg.begins_with("/") and not arg.begins_with("//")
+
+
+## Escape every local-path argument (see _p4_escape_path). For `p4 add`, pass
+## raw names and add -f when any has a special character. Revision suffixes
+## must never be appended to local paths by callers (use depot paths for that).
+static func _escape_path_args(args: PackedStringArray) -> PackedStringArray:
+	var cmd_idx := -1
+	for i in args.size():
+		if not args[i].begins_with("-"):
+			cmd_idx = i
+			break
+	if cmd_idx == -1:
+		return args
+	var out := PackedStringArray(args)
+	if args[cmd_idx] == "reconcile":
+		# Like add, `reconcile -f` takes RAW local names (verified: with escaped
+		# names it finds nothing) and without -f it skips such files entirely -
+		# so always pass -f; it changes nothing for ordinary names.
+		if not "-f" in args:
+			out.insert(cmd_idx + 1, "-f")
+		return out
+	if args[cmd_idx] == "add":
+		var special := false
+		for a in args:
+			if _is_local_path(a) and _p4_escape_path(a) != a:
+				special = true
+		if special and not "-f" in args:
+			out.insert(cmd_idx + 1, "-f")
+		return out
+	for i in range(cmd_idx + 1, out.size()):
+		if _is_local_path(out[i]):
+			out[i] = _p4_escape_path(out[i])
+	return out
 
 
 ## Godot's OS.execute on macOS/Linux runs the command through popen(), wrapping
@@ -4141,17 +4255,23 @@ func _write_temp_spec(spec_text: String) -> String:
 	return path
 
 
+## Blocking p4 on the main thread - only for the pre-save hook (see
+## _apply_changes), so it uses the short network limit and the circuit breaker
+## applies to every command: a save never waits on a server that just failed.
 func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
 	if _shutting_down:
 		return {"exit_code": -1, "output": [""]}
+	if _server_unreachable():
+		return _skipped_result()
 	var loud := _should_log_cmd(args)
-	args = _with_connection_flags(args)
+	args = _with_connection_flags(_escape_path_args(args), NET_MAXWAIT_SAVE_SEC)
 	if loud:
 		_log_p4_cmd(args)
 	var output := []
 	var exit_code := OS.execute(_p4_cmd(), _os_args(args), output, true)
 	var result := {"exit_code": exit_code, "output": output}
 	_finish_p4_log(args, result, loud)
+	_note_connectivity(result)
 	_maybe_offer_login(result)
 	return result
 
@@ -4164,7 +4284,11 @@ func _p4_exec_logged_sync(args: PackedStringArray) -> Dictionary:
 ## Log a p4 invocation's command line (truncated if enormous, e.g. a `where`
 ## over the whole opened set).
 func _log_p4_cmd(args: PackedStringArray) -> void:
-	var line := "$ p4 " + " ".join(args)
+	var shown := PackedStringArray()
+	for a in args:
+		if not a.begins_with("-vnet.maxwait="): # on every command; just noise here
+			shown.append(a)
+	var line := "$ p4 " + " ".join(shown)
 	if line.length() > 400:
 		line = line.substr(0, 400) + " ... (%d args total)" % args.size()
 	_log(line)
@@ -5266,6 +5390,81 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] FAIL: prewrite")
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-special-names":
+			# Live and DESTRUCTIVE (four real submits): files named with @ # %
+			# through the plugin's add, submit, checkout, diff, move and delete
+			# paths. Refuses to run unless nothing is opened.
+			_selftest_auto_answer = "confirm"
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: special-names - files already opened; needs a clean workspace")
+				get_tree().quit()
+				return
+			var dir := "res://p4g_special_names_test"
+			DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dir))
+			var names := ["icon@2x.txt", "take#1.txt", "50%.txt"]
+			var ok := true
+			for n: String in names:
+				var fw := FileAccess.open(ProjectSettings.globalize_path(dir.path_join(n)), FileAccess.WRITE)
+				fw.store_string("special name %s\n" % n)
+				fw.close()
+				await _add_path(dir.path_join(n))
+				var added := String((await _fetch_fstat_record(dir.path_join(n))).get("action", "")) == "add"
+				_log("[selftest] add %s -> %s" % [n, added])
+				ok = ok and added
+			await _submit_changelist("default", [], "P4Godot selftest: special file names")
+			var edit_res := dir.path_join("icon@2x.txt")
+			var co: Dictionary = await _do_checkout(edit_res)
+			var fw2 := FileAccess.open(ProjectSettings.globalize_path(edit_res), FileAccess.WRITE)
+			fw2.store_string("special name icon@2x.txt\nchanged\n")
+			fw2.close()
+			var diff := await _p4_exec(["diff", "-dul", ProjectSettings.globalize_path(edit_res)])
+			var diff_ok := int(diff.exit_code) == 0 and _diff_has_changes(String(diff.output[0]))
+			var depot := _diff_depot_path(String(diff.output[0]), "")
+			var have := await _p4_exec(["print", "-q", depot + "#have"])
+			var print_ok := int(have.exit_code) == 0 and String(have.output[0]).contains("special name")
+			await _p4_exec_logged(["revert", ProjectSettings.globalize_path(edit_res)])
+			_log("[selftest] checkout=%s diff=%s print-have=%s" % [co.ok, diff_ok, print_ok])
+			ok = ok and co.ok and diff_ok and print_ok
+			var old_res := dir.path_join("take#1.txt")
+			var new_res := dir.path_join("take#2.txt")
+			DirAccess.rename_absolute(ProjectSettings.globalize_path(old_res), ProjectSettings.globalize_path(new_res))
+			await _p4_record_move(old_res, new_res, false)
+			var moved := String((await _fetch_fstat_record(new_res)).get("action", "")) == "move/add"
+			_log("[selftest] move take#1 -> take#2: %s" % moved)
+			ok = ok and moved
+			await _submit_changelist("default", [], "P4Godot selftest: special names move")
+			for n: String in ["icon@2x.txt", "take#2.txt", "50%.txt"]:
+				await _p4_exec_logged(["delete", ProjectSettings.globalize_path(dir.path_join(n))])
+			await _submit_changelist("default", [], "P4Godot selftest: special names cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			for n: String in ["icon@2x.txt", "take#2.txt", "50%.txt"]:
+				var st := await _fetch_fstat_record(dir.path_join(n))
+				ok = ok and String(st.get("headAction", "")) == "delete"
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(dir))
+			_log("[selftest] opened-after=%d" % left)
+			_log("[selftest] %s: special-names" % ("PASS" if ok and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-breaker":
+			# Live, read-only: point at an unroutable server once (one ~21 s
+			# connect timeout), then check that save-path and status calls return
+			# instantly while connection probes still try.
+			var saved_port := _override_port
+			_override_port = "10.255.255.1:1666"
+			var first := await _p4_exec(["-ztag", "fstat", "C:/nothing"])
+			var tripped := _server_unreachable()
+			var t0 := Time.get_ticks_msec()
+			var sync_r := _p4_exec_sync(["fstat", "C:/nothing"])
+			var async_r := await _p4_exec(["-ztag", "opened"])
+			var fast_ms := Time.get_ticks_msec() - t0
+			var skipped: bool = String(sync_r.output[0]).contains("skipped") \
+					and String(async_r.output[0]).contains("skipped")
+			_override_port = saved_port
+			_unreachable_until_msec = 0
+			_log("[selftest] first-exit=%d tripped=%s skipped=%s fast=%dms" % [int(first.exit_code), tripped, skipped, fast_ms])
+			_log("[selftest] %s: breaker" % ("PASS" if tripped and skipped and fast_ms < 1000 else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-probe":
 			# Live, read-only: log what the connection probe decides. Run it with
 			# P4TICKETS pointing at an empty file to see the logged-out path.
@@ -5284,6 +5483,25 @@ func _run_cli_self_test_if_requested() -> void:
 			var esc := _os_args(PackedStringArray(["$V `x` \"q\" \\"]))
 			var os_ok := esc[0] == ("$V `x` \"q\" \\" if OS.get_name() == "Windows"
 					else "\\$V \\`x\\` \\\"q\\\" \\\\")
+			# Perforce path escaping: local paths escaped, depot paths and flags
+			# untouched, `add` gets raw names plus -f.
+			var pe_ok := _escape_path_args(PackedStringArray(["-ztag", "fstat", "C:/p/icon@2x.png"])) \
+					== PackedStringArray(["-ztag", "fstat", "C:/p/icon%402x.png"]) \
+				and _escape_path_args(PackedStringArray(["edit", "-c", "12", "/home/u/50%.txt"])) \
+					== PackedStringArray(["edit", "-c", "12", "/home/u/50%25.txt"]) \
+				and _escape_path_args(PackedStringArray(["add", "C:/p/take#1.txt"])) \
+					== PackedStringArray(["add", "-f", "C:/p/take#1.txt"]) \
+				and _escape_path_args(PackedStringArray(["add", "C:/p/plain.txt"])) \
+					== PackedStringArray(["add", "C:/p/plain.txt"]) \
+				and _escape_path_args(PackedStringArray(["print", "-q", "//d/x%40y#have"])) \
+					== PackedStringArray(["print", "-q", "//d/x%40y#have"]) \
+				and _escape_path_args(PackedStringArray(["reconcile", "C:/My Game/..."])) \
+					== PackedStringArray(["reconcile", "-f", "C:/My Game/..."]) \
+				and _escape_path_args(PackedStringArray(["-ztag", "reconcile", "-n", "C:/p/take#1.txt"])) \
+					== PackedStringArray(["-ztag", "reconcile", "-f", "-n", "C:/p/take#1.txt"]) \
+				and _p4_escape_path("/a/*%@#") == "/a/%2A%25%40%23"
+			_log("[selftest] path-escaping=%s" % pe_ok)
+			os_ok = os_ok and pe_ok
 			var odd_dir := ProjectSettings.globalize_path("user://p4 selftest & quoting")
 			DirAccess.make_dir_recursive_absolute(odd_dir)
 			var stdin_file := odd_dir.path_join("in put.txt")
