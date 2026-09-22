@@ -2988,6 +2988,15 @@ func _get_current_file_path() -> String:
 ## any failure. Shared by the toolbar "Checkout Active File" button and the
 ## FileSystem-dock context menu.
 func _checkout_path(res_path: String) -> void:
+	# An imported asset's .import holds its import settings, and the Import dock
+	# writes it before any plugin hook runs - so check it out alongside (the
+	# FileSystem dock hides .import files, so users can't pick it themselves).
+	var import_res := res_path + ".import"
+	if FileAccess.file_exists(ProjectSettings.globalize_path(import_res)) \
+			and await _needs_checkout(ProjectSettings.globalize_path(import_res)):
+		var side: Dictionary = await _do_checkout(import_res)
+		if not side.ok:
+			_show_alert("Couldn't check out '%s' - %s." % [import_res, side.reason])
 	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
 		_remember_no_checkout(res_path, ProjectSettings.globalize_path(res_path))
 		_log("'%s' doesn't need checkout (already opened by you, or not tracked by Perforce)." % res_path)
@@ -5387,6 +5396,19 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] %s: create-changelist" % ("PASS" if del.exit_code == 0 else "FAIL"))
 			else:
 				_log("[selftest] FAIL: create-changelist (no number returned)")
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-fs-checkout="):
+			# Live: the FileSystem-dock "P4: Check Out" path (an imported asset's
+			# .import comes along). Leaves the files opened - revert afterwards.
+			var path := arg.substr("--p4-selftest-fs-checkout=".length())
+			await _checkout_path(path)
+			var both := true
+			for p: String in [path, path + ".import"]:
+				var opened := not await _needs_checkout(ProjectSettings.globalize_path(p))
+				_log("[selftest] %s opened=%s" % [p, opened])
+				both = both and opened
+			_log("[selftest] %s: fs-checkout" % ("PASS" if both else "FAIL"))
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-checkout="):
