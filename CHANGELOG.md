@@ -42,7 +42,7 @@ First public release.
   - `p4` is found in Homebrew's folders even when Godot is launched from the
     Dock.
   - A missing `p4` is reported as missing instead of "can't reach server".
-- New **Editor Settings → P4godot → P4 Executable** setting for a `p4` in an
+- New **Editor Settings → Perforce → Executable Path** setting for a `p4` in an
   unusual place.
 - First connection to an `ssl:` server shows the fingerprint and offers to
   trust it. A changed fingerprint shows a warning instead.

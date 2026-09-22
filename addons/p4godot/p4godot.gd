@@ -29,8 +29,8 @@ extends EditorPlugin
 ## - allwrite support: "needs checkout" is decided by asking Perforce
 ##   (`p4 fstat`), never by OS read-only attributes, so everything above also
 ##   works in an `allwrite` client where P4 leaves files writable. If a save
-##   succeeds on a file that isn't checked out (the allwrite case), the file
-##   is checked out right after so the changelist stays truthful.
+##   succeeds on a file that isn't checked out (the allwrite case), it goes
+##   through `p4 reconcile -e` right after, which opens it only if it changed.
 ## - Delete / move / rename: deleting or moving a file (or folder) in the
 ##   FileSystem dock is caught via FileSystemDock signals and offered to
 ##   Perforce - open-for-delete for a deletion, a history-preserving move
@@ -49,9 +49,9 @@ extends EditorPlugin
 ##   Godot's generic error: the engine emits no signal on a failed resource
 ##   write (EditorPlugin.resource_saved fires only on success).
 ## - project.godot writes and edits made OUTSIDE the editor are not covered
-##   (use Reconcile for those). New empty files aren't auto-added either - Godot
-##   emits no create signal - but a new file gets added when you save it or via
-##   Reconcile.
+##   (use Reconcile for those). New files aren't auto-added either - Godot
+##   emits no create signal, and the save handlers skip untracked files - so
+##   add them with the FileSystem dock's "P4: Mark for Add" or via Reconcile.
 ## - p4 commands run on a background worker thread (one at a time, in order),
 ##   so a slow or unreachable server no longer stalls the editor. Results are
 ##   cached per file per session as before. Two deliberate exceptions stay on
@@ -241,7 +241,7 @@ var _p4_port: String = ""
 # The p4 executable (see _resolve_p4_bin); "" until found. Read by the worker
 # only through the copy each P4Request carries.
 var _p4_bin: String = ""
-const P4_PATH_SETTING := "p4godot/p4_executable"
+const P4_PATH_SETTING := "perforce/executable_path"
 # The last connection probe's p4 output, for setup prompts that quote it.
 var _last_probe_text: String = ""
 
@@ -498,6 +498,10 @@ func _probe_connection() -> String:
 	var client := String(info.get("clientName", ""))
 	var root := String(info.get("clientRoot", ""))
 	if client == "*unknown*" or client.is_empty() or not _project_inside_root(root):
+		# `p4 info` works without a ticket but listing workspaces doesn't, so
+		# log in before the workspace picker - or it finds nothing.
+		if _looks_like_login_error(await _p4_exec(["login", "-s"], false)):
+			return "not logged in"
 		return "no client"
 	_p4_client = client
 	return "ok"
@@ -512,7 +516,8 @@ func _p4_cmd() -> String:
 ## Find a working p4 executable, or "". Godot launched from the macOS Dock or
 ## Finder gets launchd's minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
 ## hides Homebrew's p4 - so after the PATH lookup, try the usual install
-## locations. The "p4godot/p4_executable" editor setting is tried first.
+## locations. The "perforce/executable_path" editor setting (shown as Perforce >
+## Executable Path) is tried first.
 func _resolve_p4_bin() -> String:
 	var settings := EditorInterface.get_editor_settings()
 	if not settings.has_setting(P4_PATH_SETTING):
@@ -587,7 +592,7 @@ func _offer_connection_setup() -> void:
 					"Install it from perforce.com/downloads (on Windows it comes with P4V;\n" +
 					"on macOS, `brew install --cask p4` works), then press Refresh in the P4G dock.\n\n" +
 					"If p4 is installed somewhere unusual, set its full path in\n" +
-					"Editor Settings > P4godot > P4 Executable.")
+					"Editor Settings > Perforce > Executable Path.")
 			break
 		if status == "not trusted":
 			var fp_re := RegEx.create_from_string("(?:[0-9A-Fa-f]{2}:){15,}[0-9A-Fa-f]{2}")
@@ -628,7 +633,7 @@ func _offer_connection_setup() -> void:
 	_setup_active = false
 	_update_conn_status()
 	if not _p4_available:
-		_log("Perforce is still not configured - press Refresh in the P4 dock to run setup again.")
+		_log("Perforce is still not configured - press Refresh (the circular-arrow button) in the P4G dock to run setup again.")
 
 
 ## Best guess for the server-address prompt: a stored override, else whatever
@@ -669,7 +674,7 @@ func _pick_client() -> bool:
 		var res: Dictionary = await _show_input_dialog("P4 Connection Setup",
 				("No workspaces found for your user on %s.\n" % _p4_port) +
 				"Create one in P4V (or with `p4 client`) whose root contains this project,\n" +
-				"then press Refresh in the P4 dock. Or enter a workspace name to use directly:",
+				"then press Refresh (the circular-arrow button) in the P4G dock. Or enter a workspace name to use directly:",
 				"", false, "Use Workspace")
 		if not res.ok or String(res.text).strip_edges().is_empty():
 			return false
@@ -1425,7 +1430,7 @@ func _scene_saved_probe(path: String) -> void:
 			_set_file_writable(global_path, true)
 			_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
 					"Perforce doesn't know about this change yet. Once the file becomes " +
-					"available, use 'Checkout Current File' (or Reconcile) so the " +
+					"available, right-click it in the FileSystem dock and choose 'P4: Check Out' (or use Reconcile) so the " +
 					"change lands in a changelist.") % [res_path, result.reason])
 		return
 
@@ -1719,7 +1724,7 @@ func _run_rescue_flow() -> void:
 	var choices: Array = await _pending_changelist_choices()
 	var picked: Dictionary = await _show_checkout_target_dialog(message, ok_text, "Not Now", choices)
 	if not picked.ok:
-		_log("File(s) remain unsaved. Check them out (P4 dock or `p4 edit`) when you're ready.")
+		_log("File(s) remain unsaved. Check them out (FileSystem dock 'P4: Check Out', or `p4 edit`) when you're ready.")
 		return
 
 	var succeeded: Array = []
@@ -1817,7 +1822,7 @@ func _on_resource_saved(res: Resource) -> void:
 		_set_file_writable(global_path, true)
 		_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
 				"Perforce doesn't know about this change yet. Once the file becomes " +
-				"available, use 'Checkout Current File' (or Reconcile) so the " +
+				"available, right-click it in the FileSystem dock and choose 'P4: Check Out' (or use Reconcile) so the " +
 				"change lands in a changelist.") % [res_path, result.reason])
 
 
@@ -2024,6 +2029,24 @@ func _update_conn_status() -> void:
 
 func _on_conn_status_pressed() -> void:
 	_login_declined = false
+	if _p4_available and not _setup_active:
+		# Connected: a click means "use a different workspace". (Setup alone
+		# would stop at its first probe, which already says "ok".)
+		_setup_active = true
+		var old_client := _p4_client
+		var picked := await _pick_client()
+		_setup_active = false
+		if not picked or _override_client == old_client:
+			return
+		# Everything cached about the old workspace is now wrong.
+		_checked_out_this_session.clear()
+		_declined_this_session.clear()
+		_pending_save_checkout.clear()
+		_prewrite_eligible_cache.clear()
+		_fstat_cache.clear()
+		_fstat_failed.clear()
+		_p4_available = false
+		_update_conn_status()
 	_offer_connection_setup()
 
 
@@ -2258,7 +2281,7 @@ func _on_diff_window_close_requested() -> void:
 ## degenerates into remove-all/add-all.
 func _diff_path(res_path: String) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
+		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
 	var local_path := ProjectSettings.globalize_path(res_path)
 	var result := await _p4_exec(["diff", "-dul", local_path])
@@ -3157,7 +3180,7 @@ func _on_reconcile_pressed() -> void:
 
 func _reconcile_flow() -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
+		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
 	var preview := await _reconcile_preview()
 	if preview.is_empty():
@@ -3193,7 +3216,7 @@ func _on_revert_unchanged_pressed() -> void:
 
 func _revert_unchanged_flow() -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
+		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
 	var preview := await _revert_unchanged_preview()
 	if preview.is_empty():
@@ -3451,7 +3474,7 @@ func _submit_changelist_from_meta(meta: Dictionary) -> void:
 ## files (`submit -d <desc> <scope>`).
 func _submit_changelist(change: String, files: Array, preset_desc: String = "") -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
+		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
 	# The dock's file list can be stale; confirm (and submit) what's opened now.
 	files = await _submit_file_list(change, files)
@@ -3841,7 +3864,7 @@ func _local_to_res(local_path: String) -> String:
 
 ## Async `p4 <args>` via the worker thread. Returns {exit_code, output}. Commands
 ## are logged to the log window per the Verbose setting (see _should_log_cmd).
-func _p4_exec(args: PackedStringArray) -> Dictionary:
+func _p4_exec(args: PackedStringArray, offer_login: bool = true) -> Dictionary:
 	if _shutting_down:
 		# Continuations that resume during teardown must not start new p4
 		# commands (they'd run blocking on the main thread while the editor quits).
@@ -3865,7 +3888,8 @@ func _p4_exec(args: PackedStringArray) -> Dictionary:
 	_p4_inflight -= 1
 	var result := {"exit_code": req.exit_code, "output": req.output}
 	_finish_p4_log(args, result, loud)
-	_maybe_offer_login(result)
+	if offer_login:
+		_maybe_offer_login(result)
 	return result
 
 
@@ -4597,7 +4621,7 @@ func _ctx_status(paths: PackedStringArray) -> void:
 ## files. Refreshes the changelist tree.
 func _add_path(res_path: String) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
+		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
 	await _p4_exec_logged(["add", ProjectSettings.globalize_path(res_path)])
 	_request_refresh()
@@ -4608,7 +4632,7 @@ func _add_path(res_path: String) -> void:
 ## tooltip cache for these files.
 func _status_to_log(files: Array) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
+		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
 	for res in files:
 		var rec := await _fetch_fstat_record(res)
@@ -5100,6 +5124,13 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: prewrite")
 			else:
 				_log("[selftest] FAIL: prewrite")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-probe":
+			# Live, read-only: log what the connection probe decides. Run it with
+			# P4TICKETS pointing at an empty file to see the logged-out path.
+			var status: String = await _probe_connection()
+			_log("[selftest] probe status=%s" % status)
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-exec-quoting":

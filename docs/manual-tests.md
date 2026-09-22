@@ -25,7 +25,7 @@ Setup:
 | 6 | In the FileSystem dock, rename a tracked `.png`. Accept "Record Move". | `p4 opened` shows `move/add` + `move/delete` for the `.png` **and** its `.png.import`. Revert both afterwards. |
 | 7 | Quit Godot. Delete the project's `.godot/` folder. Relaunch from the Dock. | Import runs with no "Safe save failed" or "Cannot open file" errors. Afterwards `p4 opened` is empty (or lists only real `.import` changes), and `ls -l *.import` shows them read-only. |
 | 8 | Right-click a tracked `.png` → **P4: Check Out**. | `p4 opened` lists the `.png` and its `.png.import`. Revert afterwards. |
-| 9 | Editor Settings → search "P4 Executable". Set it to a bad path and restart Godot. | The setting exists under **P4godot**. After the restart the Log names the bad setting and falls back to the Homebrew p4. Clear it again. |
+| 9 | Editor Settings → search "Executable Path". Set it to a bad path and restart Godot. | The setting exists under **Perforce**. After the restart the Log names the bad setting and falls back to the Homebrew p4. Clear it again. |
 
 If a step fails, turn on **Verbose log** in the gear menu, repeat it, and
 save the Log contents.
