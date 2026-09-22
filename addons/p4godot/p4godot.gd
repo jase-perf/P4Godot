@@ -349,6 +349,10 @@ const REIMPORT_CONFIRM_THRESHOLD := 20
 # Global paths whose last `p4 fstat` failed (see _remember_no_checkout).
 var _fstat_failed: Dictionary = {}
 
+# See _shader_files.
+var _shader_files_cache: Array = []
+var _shader_files_dirty: bool = true
+
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
@@ -373,6 +377,7 @@ func _enter_tree() -> void:
 	var efs := EditorInterface.get_resource_filesystem()
 	efs.resources_reimporting.connect(_on_resources_reimporting)
 	efs.resources_reimported.connect(_on_resources_reimported)
+	efs.filesystem_changed.connect(_on_filesystem_changed)
 
 	_p4_bin = _resolve_p4_bin()
 	_p4_thread = Thread.new()
@@ -395,6 +400,8 @@ func _exit_tree() -> void:
 			efs.resources_reimporting.disconnect(_on_resources_reimporting)
 		if efs.resources_reimported.is_connected(_on_resources_reimported):
 			efs.resources_reimported.disconnect(_on_resources_reimported)
+		if efs.filesystem_changed.is_connected(_on_filesystem_changed):
+			efs.filesystem_changed.disconnect(_on_filesystem_changed)
 	if get_undo_redo().history_changed.is_connected(_on_undo_redo_history_changed):
 		get_undo_redo().history_changed.disconnect(_on_undo_redo_history_changed)
 	var script_editor := EditorInterface.get_script_editor()
@@ -1086,6 +1093,12 @@ func _prewrite_candidates() -> Array:
 	if inspected is Resource and not (inspected as Resource).is_built_in() \
 			and not (inspected as Resource).resource_path.is_empty():
 		roots.append((inspected as Resource).resource_path)
+	# Scene saves also write every loaded resource the editor considers edited
+	# (EditorNode::_save_external_resources) - notably shaders open in the
+	# shader editor, which no dependency list reaches. Loaded = cached.
+	for sp: String in _shader_files():
+		if ResourceLoader.has_cached(sp):
+			roots.append(sp)
 	var out: Array = []
 	var seen := {}
 	for root_path: String in roots:
@@ -1106,6 +1119,30 @@ func _prewrite_candidates() -> Array:
 				seen[dep_path] = true
 				out.append(dep_path)
 	return out
+
+
+## Shader files in the project (Shader, ShaderInclude, VisualShader), from the
+## editor's in-memory filesystem; rebuilt after filesystem changes.
+func _shader_files() -> Array:
+	if _shader_files_cache.is_empty() or _shader_files_dirty:
+		_shader_files_dirty = false
+		_shader_files_cache = []
+		var root := EditorInterface.get_resource_filesystem().get_filesystem()
+		if root:
+			_collect_shader_files(root, _shader_files_cache)
+	return _shader_files_cache
+
+
+func _collect_shader_files(dir: EditorFileSystemDirectory, out: Array) -> void:
+	for i in dir.get_file_count():
+		if String(dir.get_file_type(i)) in ["Shader", "ShaderInclude", "VisualShader"]:
+			out.append(dir.get_file_path(i))
+	for i in dir.get_subdir_count():
+		_collect_shader_files(dir.get_subdir(i), out)
+
+
+func _on_filesystem_changed() -> void:
+	_shader_files_dirty = true
 
 
 func _finish_prewrite_pass() -> void:
@@ -1404,13 +1441,18 @@ func _dependency_writes_probe(scene_path: String) -> void:
 	# dependencies - it never stalls on a p4 round trip. Real failures are
 	# collected for the p4-gated handling below.
 	var failed: Array = []
-	for dep: String in ResourceLoader.get_dependencies(scene_path):
+	var written: Array = ResourceLoader.get_dependencies(scene_path)
+	# Loaded shaders (e.g. open in the shader editor) are written on scene save too.
+	for sp: String in _shader_files():
+		if ResourceLoader.has_cached(sp):
+			written.append(sp)
+	for dep: String in written:
 		# Entries may be "uid://xxx::res://path" - take the path part.
 		var dep_path := dep.get_slice("::", dep.get_slice_count("::") - 1)
 		if not dep_path.begins_with("res://"):
 			continue
 		var ext := dep_path.get_extension().to_lower()
-		if ext != "tres" and ext != "res":
+		if not ext in ["tres", "res", "gdshader", "gdshaderinc"]:
 			continue # Imported assets and scripts aren't written on scene save.
 		if _checked_out_this_session.has(dep_path) or _rescue_paths.has(dep_path):
 			continue
@@ -1500,7 +1542,7 @@ func _failed_write_was_unchanged(global_path: String) -> bool:
 func _contents_match(a: PackedByteArray, b: PackedByteArray, ext: String) -> bool:
 	if a == b:
 		return true
-	var text_exts: PackedStringArray = ["tscn", "tres", "gd", "gdshader", "cfg",
+	var text_exts: PackedStringArray = ["tscn", "tres", "gd", "gdshader", "gdshaderinc", "cfg",
 			"godot", "import", "json", "txt", "shader"]
 	if not ext in text_exts:
 		return false
@@ -1680,6 +1722,12 @@ func _run_rescue_flow() -> void:
 	for res_path: String in failed_paths:
 		_rescue_skip_frame[res_path] = Engine.get_process_frames()
 	_log("Checked out %s - saving again..." % ", ".join(succeeded))
+	# The failed attempt's safe-save temp is litter now (Reconcile would offer
+	# to add it); the retry writes the real file.
+	for res_path: String in succeeded:
+		var stale_tmp := _fresh_failed_write_tmp(ProjectSettings.globalize_path(res_path))
+		if not stale_tmp.is_empty():
+			DirAccess.remove_absolute(stale_tmp)
 
 	var scenes: Array = []
 	for res_path: String in succeeded:
@@ -3366,7 +3414,7 @@ func _submit_changelist_from_meta(meta: Dictionary) -> void:
 ## changelists submit by number (`submit -c`, using their own description); the
 ## default changelist prompts for a description and submits its project-scoped
 ## files (`submit -d <desc> <scope>`).
-func _submit_changelist(change: String, files: Array) -> void:
+func _submit_changelist(change: String, files: Array, preset_desc: String = "") -> void:
 	if not await _ensure_identity():
 		await _show_alert("Perforce is unavailable - press Refresh in the P4 dock to run connection setup (details in the P4 Log).")
 		return
@@ -3378,7 +3426,9 @@ func _submit_changelist(change: String, files: Array) -> void:
 
 	var desc := ""
 	if change == "default":
-		var input: Dictionary = await _show_input_dialog("Submit Default Changelist",
+		# preset_desc exists for the live submit selftest (no input dialog).
+		var input: Dictionary = {"ok": true, "text": preset_desc} if not preset_desc.is_empty() \
+				else await _show_input_dialog("Submit Default Changelist",
 				"Description for this submission:", "", true, "Continue")
 		if not input.ok:
 			return
@@ -5286,6 +5336,45 @@ func _run_cli_self_test_if_requested() -> void:
 					and edited.contains("second") and edited.contains("//depot/a") \
 					and not edited.contains("old line")
 			_log("[selftest] %s: build-change-spec" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-submit-roundtrip":
+			# Live and DESTRUCTIVE (two real submits): adds res://p4godot_submit_test.txt
+			# through the default-changelist submit path with a description full of
+			# shell metacharacters, checks the depot recorded it byte-for-byte, then
+			# submits its deletion. Refuses to run unless nothing is opened.
+			_selftest_auto_answer = "confirm"
+			var opened := _parse_ztag(await _p4_exec(["-ztag", "opened"]))
+			if not opened.is_empty():
+				_log("[selftest] FAIL: submit-roundtrip - %d file(s) already opened; needs a clean workspace" % opened.size())
+				get_tree().quit()
+				return
+			var test_res := "res://p4godot_submit_test.txt"
+			var test_g := ProjectSettings.globalize_path(test_res)
+			var fw := FileAccess.open(test_g, FileAccess.WRITE)
+			fw.store_string("P4Godot submit selftest %d\n" % Time.get_unix_time_from_system())
+			fw.close()
+			await _p4_exec_logged(["add", test_g])
+			var desc := "P4Godot selftest: \"quotes\" $VER `ticks` & ^ %PATH% 'single' trailing\\"
+			await _submit_changelist("default", [], desc)
+			var ch := _parse_ztag(await _p4_exec(["-ztag", "changes", "-m1", "-s", "submitted", test_g]))
+			var num := "" if ch.is_empty() else String(ch[0].get("change", ""))
+			var recorded := ""
+			if not num.is_empty():
+				var d := _parse_ztag(await _p4_exec(["-ztag", "describe", "-s", num]))
+				recorded = "" if d.is_empty() else String(d[0].get("desc", "")).strip_edges()
+			var desc_ok := recorded == desc
+			_log("[selftest] add submitted as %s; desc recorded=[%s] match=%s" % [num, recorded, desc_ok])
+			await _p4_exec_logged(["delete", test_g])
+			await _submit_changelist("default", [], "P4Godot selftest: cleanup of p4godot_submit_test.txt")
+			var st := _parse_ztag(await _p4_exec(["-ztag", "fstat", test_g]))
+			var head_action := "" if st.is_empty() else String(st[0].get("headAction", ""))
+			var left_open := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] cleanup headAction=%s opened-after=%d" % [head_action, left_open])
+			if desc_ok and head_action == "delete" and left_open == 0:
+				_log("[selftest] PASS: submit-roundtrip")
+			else:
+				_log("[selftest] FAIL: submit-roundtrip")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-create-changelist":
