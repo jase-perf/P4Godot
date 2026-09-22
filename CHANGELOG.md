@@ -2,12 +2,63 @@
 
 Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
-## Unreleased
+## 0.14.0 — 2026-09-22
+
+First public release.
 
 - Renamed the plugin to **P4Godot** (P4G for short). The addon folder is now
-  `addons/p4godot` and the dock tab reads **P4G**.
-- Packaging for the Godot Asset Store: source archives now contain only the
-  addon folder, and copies of the license and readme ship inside it.
+  `addons/p4godot` and the dock tab reads **P4G**. If you used an earlier
+  build, re-enable the plugin under its new path.
+- **Reimports no longer fail on read-only `.import` files.** Godot rewrites
+  every reimported asset's `.import`. In a read-only workspace that logged
+  "Safe save failed" and left a `.tmp` file for each asset, and a fresh sync
+  hits every asset. Unchanged files now go back to read-only. Changed ones
+  are checked out, with a prompt when more than 20 change at once.
+- **Saves never roll back.** If Perforce refuses a checkout after a save
+  landed, the file stays as saved and writable, and you're told it isn't in
+  a changelist. Earlier versions put the old content back on disk, which
+  could lose the edit.
+- Saves that don't change a read-only file no longer touch it on disk. The
+  old copy-back moved its modified time, which could trigger Godot's
+  "reload from disk" prompt.
+- Shaders open in the shader editor are covered by the read-only save
+  handling. Every scene save writes them.
+- In `allwrite` workspaces (and with `+w` filetypes), an untouched Ctrl+S no
+  longer opens the file. Saves go through `p4 reconcile -e`, which opens only
+  real changes.
+- FileSystem-dock renames and moves are recorded as real moves (`reconcile
+  -M`; earlier versions passed `-m` by mistake and recorded delete + add).
+  The `.import` and `.uid` files Godot moves or deletes alongside an asset
+  are recorded too.
+- FileSystem-dock **P4: Check Out** on an imported asset also checks out its
+  `.import`, so import-settings changes can be saved.
+- The default changelist submits exactly the files the confirmation lists.
+  They're fetched fresh, and files opened while the dialog is up aren't
+  included. Numbered-changelist confirmations list files outside the project
+  too.
+- macOS and Linux:
+  - Arguments containing `$`, backticks, quotes, or backslashes (for example
+    in changelist descriptions) are passed to p4 intact.
+  - `p4` is found in Homebrew's folders even when Godot is launched from the
+    Dock.
+  - A missing `p4` is reported as missing instead of "can't reach server".
+- New **Editor Settings → P4godot → P4 Executable** setting for a `p4` in an
+  unusual place.
+- First connection to an `ssl:` server shows the fingerprint and offers to
+  trust it. A changed fingerprint shows a warning instead.
+- **Sync This File** reloads the file only if the sync changed it, and asks
+  first when the file is open in the editor.
+- A failed status query (a network blip) no longer turns off checkout for
+  that file for the rest of the session.
+- Failed-save `.tmp` files are cleaned up after a successful retry.
+- The "Checkout on save" setting now also governs the read-only save
+  handling.
+- The temporary file that carries your login password to `p4 login` is
+  private to your user, and stale ones are removed at startup.
+- Packaging: release archives contain only the addon folder, with a copy of
+  the license and readme inside it.
+- No GDScript warnings at Godot's default warning settings, even with
+  warnings enabled for addons.
 
 ## 0.13.0 — 2026-08-20
 
@@ -50,7 +101,7 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 - FileSystem dock integration: right-click P4 actions (Check Out, Mark for
   Add, Get Latest, Diff vs Depot, Revert, Show Status in Log), hover status
   tooltips served from a background cache, and delete/move/rename tracking
-  with history-preserving moves (`p4 reconcile -m`).
+  with history-preserving moves.
 - "Auto add/edit/delete" setting to apply those actions silently.
 
 ## 0.9.0 — 2026-07-22
