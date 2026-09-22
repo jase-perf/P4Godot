@@ -1396,9 +1396,12 @@ func _scene_saved_probe(path: String) -> void:
 			# it writable so `p4 sync` refuses to overwrite the edit.
 			_set_file_writable(global_path, true)
 			return
-		_log("'%s' was saved while not checked out - checking it out to keep the changelist accurate." % res_path)
-		var result: Dictionary = await _do_checkout(res_path)
-		if not result.ok:
+		var result: Dictionary = await _checkout_if_changed(res_path)
+		if result.get("unchanged", false):
+			return # Untouched Ctrl+S; the file keeps its mode (writable in allwrite).
+		if result.ok:
+			_log("'%s' was saved while not checked out - checked it out to keep the changelist accurate." % res_path)
+		else:
 			_set_file_writable(global_path, true)
 			_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
 					"Perforce doesn't know about this change yet. Once the file becomes " +
@@ -1785,9 +1788,12 @@ func _on_resource_saved(res: Resource) -> void:
 		_remember_no_checkout(res_path, global_path)
 		_pending_save_checkout.erase(res_path)
 		return
-	_log("'%s' was saved while not checked out - checking it out to keep the changelist accurate." % res_path)
-	var result: Dictionary = await _do_checkout(res_path)
-	if not result.ok:
+	var result: Dictionary = await _checkout_if_changed(res_path)
+	if result.get("unchanged", false):
+		return # Untouched Ctrl+S; the file keeps its mode (writable in allwrite).
+	if result.ok:
+		_log("'%s' was saved while not checked out - checked it out to keep the changelist accurate." % res_path)
+	else:
 		_set_file_writable(global_path, true)
 		_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
 				"Perforce doesn't know about this change yet. Once the file becomes " +
@@ -3558,6 +3564,24 @@ func _pending_changelist_choices() -> Array:
 		var desc := String(crec.get("desc", "")).strip_edges().get_slice("\n", 0)
 		choices.append({"change": num, "label": "#%s  %s" % [num, desc]})
 	return choices
+
+
+## For a file that was saved while not checked out (allwrite workspace, a +w
+## filetype, or macOS/Linux): open it only if the save really changed it.
+## `p4 reconcile -e` compares content (line-ending tolerant - verified), so an
+## untouched Ctrl+S doesn't land the file in a changelist. Same result shape
+## as _do_checkout, plus "unchanged": true when there was nothing to open.
+func _checkout_if_changed(res_path: String) -> Dictionary:
+	if not await _ensure_identity():
+		return {"ok": false, "reason": "p4 isn't available this session (see the startup log)"}
+	var global_path := ProjectSettings.globalize_path(res_path)
+	var rec_result: Dictionary = await _p4_exec_logged(["reconcile", "-e", global_path])
+	var rec_text := "" if rec_result.output.is_empty() else String(rec_result.output[0])
+	if rec_text.contains("no file(s) to reconcile"):
+		return {"ok": true, "reason": "", "unchanged": true}
+	var fstat_result: Dictionary = await _p4_exec(["fstat", global_path])
+	var others := _parse_other_opens(await _p4_exec(["opened", "-a", global_path]))
+	return _resolve_checkout(res_path, rec_result, fstat_result, others)
 
 
 ## Blocking twin of _do_checkout() for _apply_changes(), the pre-write hook
