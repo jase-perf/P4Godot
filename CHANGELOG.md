@@ -46,6 +46,8 @@ First public release.
   unusual place.
 - First connection to an `ssl:` server shows the fingerprint and offers to
   trust it. A changed fingerprint shows a warning instead.
+- Checkout-on-edit no longer prompts for a scene you didn't edit. Switching
+  to a scene tab whose instanced sub-scene had changed could trigger it.
 - **Sync This File** reloads the file only if the sync changed it, and asks
   first when the file is open in the editor.
 - A failed status query (a network blip) no longer turns off checkout for
