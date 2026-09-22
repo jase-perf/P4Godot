@@ -16,7 +16,7 @@
 - [ ] Timeouts: no p4 command has one; `_apply_changes` runs blocking checkouts on save. Circuit-breaker after "Connect to server failed", and/or `execute_with_pipe` + `OS.kill` on a deadline.
 - [ ] Escape `@ # % *` in file paths passed to p4 (`%40 %23 %25 %2A`; `add -f` takes raw paths) and unescape depot paths in output.
 - [ ] Connection overrides live in `.godot/editor/project_metadata.cfg`; if `.godot/` gets submitted, teammates inherit them. Move to the per-user editor config dir keyed by project path, and warn in Reconcile when `.godot/` paths appear.
-- [ ] Reviewer-reported (PLAUSIBLE, unverified): `history_changed` also fires from `clear_history` on tab switches, which can prompt checkout for an untouched scene. Act only when the history version increases.
+- [x] (0.14.0, `_history_advanced`, verified with a negative control) `history_changed` also fires from `clear_history` on tab switches, which prompted checkout for an untouched scene.
 - [ ] Error-dialog dismissal matches by basename substring (`level.tscn` also covers `sublevel.tscn`); match the full path.
 - [ ] Import dock: settings changes on a read-only `.import` fail (Godot writes it before any hook). Workaround shipped: FileSystem Check Out takes the `.import` along.
 

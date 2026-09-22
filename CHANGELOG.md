@@ -45,7 +45,17 @@ First public release.
 - New **Editor Settings → Perforce → Executable Path** setting for a `p4` in an
   unusual place.
 - First connection to an `ssl:` server shows the fingerprint and offers to
-  trust it. A changed fingerprint shows a warning instead.
+  trust exactly that fingerprint. A changed fingerprint shows a warning
+  instead.
+- Connection setup asks you to log in before it lists your workspaces.
+  Logged out on a first run, it used to say "No workspaces found".
+- Clicking the connection status while connected lets you switch to a
+  different workspace.
+- macOS and Linux: a save that lands on a read-only file while Perforce
+  can't be reached is left writable, so a later sync can't silently
+  overwrite it.
+- Nested resources a scene save writes (a material inside a tileset, for
+  example) are covered by the read-only save handling.
 - Checkout-on-edit no longer prompts for a scene you didn't edit. Switching
   to a scene tab whose instanced sub-scene had changed could trigger it.
 - **Sync This File** reloads the file only if the sync changed it, and asks

@@ -346,11 +346,18 @@ var _prewrite_eligible_cache: Dictionary = {}
 var _reimport_backups: Dictionary = {}
 const REIMPORT_CONFIRM_THRESHOLD := 20
 
-# Global paths whose last `p4 fstat` failed (see _remember_no_checkout).
+# Global path -> Time.get_ticks_msec() of its last failed `p4 fstat` (see
+# _remember_no_checkout and the keystroke throttle in _handle_edit).
 var _fstat_failed: Dictionary = {}
 
 # Last-seen UndoRedo version per editor history id (see _history_advanced).
 var _history_versions: Dictionary = {}
+
+# res:// path -> [mtime, direct res:// dependencies] (see _direct_deps).
+var _deps_cache: Dictionary = {}
+
+# res:// path -> Time.get_ticks_msec() when _finish_prewrite_pass settled it.
+var _prewrite_settled: Dictionary = {}
 
 # See _shader_files.
 var _shader_files_cache: Array = []
@@ -597,14 +604,21 @@ func _offer_connection_setup() -> void:
 		if status == "not trusted":
 			var fp_re := RegEx.create_from_string("(?:[0-9A-Fa-f]{2}:){15,}[0-9A-Fa-f]{2}")
 			var fp_match := fp_re.search(_last_probe_text)
-			var fp := fp_match.get_string() if fp_match else "(see the P4 Log)"
+			if not fp_match:
+				await _show_alert("This computer hasn't connected to this Perforce server over " +
+						"SSL before, and P4Godot couldn't read the server's fingerprint (see the P4 " +
+						"Log). Run `p4 trust` in a terminal to check and accept it, then press Refresh.")
+				break
+			var fp := fp_match.get_string()
 			var trust: bool = await _show_confirm_dialog(("This computer hasn't connected to this " +
 					"Perforce server over SSL before.\n\nServer fingerprint:\n%s\n\nTrust it only if it " +
 					"matches the fingerprint your server admin gave you (or the one P4V showed you).")
 					% fp, "Trust This Server", "Cancel")
 			if not trust:
 				break
-			await _p4_exec_logged(["trust", "-y"])
+			# Install exactly the fingerprint shown, not whatever the next
+			# connection happens to present.
+			await _p4_exec_logged(["trust", "-i", fp])
 			continue
 		if status == "fingerprint changed":
 			await _show_alert("WARNING: this Perforce server's SSL fingerprint has CHANGED since " +
@@ -911,6 +925,11 @@ func _handle_edit(res_path: String) -> void:
 			or _pending_save_checkout.has(res_path) \
 			or _inflight_edit_checks.has(res_path):
 		return
+	# Its last status check failed moments ago (server down, dead ticket):
+	# don't start another round trip on every keystroke. Saves still check.
+	var gp := ProjectSettings.globalize_path(res_path)
+	if _fstat_failed.has(gp) and Time.get_ticks_msec() - int(_fstat_failed[gp]) < 30000:
+		return
 	# The caches only update once the flow below RESOLVES (fstat round trip,
 	# maybe a prompt) - hold the in-flight marker across it so the keystrokes
 	# streaming in meanwhile don't each start another flow.
@@ -1069,18 +1088,26 @@ func _prewrite_pass() -> void:
 		# candidate. Synchronous by necessity (the writes start the moment
 		# _apply_changes returns) - the same tradeoff as the pre-save checkout
 		# above. The cache keeps repeat saves at zero extra round trips.
+		# Chunked: one command line per 50 paths keeps big projects under the
+		# Windows command-line length limit.
 		var by_client := {}
-		var fstat_result := _p4_exec_sync(["-ztag", "fstat"] + unknown)
-		var recs := _parse_ztag(fstat_result)
-		for rec in recs:
-			var cf := String(rec.get("clientFile", ""))
-			if not cf.is_empty():
-				by_client[cf.replace("\\", "/").to_lower()] = rec
-		# A failed fstat with no records (server unreachable, dead ticket) is
-		# "unknown", not "untracked": skip the pass for now, cache nothing.
-		var fstat_failed: bool = int(fstat_result.exit_code) != 0 and recs.is_empty()
+		var unknown_failed := {} # OS paths whose chunk failed outright
+		for i in range(0, unknown.size(), 50):
+			var chunk: Array = unknown.slice(i, i + 50)
+			var fstat_result := _p4_exec_sync(PackedStringArray(["-ztag", "fstat"] + chunk))
+			var recs := _parse_ztag(fstat_result)
+			for rec in recs:
+				var cf := String(rec.get("clientFile", ""))
+				if not cf.is_empty():
+					by_client[cf.replace("\\", "/").to_lower()] = rec
+			# A failed fstat with no records (server unreachable, dead ticket) is
+			# "unknown", not "untracked": skip those files this time, cache nothing.
+			if int(fstat_result.exit_code) != 0 and recs.is_empty():
+				for p: String in chunk:
+					unknown_failed[p] = true
 		for res_path: String in candidates:
-			if _prewrite_eligible_cache.has(res_path) or fstat_failed:
+			if _prewrite_eligible_cache.has(res_path) \
+					or unknown_failed.has(ProjectSettings.globalize_path(res_path)):
 				continue
 			var key := ProjectSettings.globalize_path(res_path).replace("\\", "/").to_lower()
 			var rec: Dictionary = by_client.get(key, {})
@@ -1136,14 +1163,48 @@ func _prewrite_candidates() -> Array:
 		if rext != "tscn" and rext != "scn":
 			continue
 		# Scene saves also write the scene's MODIFIED external resources.
-		for dep: String in ResourceLoader.get_dependencies(root_path):
-			var dep_path := dep.get_slice("::", dep.get_slice_count("::") - 1)
-			var dext := dep_path.get_extension().to_lower()
-			if dep_path.begins_with("res://") and (dext == "tres" or dext == "res") \
-					and not seen.has(dep_path):
+		for dep_path: String in _resource_deps_deep(root_path):
+			if not seen.has(dep_path):
 				seen[dep_path] = true
 				out.append(dep_path)
 	return out
+
+
+## External resources a save of `scene_path` may write: its .tres/.res
+## dependencies, followed through nested .tres/.res (a material inside a
+## tileset...) but not into other scenes, which a scene save never writes.
+## Dependency lists are cached per file by mtime; the walk is capped so a huge
+## dependency web can't slow every save.
+func _resource_deps_deep(scene_path: String) -> Array:
+	var out: Array = []
+	var seen := {scene_path: true}
+	var queue: Array = [scene_path]
+	while not queue.is_empty() and out.size() < 400:
+		var cur: String = queue.pop_front()
+		for dep_path: String in _direct_deps(cur):
+			if seen.has(dep_path):
+				continue
+			seen[dep_path] = true
+			var dext := dep_path.get_extension().to_lower()
+			if dext == "tres" or dext == "res":
+				out.append(dep_path)
+				queue.append(dep_path)
+	return out
+
+
+func _direct_deps(res_path: String) -> Array:
+	var mtime := FileAccess.get_modified_time(ProjectSettings.globalize_path(res_path))
+	var cached: Array = _deps_cache.get(res_path, [])
+	if not cached.is_empty() and int(cached[0]) == mtime:
+		return cached[1]
+	var deps: Array = []
+	for dep: String in ResourceLoader.get_dependencies(res_path):
+		# Entries may be "uid://xxx::res://path" - take the path part.
+		var dep_path := dep.get_slice("::", dep.get_slice_count("::") - 1)
+		if dep_path.begins_with("res://"):
+			deps.append(dep_path)
+	_deps_cache[res_path] = [mtime, deps]
+	return deps
 
 
 ## Shader files in the project (Shader, ShaderInclude, VisualShader), from the
@@ -1175,6 +1236,9 @@ func _finish_prewrite_pass() -> void:
 	var managed := _prewrite_managed
 	_prewrite_managed = {}
 	for res_path: String in managed.keys():
+		# The dependency probe (deferred after this) must not re-examine files
+		# this pass just settled.
+		_prewrite_settled[res_path] = Time.get_ticks_msec()
 		var backup := String(managed[res_path])
 		var global_path := ProjectSettings.globalize_path(res_path)
 		var cur := FileAccess.get_file_as_bytes(global_path)
@@ -1237,14 +1301,31 @@ func _save_landed(global_path: String) -> bool:
 	if OS.get_name() == "Windows":
 		return false
 	var age := Time.get_unix_time_from_system() - float(FileAccess.get_modified_time(global_path))
-	return age >= 0.0 and age < 10.0
+	return absf(age) < 10.0 # abs: tolerate small clock skew on network drives
+
+
+## macOS/Linux: a save that lands on a read-only file leaves it read-only (the
+## rename keeps the old mode), and `p4 sync` overwrites read-only files without
+## asking. When Perforce can't be asked whether the file is checked out, make
+## it writable so a sync refuses to clobber the edit. Windows never lands a
+## save on a read-only file, so this is a no-op there.
+func _protect_landed_save(res_path: String, global_path: String) -> void:
+	if OS.get_name() == "Windows" or FileAccess.open(global_path, FileAccess.READ_WRITE) != null:
+		return
+	if _set_file_writable(global_path, true):
+		_log("'%s' was saved while Perforce couldn't be asked about it - left writable so a sync can't overwrite it. Run Reconcile once Perforce is reachable." % res_path)
 
 
 ## Scratch folder for pre-write backups and temporary p4 spec files. Swept of
 ## stale leftovers (a crash mid-save or mid-login) at startup.
 func _p4godot_cache_dir() -> String:
 	var dir := OS.get_cache_dir().path_join("p4godot")
-	DirAccess.make_dir_recursive_absolute(dir)
+	if not DirAccess.dir_exists_absolute(dir):
+		DirAccess.make_dir_recursive_absolute(dir)
+		if OS.get_name() != "Windows":
+			# Backups and the login spec live here: owner-only (rwx------).
+			FileAccess.set_unix_permissions(dir, FileAccess.UNIX_READ_OWNER
+					| FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER)
 	return dir
 
 
@@ -1402,11 +1483,25 @@ func _scene_saved_probe(path: String) -> void:
 		_log("Save of '%s' failed (read-only), but its content is unchanged - nothing was lost, no checkout needed." % res_path)
 		_queue_error_dialog_dismissal(res_path)
 		return
+	# Decided now, before any await: the mtime test in _save_landed only holds
+	# right after the write, and the p4 queue can take a while.
+	var landed := _save_landed(global_path)
+	var landed_read_only := landed and FileAccess.open(global_path, FileAccess.READ_WRITE) == null
 	if not await _ensure_identity():
+		if landed:
+			_protect_landed_save(res_path, global_path)
 		return
 	if _checked_out_this_session.has(res_path):
-		return
+		if not landed_read_only:
+			return
+		# Opened files are writable, so the cache is stale (submitted or
+		# reverted outside the editor) - re-ask Perforce below.
+		_checked_out_this_session.erase(res_path)
 	if not await _needs_checkout(global_path):
+		if _fstat_failed.has(global_path):
+			if landed:
+				_protect_landed_save(res_path, global_path)
+			return # Unknown, not "no checkout needed": keep any pending retry.
 		_remember_no_checkout(res_path, global_path)
 		_pending_save_checkout.erase(res_path)
 		return
@@ -1415,7 +1510,7 @@ func _scene_saved_probe(path: String) -> void:
 	# situation we're in: landed = the save went through without a checkout
 	# (allwrite client, or macOS/Linux, where read-only doesn't block a save),
 	# not landed = the save just failed.
-	if _save_landed(global_path):
+	if landed:
 		if checkout_was_refused_this_save:
 			# macOS/Linux: saved despite the refusal (already reported). Keep
 			# it writable so `p4 sync` refuses to overwrite the edit.
@@ -1469,22 +1564,26 @@ func _dependency_writes_probe(scene_path: String) -> void:
 	# dependencies - it never stalls on a p4 round trip. Real failures are
 	# collected for the p4-gated handling below.
 	var failed: Array = []
-	var written: Array = ResourceLoader.get_dependencies(scene_path)
+	var landed: Array = [] # macOS/Linux: written despite being read-only
+	var written: Array = _resource_deps_deep(scene_path)
 	# Loaded shaders (e.g. open in the shader editor) are written on scene save too.
 	for sp: String in _shader_files():
 		if ResourceLoader.has_cached(sp):
 			written.append(sp)
-	for dep: String in written:
-		# Entries may be "uid://xxx::res://path" - take the path part.
-		var dep_path := dep.get_slice("::", dep.get_slice_count("::") - 1)
-		if not dep_path.begins_with("res://"):
-			continue
-		var ext := dep_path.get_extension().to_lower()
-		if not ext in ["tres", "res", "gdshader", "gdshaderinc"]:
-			continue # Imported assets and scripts aren't written on scene save.
+	for dep_path: String in written:
 		if _checked_out_this_session.has(dep_path) or _rescue_paths.has(dep_path):
 			continue
+		if Time.get_ticks_msec() - int(_prewrite_settled.get(dep_path, -100000)) < 10000:
+			continue # The pre-write pass just handled this save of it.
 		var global_path := ProjectSettings.globalize_path(dep_path)
+		if OS.get_name() != "Windows":
+			# No failed write here - the rename lands on read-only files. A
+			# read-only dependency with a fresh mtime was just written while not
+			# checked out.
+			if FileAccess.open(global_path, FileAccess.READ_WRITE) == null \
+					and _save_landed(global_path):
+				landed.append(dep_path)
+			continue
 		if _fresh_failed_write_tmp(global_path).is_empty():
 			continue
 		if _failed_write_was_unchanged(global_path):
@@ -1492,10 +1591,21 @@ func _dependency_writes_probe(scene_path: String) -> void:
 			_queue_error_dialog_dismissal(dep_path)
 			continue
 		failed.append({"dep_path": dep_path, "global_path": global_path})
-	if failed.is_empty():
+	if failed.is_empty() and landed.is_empty():
 		return
 	if not await _ensure_identity():
+		for dep_path: String in landed:
+			_protect_landed_save(dep_path, ProjectSettings.globalize_path(dep_path))
 		return
+	for dep_path: String in landed:
+		var result: Dictionary = await _checkout_if_changed(dep_path)
+		if result.get("unchanged", false):
+			continue
+		if result.ok:
+			_log("Saving '%s' also wrote '%s' - checked it out to keep the changelist accurate." % [scene_path, dep_path])
+		else:
+			_set_file_writable(ProjectSettings.globalize_path(dep_path), true)
+			_log("Saving '%s' also wrote '%s', which couldn't be checked out (%s) - left writable so a sync can't overwrite it." % [scene_path, dep_path, result.reason])
 	for entry: Dictionary in failed:
 		var dep_path := String(entry.dep_path)
 		if not await _needs_checkout(String(entry.global_path)):
@@ -1519,7 +1629,7 @@ func _dependency_writes_probe(scene_path: String) -> void:
 ## COMPLETE content the editor tried to write (the write finished; only the
 ## rename over the read-only target failed), which is what lets
 ## _failed_write_was_unchanged() below compare it against the disk file.
-func _fresh_failed_write_tmp(global_path: String) -> String:
+func _fresh_failed_write_tmp(global_path: String, max_age_sec: float = 10.0) -> String:
 	var dir := DirAccess.open(global_path.get_base_dir())
 	if dir == null:
 		return ""
@@ -1535,7 +1645,7 @@ func _fresh_failed_write_tmp(global_path: String) -> String:
 			continue
 		var tmp_path := global_path.get_base_dir().path_join(f)
 		var mtime := FileAccess.get_modified_time(tmp_path)
-		if now - mtime < 10.0 and mtime >= best_mtime:
+		if now - mtime < max_age_sec and mtime >= best_mtime:
 			best = tmp_path
 			best_mtime = mtime
 	return best
@@ -1753,7 +1863,8 @@ func _run_rescue_flow() -> void:
 	# The failed attempt's safe-save temp is litter now (Reconcile would offer
 	# to add it); the retry writes the real file.
 	for res_path: String in succeeded:
-		var stale_tmp := _fresh_failed_write_tmp(ProjectSettings.globalize_path(res_path))
+		# 15 min: the user may have taken a while to answer the rescue dialog.
+		var stale_tmp := _fresh_failed_write_tmp(ProjectSettings.globalize_path(res_path), 900.0)
 		if not stale_tmp.is_empty():
 			DirAccess.remove_absolute(stale_tmp)
 
@@ -1793,23 +1904,32 @@ func _on_resource_saved(res: Resource) -> void:
 	if res == null:
 		return
 	var res_path := res.resource_path
-	if res_path.is_empty() or not res_path.begins_with("res://") \
-			or _checked_out_this_session.has(res_path):
+	if res_path.is_empty() or not res_path.begins_with("res://"):
 		return
 	if _prewrite_managed.has(res_path):
 		return # The pre-write pass owns this file's restore-or-checkout decision.
 	var global_path := ProjectSettings.globalize_path(res_path)
+	# resource_saved only fires for writes that landed. Read-only afterwards
+	# (possible only on macOS/Linux) means NOT opened, whatever the cache says.
+	var landed_read_only := FileAccess.open(global_path, FileAccess.READ_WRITE) == null
+	if _checked_out_this_session.has(res_path):
+		if not landed_read_only:
+			return
+		_checked_out_this_session.erase(res_path) # stale: submitted/reverted elsewhere
 	if _rescue_skip_frame.get(res_path, -1) == Engine.get_process_frames():
-		# The pre-save checkout was just refused and reported. resource_saved
-		# only fires for writes that landed (macOS/Linux ignore read-only on
-		# save): keep the file writable so `p4 sync` won't overwrite the edit.
+		# The pre-save checkout was just refused and reported. Keep the file
+		# writable so `p4 sync` won't overwrite the edit.
 		_set_file_writable(global_path, true)
 		return
 	if not await _ensure_identity():
+		_protect_landed_save(res_path, global_path)
 		return
 	if _checked_out_this_session.has(res_path):
 		return # Re-check: a save-time checkout may have resolved during the await.
 	if not await _needs_checkout(global_path):
+		if _fstat_failed.has(global_path):
+			_protect_landed_save(res_path, global_path)
+			return # Unknown, not "no checkout needed": keep any pending retry.
 		_remember_no_checkout(res_path, global_path)
 		_pending_save_checkout.erase(res_path)
 		return
@@ -3040,19 +3160,22 @@ func _checkout_path(res_path: String) -> void:
 	# An imported asset's .import holds its import settings, and the Import dock
 	# writes it before any plugin hook runs - so check it out alongside (the
 	# FileSystem dock hides .import files, so users can't pick it themselves).
+	# Asset first: if it's exclusively locked elsewhere, the .import shouldn't
+	# end up opened on its own.
+	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
+		_remember_no_checkout(res_path, ProjectSettings.globalize_path(res_path))
+		_log("'%s' doesn't need checkout (already opened by you, or not tracked by Perforce)." % res_path)
+	else:
+		var result: Dictionary = await _do_checkout(res_path)
+		if not result.ok:
+			_show_alert("Couldn't check out '%s' - %s." % [res_path, result.reason])
+			return
 	var import_res := res_path + ".import"
 	if FileAccess.file_exists(ProjectSettings.globalize_path(import_res)) \
 			and await _needs_checkout(ProjectSettings.globalize_path(import_res)):
 		var side: Dictionary = await _do_checkout(import_res)
 		if not side.ok:
 			_show_alert("Couldn't check out '%s' - %s." % [import_res, side.reason])
-	if not await _needs_checkout(ProjectSettings.globalize_path(res_path)):
-		_remember_no_checkout(res_path, ProjectSettings.globalize_path(res_path))
-		_log("'%s' doesn't need checkout (already opened by you, or not tracked by Perforce)." % res_path)
-		return
-	var result: Dictionary = await _do_checkout(res_path)
-	if not result.ok:
-		_show_alert("Couldn't check out '%s' - %s." % [res_path, result.reason])
 
 
 ## The file selected in the changelist tree (a file row), or "" if none. The
@@ -3445,9 +3568,13 @@ func _replace_spec_description(spec_text: String, new_desc: String) -> String:
 func _parse_change_number(result: Dictionary) -> String:
 	if result.output.is_empty():
 		return ""
-	var re := RegEx.new()
-	re.compile("Change (\\d+)")
-	var m := re.search(String(result.output[0]))
+	var text := String(result.output[0])
+	# A submit the server renumbers says "Change 12 renamed change 14 and
+	# submitted." - the final number is the one after "renamed change".
+	var renamed_m := RegEx.create_from_string("renamed change (\\d+)").search(text)
+	if renamed_m:
+		return renamed_m.get_string(1)
+	var m := RegEx.create_from_string("Change (\\d+)").search(text)
 	return m.get_string(1) if m else ""
 
 
@@ -3530,9 +3657,11 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	if result.exit_code == 0:
 		var submitted := _parse_change_number(result)
 		_log("Submit complete." if submitted.is_empty() else "Submitted as change %s." % submitted)
-		# Submitted files are no longer opened - drop them from the caches.
+		# Submitted files are no longer opened. The cache is keyed by res://
+		# path, which files missing from the last refresh don't have here - so
+		# drop it all; the refresh below re-adds whatever is still opened.
+		_checked_out_this_session.clear()
 		for f in files:
-			_checked_out_this_session.erase(f.label)
 			_pending_save_checkout.erase(f.label)
 	else:
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
@@ -3701,7 +3830,7 @@ func _needs_checkout_from(result: Dictionary, global_path: String) -> bool:
 	if _fstat_shows_our_open(text):
 		return false
 	if result.exit_code != 0:
-		_fstat_failed[global_path] = true
+		_fstat_failed[global_path] = Time.get_ticks_msec()
 		_log("Warning: 'p4 fstat' failed (exit %d) for '%s'%s" % [result.exit_code, global_path,
 				"" if text.is_empty() else ": " + text.strip_edges().get_slice("\n", 0)])
 		return false
@@ -3988,14 +4117,25 @@ static func _os_args(args: PackedStringArray) -> PackedStringArray:
 
 func _write_temp_spec(spec_text: String) -> String:
 	var path := _p4godot_cache_dir().path_join("spec_%d.txt" % Time.get_ticks_usec())
+	if OS.get_name() != "Windows":
+		# The login password travels through this file, so it must be owner-only
+		# BEFORE the content is written. The editor's safe-save writes a temp
+		# sibling and renames it over the target, copying the target's mode - so
+		# create the file empty, restrict it, and only then write for real.
+		var pre := FileAccess.open(path, FileAccess.WRITE)
+		if pre == null:
+			_log("Could not open a temp spec file at '%s'." % path)
+			return ""
+		pre.close()
+		if FileAccess.set_unix_permissions(path,
+				FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER) != OK:
+			DirAccess.remove_absolute(path)
+			_log("Could not make the temp spec file private - not writing it.")
+			return ""
 	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f == null:
 		_log("Could not open a temp spec file at '%s'." % path)
 		return ""
-	if OS.get_name() != "Windows":
-		# The login password travels through this file: owner-only, and deleted
-		# right after p4 reads it (stale leftovers are swept at startup).
-		FileAccess.set_unix_permissions(path, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
 	f.store_string(spec_text)
 	f.close()
 	return path
