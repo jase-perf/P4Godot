@@ -843,12 +843,70 @@ func _skipped_result() -> Dictionary:
 			"check $P4PORT. (P4Godot skipped this: the server wasn't answering moments ago.)"]}
 
 
-## Persist the connection overrides next to the other per-project settings.
+# ---------------------------------------------------------------------------
+# Where the connection overrides live
+#
+# The server, user and workspace this project should connect as are one
+# person's business, not the team's. They used to sit with the other settings
+# in the project's metadata, which is a file inside `.godot/` - so a team that
+# submitted `.godot/` (against the advice in the README, but it happens) gave
+# every teammate this machine's user name and workspace, and they would all
+# try to connect as each other.
+#
+# They live in the editor's own per-user config folder now, in one file keyed
+# by the project's path, so they follow the person rather than the project.
+# Anything left in the old place is moved on first load and blanked there.
+# ---------------------------------------------------------------------------
+
+func _connection_store_path() -> String:
+	return EditorInterface.get_editor_paths().get_config_dir().path_join(
+			"p4godot").path_join("connections.cfg")
+
+
+## One section per project, named by a hash of its path so the section name
+## can't contain characters a config file would choke on. The readable path
+## goes inside the section.
+func _project_store_section() -> String:
+	return ProjectSettings.globalize_path("res://").sha256_text()
+
+
 func _save_connection_overrides() -> void:
+	var path := _connection_store_path()
+	var cfg := ConfigFile.new()
+	cfg.load(path) # keep the other projects already in the file
+	var section := _project_store_section()
+	cfg.set_value(section, "project", ProjectSettings.globalize_path("res://"))
+	cfg.set_value(section, "port", _override_port)
+	cfg.set_value(section, "user", _override_user)
+	cfg.set_value(section, "client", _override_client)
+	DirAccess.make_dir_recursive_absolute(path.get_base_dir())
+	var err := cfg.save(path)
+	if err != OK:
+		_log("Warning: couldn't save the Perforce connection settings to '%s' (error %d)."
+				% [path, err])
+
+
+func _load_connection_overrides() -> void:
+	var cfg := ConfigFile.new()
+	var section := _project_store_section()
+	if cfg.load(_connection_store_path()) == OK and cfg.has_section(section):
+		_override_port = String(cfg.get_value(section, "port", ""))
+		_override_user = String(cfg.get_value(section, "user", ""))
+		_override_client = String(cfg.get_value(section, "client", ""))
+		return
+	# Nothing stored for this project yet. Take whatever the old in-project
+	# location holds, move it, and blank it there so submitting `.godot/`
+	# can't spread it.
 	var settings := EditorInterface.get_editor_settings()
-	settings.set_project_metadata(SETTINGS_SECTION, "override_port", _override_port)
-	settings.set_project_metadata(SETTINGS_SECTION, "override_user", _override_user)
-	settings.set_project_metadata(SETTINGS_SECTION, "override_client", _override_client)
+	_override_port = settings.get_project_metadata(SETTINGS_SECTION, "override_port", "")
+	_override_user = settings.get_project_metadata(SETTINGS_SECTION, "override_user", "")
+	_override_client = settings.get_project_metadata(SETTINGS_SECTION, "override_client", "")
+	if _override_port.is_empty() and _override_user.is_empty() and _override_client.is_empty():
+		return
+	_log("Moved this project's Perforce connection settings out of .godot/ and into your own editor config.")
+	_save_connection_overrides()
+	for key in ["override_port", "override_user", "override_client"]:
+		settings.set_project_metadata(SETTINGS_SECTION, key, "")
 
 
 ## Awaitable gate: resolves to _p4_available once the startup `p4 info` check
@@ -878,9 +936,7 @@ func _load_settings() -> void:
 	detect_external_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "detect_external_changes", true)
 	_verbose_log = verbose_log_checkbox.button_pressed
-	_override_port = settings.get_project_metadata(SETTINGS_SECTION, "override_port", "")
-	_override_user = settings.get_project_metadata(SETTINGS_SECTION, "override_user", "")
-	_override_client = settings.get_project_metadata(SETTINGS_SECTION, "override_client", "")
+	_load_connection_overrides()
 
 
 func _on_setting_toggled(_pressed: bool) -> void:
@@ -3595,6 +3651,18 @@ func _confirm_reconcile(found: Dictionary, refused: Dictionary, ok_text: String,
 		note += ("\n\nThe %d file(s) opened for delete are missing from your workspace. " +
 				"Submitting that removes them from the depot - cancel if you expected " +
 				"them to be there and your sync is incomplete.") % found.deletes
+	var cache_files: int = _count_godot_cache_paths(found.names)
+	if cache_files > 0:
+		# .godot/ is Godot's per-machine cache and editor state, and P4Godot
+		# keeps this project's server, user and workspace choice in there too.
+		# Submitting it hands your connection settings to your teammates and
+		# starts a stream of conflicts on files that are rebuilt locally
+		# anyway.
+		note += ("\n\n%d of these are inside `.godot/`, Godot's local cache. It's " +
+				"rebuilt on each machine and holds your own editor state, including " +
+				"this project's Perforce connection settings, so it doesn't belong " +
+				"in the depot. Add `.godot/` to the project's .p4ignore, then run " +
+				"Reconcile again.") % cache_files
 	if int(refused.count) > 0:
 		note += "\n\nPerforce won't open %d other file(s):\n\n%s" \
 				% [refused.count, _file_listing(refused.lines)]
@@ -3604,6 +3672,19 @@ func _confirm_reconcile(found: Dictionary, refused: Dictionary, ok_text: String,
 			% [found.names.size(), found.adds, found.edits, found.deletes,
 			_file_listing(found.names), note],
 			ok_text, cancel_text)
+
+
+## How many of these paths live in Godot's local cache folder? Matches the
+## res:// form and either slash, since the list can hold raw local paths for
+## files that don't map into the project.
+static func _count_godot_cache_paths(names: Array) -> int:
+	var n := 0
+	for name_any in names:
+		var text := String(name_any)
+		if text.begins_with("res://.godot/") or text.contains("/.godot/") \
+				or text.contains("\\.godot\\"):
+			n += 1
+	return n
 
 
 # ---------------------------------------------------------------------------
@@ -6748,6 +6829,71 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] stale entry dropped=%s; really-open entry kept=%s (cache holds %d)"
 					% [stale_dropped, real_kept, _checked_out_this_session.size()])
 			_log("[selftest] %s: opened-cache" % ("PASS" if stale_dropped and real_kept else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-connection-store":
+			# Server-independent: the connection overrides round-trip through
+			# the per-user store, a second project doesn't clobber the first,
+			# and anything left in the old in-project location is moved out
+			# and blanked - that location is a file inside .godot/, which a
+			# team can submit by accident.
+			var settings := EditorInterface.get_editor_settings()
+			var store := _connection_store_path()
+			var saved_port := _override_port
+			var saved_user := _override_user
+			var saved_client := _override_client
+
+			_override_port = "ssl:example:1666"
+			_override_user = "alice"
+			_override_client = "alice_ws"
+			_save_connection_overrides()
+			_override_port = ""
+			_override_user = ""
+			_override_client = ""
+			_load_connection_overrides()
+			var round_trip: bool = _override_port == "ssl:example:1666" \
+					and _override_user == "alice" and _override_client == "alice_ws"
+
+			# A second project must not overwrite the first project's section.
+			var other := ConfigFile.new()
+			other.load(store)
+			other.set_value("some_other_project_hash", "user", "bob")
+			other.save(store)
+			_load_connection_overrides()
+			var kept_separate: bool = _override_user == "alice"
+
+			# Migration: clear the new store for this project, put values in
+			# the old place, and load.
+			var cfg := ConfigFile.new()
+			cfg.load(store)
+			cfg.erase_section(_project_store_section())
+			cfg.save(store)
+			settings.set_project_metadata(SETTINGS_SECTION, "override_user", "legacy_user")
+			_override_user = ""
+			_load_connection_overrides()
+			var migrated: bool = _override_user == "legacy_user"
+			var old_cleared: bool = String(settings.get_project_metadata(
+					SETTINGS_SECTION, "override_user", "")).is_empty()
+			var in_new_store := ConfigFile.new()
+			in_new_store.load(store)
+			var landed: bool = String(in_new_store.get_value(
+					_project_store_section(), "user", "")) == "legacy_user"
+
+			# Put the real settings back, and take the test data out.
+			_override_port = saved_port
+			_override_user = saved_user
+			_override_client = saved_client
+			_save_connection_overrides()
+			var cleanup := ConfigFile.new()
+			cleanup.load(store)
+			cleanup.erase_section("some_other_project_hash")
+			cleanup.save(store)
+
+			_log("[selftest] store=%s" % store)
+			_log("[selftest] round-trip=%s kept-separate=%s migrated=%s old-cleared=%s landed-in-new=%s"
+					% [round_trip, kept_separate, migrated, old_cleared, landed])
+			var ok: bool = round_trip and kept_separate and migrated and old_cleared and landed
+			_log("[selftest] %s: connection-store" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-plugin-prompt":
