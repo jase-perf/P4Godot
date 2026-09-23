@@ -4,10 +4,31 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## 0.14.1 — 2026-09-23
 
+- **Reconcile tells you what it found and what it couldn't do.** The
+  confirmation now lists the files by name and breaks them down by action,
+  and anything Perforce refused is reported instead of swallowed. Refusals
+  were invisible before: `p4` reports them on stderr and still exits 0, so
+  reconciling a file another user holds with an exclusive (`+l`) lock looked
+  like it worked and silently did nothing.
+- **A refused file no longer turns into a phantom change that never clears.**
+  `p4` reports a refusal as a message whose second line begins with `... `,
+  the same way a tagged field does. Read as a field, it became a record with
+  no action, which the dock counted as "1 file to edit" that reconciling
+  could never open, and it could swallow the fields of the record printed
+  after it.
+- Reconcile opens exactly the files its confirmation listed, instead of
+  re-running over the whole project, where anything that changed while the
+  dialog was open would be opened too.
+- Reconcile warns before opening files for delete, naming the count. Files
+  missing because of an incomplete sync look identical to deleted ones, and
+  submitting that removes them from the depot.
+
 - **Changes made outside Godot are detected.** When Godot regains focus,
   P4Godot looks for files that other programs changed and offers to check
   them out, naming any that Perforce refused (usually a `+l` file someone
-  else holds). New **Detect external changes** setting, on by default.
+  else holds). New **Detect external changes** setting, on by default. The
+  scan runs on focus only, never on Godot's own filesystem rescans, so
+  working normally doesn't put a reconcile on the server every few seconds.
 - **Declining a checkout no longer turns checkout off for that file.** The
   decline suppressed re-prompting so a failed reload couldn't prompt on every
   keystroke, but nothing cleared the suppression: the next edit went

@@ -235,11 +235,16 @@ check out whatever changed. It opens exactly the files the dialog listed, and
 says so when Perforce refuses one, which usually means another user holds an
 exclusively locked (`+l`) file.
 
-Answering **Not Now** silences that same set of files until the set changes,
-so it can't ask again every time you alt-tab. With "Auto add/edit/delete" on,
-the files are opened silently instead. The scan is a full reconcile preview
-of the project, so on a very large workspace you may want it off; the
-Reconcile button still does the job on demand.
+Answering **Not Now** silences that same set of files until one of them
+changes again, so it can't ask every time you alt-tab. With "Auto
+add/edit/delete" on, the files are opened silently — except when the scan
+wants to open something for *delete*, which always asks first, because a file
+missing from an incomplete sync looks exactly like a deleted one.
+
+The scan runs when Godot regains focus, and only then: Godot's own filesystem
+rescans fire on every save, and a reconcile preview of the whole project is
+too expensive to run at that rate. On a very large workspace you may want the
+setting off entirely; **Reconcile** still does the job on demand.
 
 <!-- 📷 SCREENSHOT: the FileSystem dock with the P4 context menu open on a file,
      and (second shot or same composition) a hover tooltip showing

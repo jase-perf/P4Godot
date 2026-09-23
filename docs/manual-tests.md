@@ -45,7 +45,8 @@ by hand:
 | 6 | Check out a tracked `.gd`, add a line, save, then revert it from the P4G dock. | The script's tab stays open and shows the depot text, at roughly the line you were on. Close and reopen the file: still the depot text. |
 | 7 | With Godot in front, change a tracked `.png` in another program and save it. Click back into Godot. | A dialog lists the file and offers **Check Out**. Accept: it appears in the default changelist. |
 | 8 | Repeat step 7 but answer **Not Now**, then alt-tab away and back twice. | It asks once and stays quiet after that. |
-| 9 | Have a teammate check out a `+l` file, change that file locally in another program, then click back into Godot and accept the checkout. | A dialog names the file Perforce refused and says who has it. |
+| 9 | Create two new files and change one tracked file outside Godot, then press **Reconcile**. | The confirmation lists all three by name and reads `add: 2, edit: 1, delete: 0`. Accept: all three appear in the default changelist. |
+| 10 | Have a teammate check out a `+l` file, change that file locally in another program, then press **Reconcile** (and separately, click back into Godot and accept the checkout). | A dialog names the file Perforce refused and says who has it. Pressing Reconcile again does not report a phantom change that nothing can clear. |
 
 ## Screenshots for the README
 

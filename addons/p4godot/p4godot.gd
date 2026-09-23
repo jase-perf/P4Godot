@@ -1296,11 +1296,12 @@ func _collect_shader_files(dir: EditorFileSystemDirectory, out: Array) -> void:
 
 func _on_filesystem_changed() -> void:
 	_shader_files_dirty = true
-	# Godot rescans the project on focus-in, so this usually lands within a
-	# frame of the focus notification; the throttle collapses the pair into
-	# one scan. It also fires on its own, for files that changed while Godot
-	# was already in front.
-	_scan_for_external_changes("Godot's filesystem scan reported changes")
+	# Deliberately no external-change scan here. filesystem_changed fires
+	# after every editor rescan - every save, every import - and the scan is a
+	# reconcile preview of the whole project, so hanging it off this signal
+	# would put a full scan on the server every few seconds while someone is
+	# just working. Focus-in is the right cadence, and it's what the README
+	# promises; the Reconcile button covers anything in between.
 
 
 func _finish_prewrite_pass() -> void:
@@ -2335,6 +2336,7 @@ func _on_conn_status_pressed() -> void:
 		_prewrite_eligible_cache.clear()
 		_fstat_cache.clear()
 		_fstat_failed.clear()
+		_external_scan_dismissed = ""
 		_p4_available = false
 		_update_conn_status()
 	_offer_connection_setup()
@@ -3491,14 +3493,36 @@ func _reconcile_flow() -> void:
 	if not await _ensure_identity():
 		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
 		return
-	var preview := await _reconcile_preview()
-	if preview.is_empty():
-		await _show_alert("Reconcile found nothing to open - the workspace already matches Perforce.")
+	var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", _project_scope()])
+	var found := _summarize_reconcile(_parse_ztag(result))
+	var refused := _refusals(result)
+	if found.names.is_empty():
+		if int(refused.count) > 0:
+			await _show_alert(_refusal_alert_text(refused))
+		else:
+			await _show_alert("Reconcile found nothing to open - the workspace already matches Perforce.")
 		return
+	if not await _confirm_reconcile(found, refused, "Reconcile", "Cancel"):
+		_log("Reconcile cancelled.")
+		return
+	await _reconcile_paths(found.locals, found.names)
+
+
+## Fold a reconcile preview into the shape both callers need: the paths to
+## hand back to p4, the names to show, and a count per action. Sorted by name
+## as one list, so the paths and the names can't drift out of step.
+func _summarize_reconcile(preview: Array) -> Dictionary:
+	var rows: Array = []
 	var adds := 0
 	var edits := 0
 	var deletes := 0
 	for rec in preview:
+		# reconcile's clientFile is the raw local path (only depotFile comes
+		# back escaped), which is what a reconcile argument wants.
+		var local := String(rec.get("clientFile", ""))
+		if local.is_empty():
+			continue
+		var res := _local_to_res(local)
 		var action := String(rec.get("action", ""))
 		if action.contains("delete"):
 			deletes += 1
@@ -3506,17 +3530,37 @@ func _reconcile_flow() -> void:
 			adds += 1
 		else:
 			edits += 1
-	var proceed: bool = await _show_confirm_dialog(
-			("Perforce reconcile found %d change(s) on disk:\n\n" +
-			"    add: %d\n    edit: %d\n    delete: %d\n\n" +
-			"Open these files in Perforce? Your files on disk are not modified.")
-			% [preview.size(), adds, edits, deletes],
-			"Reconcile", "Cancel")
-	if not proceed:
-		_log("Reconcile cancelled.")
-		return
-	await _p4_exec_logged(["reconcile", _project_scope()])
-	_request_refresh()
+		rows.append({"local": local, "name": res if not res.is_empty() else local, "action": action})
+	rows.sort_custom(func(a, b): return String(a.name) < String(b.name))
+	var locals: Array = []
+	var names: Array = []
+	for row in rows:
+		locals.append(row.local)
+		names.append(row.name)
+	return {"locals": locals, "names": names, "adds": adds, "edits": edits, "deletes": deletes}
+
+
+## The confirmation for opening a set of reconciled files. It names them and
+## breaks them down by action, because "delete" is the one a user must not
+## agree to by accident: an incomplete sync makes depot files look missing,
+## and opening those for delete removes them from the depot on the next
+## submit.
+func _confirm_reconcile(found: Dictionary, refused: Dictionary, ok_text: String,
+		cancel_text: String) -> bool:
+	var note := ""
+	if int(found.deletes) > 0:
+		note += ("\n\nThe %d file(s) opened for delete are missing from your workspace. " +
+				"Submitting that removes them from the depot - cancel if you expected " +
+				"them to be there and your sync is incomplete.") % found.deletes
+	if int(refused.count) > 0:
+		note += "\n\nPerforce won't open %d other file(s):\n\n%s" \
+				% [refused.count, _file_listing(refused.lines)]
+	return await _show_confirm_dialog(
+			("%d change(s) on disk - add: %d, edit: %d, delete: %d\n\n%s\n\n" +
+			"Open these in Perforce? Your files on disk are not modified.%s")
+			% [found.names.size(), found.adds, found.edits, found.deletes,
+			_file_listing(found.names), note],
+			ok_text, cancel_text)
 
 
 # ---------------------------------------------------------------------------
@@ -3540,11 +3584,11 @@ func _reconcile_flow() -> void:
 ## on a large workspace. One every few seconds is plenty for "the user just
 ## alt-tabbed back".
 const EXTERNAL_SCAN_MIN_INTERVAL_MSEC := 5000
-## Above this many changes the message also points at .p4ignore - a count this
-## high usually means Godot's own generated files are being reported.
-const EXTERNAL_SCAN_IGNORE_HINT_COUNT := 50
+## How long an unfinished scan blocks the next one before it's written off.
+const EXTERNAL_SCAN_STUCK_MSEC := 300000
 
 var _external_scan_inflight: bool = false
+var _external_scan_started_msec: int = 0
 var _external_scan_last_msec: int = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
 ## The set of changes the user last answered "Not Now" to, so the same set
 ## doesn't ask again on every alt-tab. Cleared as soon as the set changes.
@@ -3563,8 +3607,16 @@ func _detect_external_changes() -> bool:
 ## Look for files changed outside Godot and offer to open them. Silent when
 ## there's nothing to report. `reason` shows only in the verbose log.
 func _scan_for_external_changes(reason: String) -> void:
-	if not _detect_external_changes() or _shutting_down or _external_scan_inflight:
+	if not _detect_external_changes() or _shutting_down:
 		return
+	if _external_scan_inflight:
+		# A scan waits on dialogs, and a dialog that is freed without
+		# answering leaves its awaiting coroutine parked forever. Without this
+		# release, one such dialog would turn external-change detection off
+		# for the rest of the session with nothing said about it.
+		if Time.get_ticks_msec() - _external_scan_started_msec < EXTERNAL_SCAN_STUCK_MSEC:
+			return
+		_log("The last external-change scan never finished - starting a new one.")
 	if _identity_checked and not _p4_available:
 		return # p4 was unavailable at startup - the plugin is inert.
 	if _server_unreachable():
@@ -3573,6 +3625,7 @@ func _scan_for_external_changes(reason: String) -> void:
 	if now - _external_scan_last_msec < EXTERNAL_SCAN_MIN_INTERVAL_MSEC:
 		return
 	_external_scan_inflight = true
+	_external_scan_started_msec = now
 	await _scan_for_external_changes_inner(reason)
 	# Time from the END of the scan, so a slow one can't immediately re-fire.
 	_external_scan_last_msec = Time.get_ticks_msec()
@@ -3584,88 +3637,87 @@ func _scan_for_external_changes_inner(reason: String) -> void:
 		return
 	if _verbose_log:
 		_log("Scanning for changes made outside Godot (%s)..." % reason)
-	var preview := await _reconcile_preview()
-	# `reconcile`'s clientFile is the raw local path (only depotFile comes back
-	# escaped), which is exactly what the reconcile below needs.
-	var locals: Array = []
-	var names: Array = []
-	for rec in preview:
-		var local := String(rec.get("clientFile", ""))
-		if local.is_empty():
-			continue
-		locals.append(local)
-		var res := _local_to_res(local)
-		names.append(res if not res.is_empty() else local)
-	await _offer_external_changes(locals, names)
+	var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", _project_scope()])
+	await _offer_external_changes(_summarize_reconcile(_parse_ztag(result)), _refusals(result))
 
 
 ## Ask about a set of externally changed files and open the ones the user
 ## agreed to. Split out from the scan so the decision - including "don't ask
 ## about this same set again" - can be exercised on a known list.
-func _offer_external_changes(locals: Array, names: Array) -> void:
+func _offer_external_changes(found: Dictionary, refused: Dictionary) -> void:
+	var names: Array = found.names
 	if names.is_empty():
+		# Nothing outstanding: forget any set the user waved away, so the same
+		# files can be offered again if they change later.
 		_external_scan_dismissed = ""
+		if int(refused.count) > 0 and _verbose_log:
+			_log("Perforce won't open %d changed file(s); press Reconcile for details." % refused.count)
 		return
 
-	names.sort()
-	var signature := "\n".join(PackedStringArray(names))
+	var signature := _external_scan_signature(found.locals, names)
 	if signature == _external_scan_dismissed:
-		return # Already asked about exactly this set and was told no.
+		return # Already asked about exactly this state and was told no.
 	_external_scan_dismissed = ""
 
-	if _auto_open():
+	# "Auto add/edit/delete" is about the user's own edits, so it doesn't get
+	# to silently act on a project-wide scan they didn't start when the scan
+	# wants to open files for DELETE - that would quietly stage the removal of
+	# anything an incomplete sync left missing.
+	if _auto_open() and int(found.deletes) == 0:
 		_log("%d file(s) changed outside Godot - opening them in Perforce." % names.size())
-		await _open_external_changes(locals, names)
+		await _reconcile_paths(found.locals, names, signature)
 		return
 
-	var hint := ""
-	if names.size() > EXTERNAL_SCAN_IGNORE_HINT_COUNT:
-		hint = ("\n\nThat's a lot of files. If they include ones Godot generates, add " +
-				"`.godot/` and `*.tmp` to the project's .p4ignore.")
-	var proceed: bool = await _show_confirm_dialog(
-			("%d file(s) changed outside Godot:\n\n%s\n\nCheck them out in Perforce now? " +
-			"Your files on disk are not modified.%s") % [names.size(), _file_listing(names), hint],
-			"Check Out", "Not Now")
-	if not proceed:
+	if not await _confirm_reconcile(found, refused, "Check Out", "Not Now"):
 		_external_scan_dismissed = signature
 		_log("Left %d externally changed file(s) unopened." % names.size())
 		return
-	await _open_external_changes(locals, names)
+	await _reconcile_paths(found.locals, names, signature)
 
 
-## Open exactly the files the scan reported, naming each one on the command
-## line rather than re-running reconcile over the whole project: a second scan
-## would also open anything that changed while the dialog was up, which the
-## user never saw and never agreed to. Long lists go out in batches so the
-## command line can't overflow.
+## What the user was shown, as a string that changes when the files do. Paths
+## alone aren't enough: someone who says "Not Now" and then re-exports the
+## same file has to be asked again, and a path-only signature would silence
+## that second change for the rest of the session.
+func _external_scan_signature(locals: Array, names: Array) -> String:
+	var parts := PackedStringArray()
+	for i in names.size():
+		var local := String(locals[i])
+		var stamp := 0
+		if FileAccess.file_exists(local):
+			stamp = FileAccess.get_modified_time(local)
+		parts.append("%s:%d" % [String(names[i]), stamp])
+	return "\n".join(parts)
+
+
+## Open exactly the files that were listed, naming each one on the command
+## line rather than re-running reconcile over the whole project: a second
+## whole-project pass would also open anything that changed while the dialog
+## was up, which the user never saw and never agreed to. Long lists go out in
+## batches so the command line can't overflow.
 ##
-## Anything Perforce refused is reported. The usual refusal is a `+l`
-## (exclusive-lock) file another user has open: the change is already on disk,
-## but it can never be submitted until they let go, so say so now instead of
-## letting the user find out at submit time.
-func _open_external_changes(locals: Array, names: Array) -> void:
-	const BATCH := 100
-	var blocked: Array = []
+## `signature`, when given, is remembered if Perforce refuses anything, so a
+## file locked by someone else doesn't re-ask on every alt-tab.
+func _reconcile_paths(locals: Array, names: Array, signature: String = "") -> void:
+	const BATCH := 50
+	var refused := {"count": 0, "lines": [], "locked": false}
 	var start := 0
 	while start < locals.size():
 		var args: PackedStringArray = ["reconcile"]
 		for local in locals.slice(start, start + BATCH):
 			args.append(String(local))
-		var result: Dictionary = await _p4_exec_logged(args)
-		for line in result.get("output", []):
-			var text := String(line)
-			if text.contains("exclusive file already opened") or text.contains("can't edit") \
-					or text.contains("can't add") or text.contains("can't delete"):
-				blocked.append(text.strip_edges())
+		var batch_refused := _refusals(await _p4_exec_logged(args))
+		refused.count = int(refused.count) + int(batch_refused.count)
+		refused.lines.append_array(batch_refused.lines)
+		refused.locked = bool(refused.locked) or bool(batch_refused.locked)
 		start += BATCH
 	_request_refresh()
-	if blocked.is_empty():
+	if int(refused.count) == 0:
 		return
-	await _show_alert(("Perforce would not open %d of the %d changed file(s):\n\n%s\n\n" +
-			"A file locked with the `+l` filetype can only be open for edit by one " +
-			"person at a time. Your change is on disk, but it can't be submitted until " +
-			"the other user submits, shelves, or reverts theirs.")
-			% [blocked.size(), names.size(), _file_listing(blocked)])
+	if not signature.is_empty():
+		_external_scan_dismissed = signature
+	_log("Perforce refused %d of the %d file(s)." % [refused.count, names.size()])
+	await _show_alert(_refusal_alert_text(refused))
 
 
 func _on_revert_unchanged_pressed() -> void:
@@ -4668,17 +4720,92 @@ func _parse_ztag(result: Dictionary) -> Array:
 		if line.begins_with("... "):
 			var rest: String = line.substr(4)
 			var sp: int = rest.find(" ")
+			var key: String = rest if sp == -1 else rest.substr(0, sp)
+			if not _is_ztag_key(key):
+				# A p4 message, not a field. p4 reports a refused file as a
+				# bare line plus a "... " continuation whose first word is a
+				# file path, with no blank line before whatever follows:
+				#     //depot/f - can't edit exclusive file already opened
+				#     ... //depot/f - also opened by user@client
+				#     ... depotFile //depot/g        <- the next real record
+				# Read as a field, that continuation opens a bogus record and
+				# then swallows the next real record's fields into it. That
+				# made a reconcile preview lose a file that needed opening,
+				# and left a phantom record with no `action` that the dock
+				# counted as an edit it could never open.
+				if not current.is_empty():
+					records.append(current)
+					current = {}
+				last_key = ""
+				continue
 			if sp == -1:
-				current[rest] = ""
-				last_key = rest
+				current[key] = ""
 			else:
-				last_key = rest.substr(0, sp)
-				current[last_key] = rest.substr(sp + 1)
+				current[key] = rest.substr(sp + 1)
+			last_key = key
 		elif not current.is_empty() and not last_key.is_empty():
 			current[last_key] = String(current[last_key]) + "\n" + line
 	if not current.is_empty():
 		records.append(current)
 	return records
+
+
+## Perforce tag names are bare identifiers: `depotFile`, `action`, `otherOpen0`,
+## `how0,0`, `attr-name`. A "field name" holding a path separator, a drive
+## colon or an `@` is really a message line - see _parse_ztag.
+static func _is_ztag_key(key: String) -> bool:
+	if key.is_empty():
+		return false
+	return not (key.contains("/") or key.contains("\\") or key.contains(":") \
+			or key.contains("@"))
+
+
+## The messages in a p4 command's output that say it would not, or did not,
+## open a file: {"count": <refusals>, "lines": <refusals plus their detail
+## lines>, "locked": <a +l file is held elsewhere>}.
+##
+## Reading the text is the only option here. p4 writes these to stderr, which
+## shares the output blob, and it still exits 0 - `p4 reconcile` on a file
+## another workspace holds exclusively reports the refusal and returns success
+## (verified against a `+l` file opened by a second client).
+func _refusals(result: Dictionary) -> Dictionary:
+	var lines: Array = []
+	var count := 0
+	var locked := false
+	var output: Array = result.get("output", [])
+	if output.is_empty():
+		return {"count": 0, "lines": lines, "locked": false}
+	# OS.execute hands back one string holding the whole blob, not a line per
+	# entry, so it has to be split here.
+	for raw_line in String(output[0]).split("\n"):
+		var line := raw_line.rstrip("\r").strip_edges()
+		if line.begins_with("... "):
+			line = line.substr(4).strip_edges()
+		if line.is_empty():
+			continue
+		var refusal: bool = line.contains("can't edit") or line.contains("can't add") \
+				or line.contains("can't delete") or line.contains("can't open") \
+				or line.contains("no permission for operation")
+		if line.contains("exclusive file already opened"):
+			locked = true
+		if refusal:
+			count += 1
+			lines.append(line)
+		elif line.contains("also opened by"):
+			lines.append(line) # detail for the refusal above it
+	return {"count": count, "lines": lines, "locked": locked}
+
+
+## The alert text for files Perforce would not open. The exclusive-lock
+## explanation only appears when a lock was actually the reason.
+func _refusal_alert_text(refused: Dictionary) -> String:
+	var text := "Perforce would not open %d file(s):\n\n%s" \
+			% [refused.count, _file_listing(refused.lines)]
+	if refused.locked:
+		text += ("\n\nA file with the `+l` filetype can only be open for edit by one " +
+				"person at a time. Your change is on disk, but it can't be submitted " +
+				"until the other user submits, shelves, or reverts theirs.")
+	return text
 
 
 ## Worker thread body: drain the queue in FIFO order, one command at a time.
@@ -5018,8 +5145,10 @@ func _reload_path(res_path: String) -> bool:
 	_suppress_auto_checkout = true
 	call_deferred("_clear_auto_checkout_suppression")
 	# Reopening a script tab re-fills its CodeEdit, which emits text_changed.
-	# Our own reload must not read as a user edit.
-	_reloading_paths[res_path] = true
+	# Our own reload must not read as a user edit. Counted, not a flag: a dock
+	# Revert can land while a declined edit's reload is still settling, and
+	# whichever finishes first must not un-suppress the other.
+	_reloading_paths[res_path] = int(_reloading_paths.get(res_path, 0)) + 1
 
 	var ok := false
 	var ext := res_path.get_extension().to_lower()
@@ -5027,9 +5156,12 @@ func _reload_path(res_path: String) -> bool:
 		if res_path in EditorInterface.get_open_scenes():
 			_log("Reloading scene '%s'..." % res_path)
 			EditorInterface.reload_scene_from_path(res_path)
+			ok = true
 		else:
-			_log("'%s' isn't open in a tab - nothing to reload." % res_path)
-		ok = true
+			# No tab to reload, but the cached PackedScene can still hold the
+			# old contents, and opening the scene later would serve that.
+			_log("'%s' isn't open in a tab - re-reading it from disk." % res_path)
+			ok = ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_IGNORE) != null
 	elif ext == "gd" or ext == "cs":
 		ok = await _reload_script(res_path)
 	else:
@@ -5045,7 +5177,11 @@ func _reload_path(res_path: String) -> bool:
 	# its edit signals - reopening a script tab refills its CodeEdit, which
 	# looks exactly like typing.
 	await _settle_frames(2)
-	_reloading_paths.erase(res_path)
+	var still_reloading := int(_reloading_paths.get(res_path, 1)) - 1
+	if still_reloading > 0:
+		_reloading_paths[res_path] = still_reloading
+	else:
+		_reloading_paths.erase(res_path)
 	# Revert/sync/reload all change what's opened - reflect it in the tree.
 	_request_refresh()
 	return ok
@@ -5091,7 +5227,11 @@ func _reload_script(res_path: String) -> bool:
 	script_editor.close_file(res_path)
 	EditorInterface.edit_script(fresh)
 	await _settle_frames(2)
-	if caret > 0:
+	# Only if the reopened file is still the one in front - focus can land
+	# elsewhere, and moving the caret in an unrelated file would be worse
+	# than not restoring it.
+	var now_current := script_editor.get_current_script()
+	if caret > 0 and now_current != null and now_current.resource_path == res_path:
 		var code := _current_script_code_edit()
 		if code and caret < code.get_line_count():
 			code.set_caret_line(caret)
@@ -5618,17 +5758,72 @@ func _run_cli_self_test_if_requested() -> void:
 					+ "... change 123\r\n... desc first line\r\nsecond line\r\n... user bob\r\n"
 			var recs := _parse_ztag({"exit_code": 0, "output": [blob]})
 			_log("[selftest] ztag records: %d" % recs.size())
+			var basic_ok := false
 			if recs.size() == 2:
 				_log("[selftest] rec0 action=%s change=%s" % [recs[0].get("action", "?"), recs[0].get("change", "?")])
 				var desc_lines := String(recs[1].get("desc", "")).split("\n").size()
 				_log("[selftest] rec1 change=%s desc-lines=%d" % [recs[1].get("change", "?"), desc_lines])
-				if recs[0].get("action") == "edit" and recs[0].get("change") == "default" \
-						and recs[1].get("change") == "123" and desc_lines == 2:
-					_log("[selftest] PASS: parse-ztag")
-				else:
+				basic_ok = recs[0].get("action") == "edit" and recs[0].get("change") == "default" \
+						and recs[1].get("change") == "123" and desc_lines == 2
+				if not basic_ok:
 					_log("[selftest] FAIL: parse-ztag field mismatch")
 			else:
 				_log("[selftest] FAIL: parse-ztag expected 2 records")
+
+			# A refused file, copied from what the server really prints: a bare
+			# message line, then a "... " detail line whose first word is a
+			# depot path, then the NEXT record with no blank line between.
+			# Treating that detail line as a field used to open a bogus record
+			# and swallow the following record's fields, which lost a file
+			# from the reconcile preview and left a phantom "1 edit" the dock
+			# could never open.
+			var refused_blob := "//depot/proj/locked.tscn - can't edit exclusive file already opened\n" \
+					+ "... //depot/proj/locked.tscn - also opened by bob@bob_ws\n" \
+					+ "... depotFile //depot/proj/level.gd\n" \
+					+ "... clientFile C:\\ws\\proj\\level.gd\n... action edit\n... type text\n\n" \
+					+ "... depotFile //depot/proj/new.txt\n" \
+					+ "... clientFile C:\\ws\\proj\\new.txt\n... action add\n... type text\n\n"
+			var rrecs := _parse_ztag({"exit_code": 0, "output": [refused_blob]})
+			var actions: Array = []
+			for r in rrecs:
+				actions.append(r.get("action", "<none>"))
+			_log("[selftest] refusal blob -> %d record(s), actions=%s" % [rrecs.size(), actions])
+			var kept_edit: bool = rrecs.size() == 2 \
+					and rrecs[0].get("action", "") == "edit" \
+					and rrecs[0].get("depotFile", "") == "//depot/proj/level.gd" \
+					and rrecs[1].get("action", "") == "add"
+			# No message text may leak into a record as a field name.
+			var clean_keys := true
+			for r in rrecs:
+				for k in r.keys():
+					if not _is_ztag_key(String(k)):
+						clean_keys = false
+						_log("[selftest] leaked field name: %s" % k)
+
+			# A refusal on its own has to produce NO records. As a record it
+			# carries no `action`, and the dock counted that as an edit - the
+			# phantom "1 file to edit" that came back after every reconcile
+			# and that clicking Reconcile could never clear.
+			var only_refusal := "//depot/proj/locked.tscn - can't edit exclusive file already opened\n" \
+					+ "... //depot/proj/locked.tscn - also opened by bob@bob_ws\n"
+			var orecs := _parse_ztag({"exit_code": 0, "output": [only_refusal]})
+			_log("[selftest] refusal-only blob -> %d record(s)" % orecs.size())
+			var no_phantom: bool = orecs.is_empty()
+
+			var refused := _refusals({"exit_code": 0, "output": [refused_blob]})
+			_log("[selftest] refusals: count=%d locked=%s" % [refused.count, refused.locked])
+			var refusal_ok: bool = int(refused.count) == 1 and bool(refused.locked) \
+					and refused.lines.size() == 2
+			if not no_phantom:
+				_log("[selftest] FAIL: parse-ztag - a refusal became a phantom record")
+			elif not clean_keys:
+				_log("[selftest] FAIL: parse-ztag - message text leaked into a record")
+			elif basic_ok and kept_edit and refusal_ok and no_phantom and clean_keys:
+				_log("[selftest] PASS: parse-ztag")
+			elif not kept_edit:
+				_log("[selftest] FAIL: parse-ztag - a p4 message corrupted the record stream")
+			elif not refusal_ok:
+				_log("[selftest] FAIL: parse-ztag - refusal detection")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-unchanged-save":
@@ -6390,6 +6585,35 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: opened-cache" % ("PASS" if stale_dropped and real_kept else "FAIL"))
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-reconcile-report":
+			# Live and read-only: exactly what the Reconcile dialog would say
+			# about this workspace right now - the files, the per-action
+			# counts, and anything Perforce says it won't open. Opens nothing,
+			# so it is safe to run against a workspace in any state.
+			var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", _project_scope()])
+			var records := _parse_ztag(result)
+			var found := _summarize_reconcile(records)
+			var refused := _refusals(result)
+			_log("[selftest] reconcile would open %d file(s): add=%d edit=%d delete=%d"
+					% [found.names.size(), found.adds, found.edits, found.deletes])
+			for n in found.names:
+				_log("[selftest]   %s" % n)
+			_log("[selftest] refused=%d locked=%s" % [refused.count, refused.locked])
+			for refusal_line in refused.lines:
+				_log("[selftest]   ! %s" % refusal_line)
+			# The invariant the dock depends on: every record it counts is a
+			# real file with an action. A p4 message parsed as a record breaks
+			# this, and used to show up as a file to edit that could never be
+			# opened.
+			var well_formed := true
+			for rec in records:
+				if String(rec.get("clientFile", "")).is_empty() \
+						or String(rec.get("action", "")).is_empty():
+					well_formed = false
+					_log("[selftest] malformed record: %s" % [rec])
+			_log("[selftest] %s: reconcile-report" % ("PASS" if well_formed else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-external-scan":
 			# Live: a file another program dropped into the workspace must be
 			# found by the focus-in scan and offered for checkout, and a set
@@ -6425,10 +6649,14 @@ func _run_cli_self_test_if_requested() -> void:
 					found = true
 			_log("[selftest] reconcile preview saw the new file: %s" % found)
 
+			var one_file := {"locals": [global], "names": [rel],
+					"adds": 1, "edits": 0, "deletes": 0}
+			var no_refusals := {"count": 0, "lines": [], "locked": false}
+
 			# Decline once: the file stays unopened and the set is remembered,
 			# so the same set can't ask again on every alt-tab.
 			_selftest_auto_answer = "cancel"
-			await _offer_external_changes([global], [rel])
+			await _offer_external_changes(one_file, no_refusals)
 			await _selftest_drain_frames()
 			var opened_after_decline := not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
 			var remembered := not _external_scan_dismissed.is_empty()
@@ -6436,22 +6664,22 @@ func _run_cli_self_test_if_requested() -> void:
 			# Asked again with the identical set: the dialog must not reappear,
 			# so even a "confirm" answer leaves the file unopened.
 			_selftest_auto_answer = "confirm"
-			await _offer_external_changes([global], [rel])
+			await _offer_external_changes(one_file, no_refusals)
 			await _selftest_drain_frames()
-			var silent_on_repeat := not not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
+			var still_unopened := _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
 
 			# A fresh set does ask, and accepting opens the file for add.
 			_external_scan_dismissed = ""
-			await _offer_external_changes([global], [rel])
+			await _offer_external_changes(one_file, no_refusals)
 			await _selftest_drain_frames()
 			var opened := not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
 
 			await _p4_exec_logged(["revert", global])
 			DirAccess.remove_absolute(global)
-			_log("[selftest] preview-found=%s opened-after-decline=%s remembered=%s silent-on-repeat=%s opened-after-accept=%s"
-					% [found, opened_after_decline, remembered, silent_on_repeat, opened])
+			_log("[selftest] preview-found=%s opened-after-decline=%s remembered=%s still-unopened-on-repeat=%s opened-after-accept=%s"
+					% [found, opened_after_decline, remembered, still_unopened, opened])
 			var ok: bool = found and focus_scanned and not opened_after_decline \
-					and remembered and silent_on_repeat and opened
+					and remembered and still_unopened and opened
 			_log("[selftest] %s: external-scan" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
