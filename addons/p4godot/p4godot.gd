@@ -172,6 +172,7 @@ var _toolbar_actions: HBoxContainer
 var _toolbar_right: HBoxContainer
 var _toolbar_wrapped: bool = false
 var auto_checkout_checkbox: CheckBox
+var detect_external_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 var verbose_log_checkbox: CheckBox
 var auto_open_checkbox: CheckBox
@@ -268,6 +269,11 @@ var _setup_active: bool = false
 var _checked_out_this_session: Dictionary = {}
 var _declined_this_session: Dictionary = {}
 var _pending_save_checkout: Dictionary = {}
+
+# res:// path -> true while WE are reloading that file from disk. Refilling a
+# script tab emits text_changed exactly like typing does; without this, our
+# own reload would prompt for a checkout of the file it just discarded.
+var _reloading_paths: Dictionary = {}
 
 # Hover-tooltip status cache: res:// path -> {data: <parsed -ztag fstat record>,
 # time: <unix seconds>}. The tooltip callback is synchronous and must never wait
@@ -864,6 +870,8 @@ func _load_settings() -> void:
 			SETTINGS_SECTION, "verbose_log", false)
 	auto_open_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "auto_open_no_prompt", false)
+	detect_external_checkbox.button_pressed = settings.get_project_metadata(
+			SETTINGS_SECTION, "detect_external_changes", true)
 	_verbose_log = verbose_log_checkbox.button_pressed
 	_override_port = settings.get_project_metadata(SETTINGS_SECTION, "override_port", "")
 	_override_user = settings.get_project_metadata(SETTINGS_SECTION, "override_user", "")
@@ -880,6 +888,8 @@ func _on_setting_toggled(_pressed: bool) -> void:
 			verbose_log_checkbox.button_pressed)
 	settings.set_project_metadata(SETTINGS_SECTION, "auto_open_no_prompt",
 			auto_open_checkbox.button_pressed)
+	settings.set_project_metadata(SETTINGS_SECTION, "detect_external_changes",
+			detect_external_checkbox.button_pressed)
 	_verbose_log = verbose_log_checkbox.button_pressed
 
 
@@ -963,7 +973,8 @@ func _handle_edit(res_path: String) -> void:
 	if _checked_out_this_session.has(res_path) \
 			or _declined_this_session.has(res_path) \
 			or _pending_save_checkout.has(res_path) \
-			or _inflight_edit_checks.has(res_path):
+			or _inflight_edit_checks.has(res_path) \
+			or _reloading_paths.has(res_path):
 		return
 	# Its last status check failed moments ago (server down, dead ticket):
 	# don't start another round trip on every keystroke. Saves still check.
@@ -1010,11 +1021,16 @@ func _prompt_then_checkout(res_path: String) -> void:
 			await _on_edit_checkout_failed(res_path, result.reason)
 	else:
 		_log("Declined checkout of '%s' - discarding the in-editor change and reloading from disk..." % res_path)
-		# _reload_path() clears _declined_this_session (so manual Revert/Sync/
-		# Reload get a clean slate) - set the flag AFTER calling it, or it
-		# would be wiped immediately and every keystroke would re-prompt.
-		_reload_path(res_path)
-		_declined_this_session[res_path] = true
+		# Suppress re-prompting only when the discard could NOT be confirmed.
+		# A reload that silently failed leaves the change sitting in the
+		# editor, and every keystroke after it would prompt again. A
+		# confirmed reload puts the editor back in step with the depot, so
+		# the user's next edit is a genuinely new one and has to prompt -
+		# that's what makes declining once not turn checkout off for the
+		# rest of the session. (_reload_path clears the flag itself, so this
+		# has to be set after it, not before.)
+		if not await _reload_path(res_path):
+			_declined_this_session[res_path] = true
 
 
 ## The user said "Check Out" but Perforce refused (most commonly: someone else
@@ -1036,8 +1052,8 @@ func _on_edit_checkout_failed(res_path: String, reason: String) -> void:
 		_log("Keeping in-editor changes to '%s'; checkout will be retried on save." % res_path)
 	else:
 		_log("Discarding the in-editor change to '%s' and reloading from disk..." % res_path)
-		_reload_path(res_path)
-		_declined_this_session[res_path] = true
+		if not await _reload_path(res_path):
+			_declined_this_session[res_path] = true
 
 
 # ---------------------------------------------------------------------------
@@ -1280,6 +1296,11 @@ func _collect_shader_files(dir: EditorFileSystemDirectory, out: Array) -> void:
 
 func _on_filesystem_changed() -> void:
 	_shader_files_dirty = true
+	# Godot rescans the project on focus-in, so this usually lands within a
+	# frame of the focus notification; the throttle collapses the pair into
+	# one scan. It also fires on its own, for files that changed while Godot
+	# was already in front.
+	_scan_for_external_changes("Godot's filesystem scan reported changes")
 
 
 func _finish_prewrite_pass() -> void:
@@ -2174,6 +2195,13 @@ func _build_dock() -> void:
 	auto_open_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(auto_open_checkbox)
 
+	detect_external_checkbox = CheckBox.new()
+	detect_external_checkbox.text = "Detect external changes"
+	detect_external_checkbox.tooltip_text = "When Godot regains focus, look for files changed by other programs (Photoshop, Blender, a text editor) and offer to check them out."
+	detect_external_checkbox.button_pressed = true
+	detect_external_checkbox.toggled.connect(_on_setting_toggled)
+	settings_row.add_child(detect_external_checkbox)
+
 	_build_tree()
 
 	# The log lives in its own on-demand Window rather than eating dock space -
@@ -2215,7 +2243,7 @@ func _add_toolbar_button(parent: Control, icon_name: String, text: String,
 	return button
 
 
-## The gear menu fronting the four setting checkboxes. Checkable popup items
+## The gear menu fronting the setting checkboxes. Checkable popup items
 ## sync from the checkboxes on open and toggle them on click, so the existing
 ## persistence (_on_setting_toggled) and every reader stay untouched.
 func _build_settings_menu(parent: Control) -> void:
@@ -2232,11 +2260,13 @@ func _build_settings_menu(parent: Control) -> void:
 	popup.add_check_item("Checkout on edit", 0)
 	popup.add_check_item("Checkout on save", 1)
 	popup.add_check_item("Auto add/edit/delete", 2)
-	popup.add_check_item("Verbose log", 3)
+	popup.add_check_item("Detect external changes", 3)
+	popup.add_check_item("Verbose log", 4)
 	popup.set_item_tooltip(0, "Offer to check out a file the moment it is first modified in the editor.")
 	popup.set_item_tooltip(1, "Automatically check out edited files right before the editor writes them.")
 	popup.set_item_tooltip(2, "Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs.")
-	popup.set_item_tooltip(3, "Log read-only status probes too, not just state-changing commands.")
+	popup.set_item_tooltip(3, "When Godot regains focus, look for files changed by other programs and offer to check them out.")
+	popup.set_item_tooltip(4, "Log read-only status probes too, not just state-changing commands.")
 	popup.about_to_popup.connect(_sync_settings_menu)
 	popup.id_pressed.connect(_on_settings_menu_id_pressed)
 	parent.add_child(settings_menu)
@@ -2247,13 +2277,14 @@ func _settings_menu_checkbox(id: int) -> CheckBox:
 		0: return auto_checkout_checkbox
 		1: return checkout_on_save_checkbox
 		2: return auto_open_checkbox
-		3: return verbose_log_checkbox
+		3: return detect_external_checkbox
+		4: return verbose_log_checkbox
 	return null
 
 
 func _sync_settings_menu() -> void:
 	var popup := settings_menu.get_popup()
-	for id in 4:
+	for id in 5:
 		var cb := _settings_menu_checkbox(id)
 		popup.set_item_checked(popup.get_item_index(id), cb != null and cb.button_pressed)
 
@@ -3255,7 +3286,7 @@ func _refresh_changelists() -> void:
 			if tree == null or _shutting_down:
 				break
 			_rebuild_tree(model)
-			_fold_opened_into_cache(model)
+			_sync_opened_cache(model)
 		if not _refresh_pending:
 			break
 	_refresh_inflight = false
@@ -3269,14 +3300,24 @@ func _set_actions_enabled(enabled: bool) -> void:
 			b.disabled = not enabled
 
 
-## Every file Perforce reports as opened is, by definition, checked out by us -
-## fold them into the session cache so a refresh right after a reconcile (or any
-## external checkout) suppresses redundant edit-time prompts. Additive only;
-## removal stays with the explicit revert paths.
-func _fold_opened_into_cache(model: Dictionary) -> void:
+## `p4 opened` is the truth about what this workspace has checked out, so a
+## successful refresh REPLACES the session cache with it instead of adding to
+## it. Growing it only - what earlier versions did - meant a submit or a
+## revert done anywhere else (P4V, a terminal, a teammate's script) left the
+## file marked checked out here for the rest of the session, and every later
+## edit to it was silently ignored.
+##
+## A refresh racing a checkout can drop an entry that is really open. That
+## costs one fstat on the next edit to the file, which re-adds it; keeping a
+## stale entry instead loses a checkout, which is the worse trade.
+func _sync_opened_cache(model: Dictionary) -> void:
+	if not model.get("opened_ok", false):
+		return # The query failed - keep what we know rather than forget it.
+	var opened_now: Dictionary = {}
 	for cl in model.get("changelists", []):
 		for f in cl.files:
-			_checked_out_this_session[f.res_path] = true
+			opened_now[f.res_path] = true
+	_checked_out_this_session = opened_now
 
 
 # ---------------------------------------------------------------------------
@@ -3352,7 +3393,7 @@ func _revert_path(res_path: String) -> void:
 		return
 	await _p4_exec_logged(["revert", ProjectSettings.globalize_path(res_path)])
 	_checked_out_this_session.erase(res_path)
-	_reload_path(res_path)
+	await _reload_path(res_path)
 
 
 ## Sync res_path to the head revision and reload it from disk. Shared by the
@@ -3375,7 +3416,7 @@ func _sync_path(res_path: String) -> void:
 			"editor.\n\nReload it now? Unsaved changes to it in the editor will be lost.") % res_path,
 			"Reload", "Keep Editor Version")
 	if reload:
-		_reload_path(res_path)
+		await _reload_path(res_path)
 	else:
 		_log("Kept the editor's version of '%s' - saving it would overwrite the synced revision." % res_path)
 
@@ -3402,7 +3443,7 @@ func _reload_path_confirmed(res_path: String) -> void:
 	if not proceed:
 		_log("Reload of '%s' cancelled." % res_path)
 		return
-	_reload_path(res_path)
+	await _reload_path(res_path)
 
 
 # ---------------------------------------------------------------------------
@@ -3476,6 +3517,155 @@ func _reconcile_flow() -> void:
 		return
 	await _p4_exec_logged(["reconcile", _project_scope()])
 	_request_refresh()
+
+
+# ---------------------------------------------------------------------------
+# Detecting changes made outside Godot
+#
+# Textures, models and audio get edited in Photoshop, Blender and Audition -
+# tools that know nothing about Perforce. Those files land in the workspace
+# already changed, and in a read-only workspace the other tool couldn't even
+# write them without someone checking them out first. Nothing inside Godot
+# fires for that, so the plugin looks for itself: when Godot comes back to the
+# front, and when Godot's own filesystem scan reports changes, run the same
+# non-mutating `reconcile -n` preview the Reconcile button uses and offer to
+# open whatever it found.
+#
+# The scan runs on the worker thread like every other p4 command. It is
+# single-flighted and throttled, because focus-in and filesystem_changed
+# normally arrive within a frame of each other.
+# ---------------------------------------------------------------------------
+
+## The scan is a full reconcile preview of the project, so it costs real work
+## on a large workspace. One every few seconds is plenty for "the user just
+## alt-tabbed back".
+const EXTERNAL_SCAN_MIN_INTERVAL_MSEC := 5000
+## Above this many changes the message also points at .p4ignore - a count this
+## high usually means Godot's own generated files are being reported.
+const EXTERNAL_SCAN_IGNORE_HINT_COUNT := 50
+
+var _external_scan_inflight: bool = false
+var _external_scan_last_msec: int = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
+## The set of changes the user last answered "Not Now" to, so the same set
+## doesn't ask again on every alt-tab. Cleared as soon as the set changes.
+var _external_scan_dismissed: String = ""
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_IN:
+		_scan_for_external_changes("Godot regained focus")
+
+
+func _detect_external_changes() -> bool:
+	return detect_external_checkbox != null and detect_external_checkbox.button_pressed
+
+
+## Look for files changed outside Godot and offer to open them. Silent when
+## there's nothing to report. `reason` shows only in the verbose log.
+func _scan_for_external_changes(reason: String) -> void:
+	if not _detect_external_changes() or _shutting_down or _external_scan_inflight:
+		return
+	if _identity_checked and not _p4_available:
+		return # p4 was unavailable at startup - the plugin is inert.
+	if _server_unreachable():
+		return # The breaker is open; don't spend another timeout on a scan.
+	var now := Time.get_ticks_msec()
+	if now - _external_scan_last_msec < EXTERNAL_SCAN_MIN_INTERVAL_MSEC:
+		return
+	_external_scan_inflight = true
+	await _scan_for_external_changes_inner(reason)
+	# Time from the END of the scan, so a slow one can't immediately re-fire.
+	_external_scan_last_msec = Time.get_ticks_msec()
+	_external_scan_inflight = false
+
+
+func _scan_for_external_changes_inner(reason: String) -> void:
+	if not await _ensure_identity():
+		return
+	if _verbose_log:
+		_log("Scanning for changes made outside Godot (%s)..." % reason)
+	var preview := await _reconcile_preview()
+	# `reconcile`'s clientFile is the raw local path (only depotFile comes back
+	# escaped), which is exactly what the reconcile below needs.
+	var locals: Array = []
+	var names: Array = []
+	for rec in preview:
+		var local := String(rec.get("clientFile", ""))
+		if local.is_empty():
+			continue
+		locals.append(local)
+		var res := _local_to_res(local)
+		names.append(res if not res.is_empty() else local)
+	await _offer_external_changes(locals, names)
+
+
+## Ask about a set of externally changed files and open the ones the user
+## agreed to. Split out from the scan so the decision - including "don't ask
+## about this same set again" - can be exercised on a known list.
+func _offer_external_changes(locals: Array, names: Array) -> void:
+	if names.is_empty():
+		_external_scan_dismissed = ""
+		return
+
+	names.sort()
+	var signature := "\n".join(PackedStringArray(names))
+	if signature == _external_scan_dismissed:
+		return # Already asked about exactly this set and was told no.
+	_external_scan_dismissed = ""
+
+	if _auto_open():
+		_log("%d file(s) changed outside Godot - opening them in Perforce." % names.size())
+		await _open_external_changes(locals, names)
+		return
+
+	var hint := ""
+	if names.size() > EXTERNAL_SCAN_IGNORE_HINT_COUNT:
+		hint = ("\n\nThat's a lot of files. If they include ones Godot generates, add " +
+				"`.godot/` and `*.tmp` to the project's .p4ignore.")
+	var proceed: bool = await _show_confirm_dialog(
+			("%d file(s) changed outside Godot:\n\n%s\n\nCheck them out in Perforce now? " +
+			"Your files on disk are not modified.%s") % [names.size(), _file_listing(names), hint],
+			"Check Out", "Not Now")
+	if not proceed:
+		_external_scan_dismissed = signature
+		_log("Left %d externally changed file(s) unopened." % names.size())
+		return
+	await _open_external_changes(locals, names)
+
+
+## Open exactly the files the scan reported, naming each one on the command
+## line rather than re-running reconcile over the whole project: a second scan
+## would also open anything that changed while the dialog was up, which the
+## user never saw and never agreed to. Long lists go out in batches so the
+## command line can't overflow.
+##
+## Anything Perforce refused is reported. The usual refusal is a `+l`
+## (exclusive-lock) file another user has open: the change is already on disk,
+## but it can never be submitted until they let go, so say so now instead of
+## letting the user find out at submit time.
+func _open_external_changes(locals: Array, names: Array) -> void:
+	const BATCH := 100
+	var blocked: Array = []
+	var start := 0
+	while start < locals.size():
+		var args: PackedStringArray = ["reconcile"]
+		for local in locals.slice(start, start + BATCH):
+			args.append(String(local))
+		var result: Dictionary = await _p4_exec_logged(args)
+		for line in result.get("output", []):
+			var text := String(line)
+			if text.contains("exclusive file already opened") or text.contains("can't edit") \
+					or text.contains("can't add") or text.contains("can't delete"):
+				blocked.append(text.strip_edges())
+		start += BATCH
+	_request_refresh()
+	if blocked.is_empty():
+		return
+	await _show_alert(("Perforce would not open %d of the %d changed file(s):\n\n%s\n\n" +
+			"A file locked with the `+l` filetype can only be open for edit by one " +
+			"person at a time. Your change is on disk, but it can't be submitted until " +
+			"the other user submits, shelves, or reverts theirs.")
+			% [blocked.size(), names.size(), _file_listing(blocked)])
 
 
 func _on_revert_unchanged_pressed() -> void:
@@ -4035,17 +4225,21 @@ func _format_other_opens(others: Array) -> String:
 
 ## Snapshot the pending changelists and the files opened in each, mapped back to
 ## res:// paths. Returns:
-##   {available: bool, changelists: Array}
+##   {available: bool, opened_ok: bool, changelists: Array}
+## `opened_ok` says the `p4 opened` query itself succeeded (it exits 0 with an
+## empty list when nothing is open), which is what lets _sync_opened_cache
+## tell "nothing is checked out" from "we couldn't ask".
 ## each changelist: {change: "default"|"<n>", desc: String, files: Array}
 ## each file:       {res_path, depot_path, action, change, type}
 ## The default changelist is synthesized (p4 never lists it) and always present,
 ## even empty, so newly-opened files always have a home in the tree.
 func _query_pending_model() -> Dictionary:
 	if not await _ensure_identity():
-		return {"available": false, "changelists": []}
+		return {"available": false, "opened_ok": false, "changelists": []}
 
 	# 1. Files opened in our client (across all its pending changelists).
-	var opened := _parse_ztag(await _p4_exec(["-ztag", "opened"]))
+	var opened_result: Dictionary = await _p4_exec(["-ztag", "opened"])
+	var opened := _parse_ztag(opened_result)
 
 	# 2. Map each opened depotFile to a local path. `opened`'s clientFile is
 	#    CLIENT syntax (//workspace/...), not a filesystem path - `p4 where`'s
@@ -4106,7 +4300,11 @@ func _query_pending_model() -> Dictionary:
 			"type": String(rec.get("type", "")),
 		})
 
-	return {"available": true, "changelists": cls}
+	return {
+		"available": true,
+		"opened_ok": int(opened_result.get("exit_code", 1)) == 0,
+		"changelists": cls,
+	}
 
 
 ## Map a local OS path (from `p4 where`'s `path`) to a res:// path, or "" if the
@@ -4809,14 +5007,21 @@ func _on_confirm_dialog_canceled() -> void:
 # ---------------------------------------------------------------------------
 
 ## Reloads res_path from disk, discarding any in-editor unsaved changes.
-func _reload_path(res_path: String) -> void:
+## Returns true when the editor's copy of the file demonstrably matches disk
+## again - callers use that to decide whether they still have to suppress
+## checkout prompts for the file.
+func _reload_path(res_path: String) -> bool:
 	# reload_scene_from_path() internally calls EditorUndoRedoManager.
 	# clear_history(), which emits history_changed - suppress our own handler
 	# so the reload can't re-trigger the prompt it was just declining. Cleared
 	# on a deferred call so same-frame/deferred emissions are covered too.
 	_suppress_auto_checkout = true
 	call_deferred("_clear_auto_checkout_suppression")
+	# Reopening a script tab re-fills its CodeEdit, which emits text_changed.
+	# Our own reload must not read as a user edit.
+	_reloading_paths[res_path] = true
 
+	var ok := false
 	var ext := res_path.get_extension().to_lower()
 	if ext == "tscn" or ext == "scn":
 		if res_path in EditorInterface.get_open_scenes():
@@ -4824,22 +5029,86 @@ func _reload_path(res_path: String) -> void:
 			EditorInterface.reload_scene_from_path(res_path)
 		else:
 			_log("'%s' isn't open in a tab - nothing to reload." % res_path)
+		ok = true
 	elif ext == "gd" or ext == "cs":
-		# close_file() is the only scriptable way to force-discard an unsaved
-		# script buffer (reload_open_files() only reloads on an on-disk mtime
-		# change, which a declined checkout never causes). Costs the tab.
-		_log("Closing and discarding unsaved changes to script '%s'..." % res_path)
-		EditorInterface.get_script_editor().close_file(res_path)
+		ok = await _reload_script(res_path)
 	else:
 		_log("Reloading resource '%s' from disk..." % res_path)
 		var reloaded := ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_REPLACE)
 		if reloaded:
 			EditorInterface.edit_resource(reloaded)
+		ok = reloaded != null
 	_checked_out_this_session.erase(res_path)
 	_declined_this_session.erase(res_path)
 	_pending_save_checkout.erase(res_path)
+	# Let the editor finish rebuilding the scene/tab before we stop ignoring
+	# its edit signals - reopening a script tab refills its CodeEdit, which
+	# looks exactly like typing.
+	await _settle_frames(2)
+	_reloading_paths.erase(res_path)
 	# Revert/sync/reload all change what's opened - reflect it in the tree.
 	_request_refresh()
+	return ok
+
+
+## Put a script back to its on-disk contents. Two copies have to be replaced,
+## not one. Godot keeps the edited source in the cached Script resource as
+## well as in the open tab, so reverting in Perforce and closing the tab isn't
+## enough: reopening the file serves the cached resource and the discarded
+## edit comes back.
+##
+## CACHE_MODE_IGNORE is the only load mode that re-reads a script from disk -
+## plain load() and CACHE_MODE_REPLACE both hand back the cached source
+## (measured on Godot 4.7). It refreshes the cached resource in place, so
+## every reference to the script sees the depot text. The tab is then closed
+## and reopened on that refreshed resource, which is what puts the depot text
+## in front of the user. reload_open_files() can't do this job: it skips any
+## script whose on-disk modification time matches what it last recorded.
+func _reload_script(res_path: String) -> bool:
+	var script_editor := EditorInterface.get_script_editor()
+	var was_open := false
+	for s in script_editor.get_open_scripts():
+		if (s as Script).resource_path == res_path:
+			was_open = true
+			break
+	# Keep the user's place in the file across the close/reopen.
+	var caret := 0
+	var current := script_editor.get_current_script()
+	if current != null and current.resource_path == res_path:
+		var code := _current_script_code_edit()
+		if code:
+			caret = code.get_caret_line()
+
+	var fresh := ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_IGNORE) as Script
+	if fresh == null:
+		_log("Couldn't re-read '%s' from disk - the editor may still show the old contents." % res_path)
+		return false
+	if not was_open:
+		_log("Re-read '%s' from disk." % res_path)
+		return true
+
+	_log("Reloading script '%s' from disk..." % res_path)
+	script_editor.close_file(res_path)
+	EditorInterface.edit_script(fresh)
+	await _settle_frames(2)
+	if caret > 0:
+		var code := _current_script_code_edit()
+		if code and caret < code.get_line_count():
+			code.set_caret_line(caret)
+	return true
+
+
+## The CodeEdit behind the script tab that's in front, or null.
+func _current_script_code_edit() -> CodeEdit:
+	var base := EditorInterface.get_script_editor().get_current_editor()
+	if base == null:
+		return null
+	return base.get_base_editor() as CodeEdit
+
+
+func _settle_frames(count: int) -> void:
+	for _i in count:
+		await get_tree().process_frame
 
 
 func _clear_auto_checkout_suppression() -> void:
@@ -5970,6 +6239,198 @@ func _run_cli_self_test_if_requested() -> void:
 					and untouched and checked_out else "FAIL"))
 			get_tree().quit()
 			return
+		if arg.begins_with("--p4-selftest-script-revert="):
+			# Live: reverting a script has to put the DEPOT text back in front
+			# of the user. Godot holds the edited source in the cached Script
+			# resource as well as in the open tab, so a reload that only
+			# closes the tab hands the edit straight back the moment the file
+			# is reopened.
+			#
+			# This has to run against a real `p4 revert`, not a simulated one.
+			# Restoring the file with FileAccess moves its modification time
+			# FORWARD, and Godot then reloads the script by itself, which
+			# hides the bug. Perforce restores the depot file's own modtime,
+			# which is older than the edit - Godot sees nothing to reload, and
+			# the stale cached resource is what the user gets.
+			# Self-cleaning: the revert is the cleanup.
+			var path := arg.substr("--p4-selftest-script-revert=".length())
+			var global := ProjectSettings.globalize_path(path)
+			var marker := "# p4godot selftest edit"
+			_selftest_auto_answer = "confirm"
+			await _do_checkout(path)
+			var original := FileAccess.get_file_as_string(global)
+			var scr := ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE) as Script
+			EditorInterface.edit_script(scr)
+			await _settle_frames(2)
+			# Edit it the way the editor does: the tab's text and the cached
+			# resource both carry the change, and a save puts it on disk.
+			var edited := original + "\n" + marker + "\n"
+			scr.source_code = edited
+			var typed := _current_script_code_edit()
+			if typed:
+				typed.text = edited
+			var f := FileAccess.open(global, FileAccess.WRITE)
+			f.store_string(edited)
+			f.close()
+			await _selftest_drain_frames()
+			var dirty_before: bool = (ResourceLoader.load(path) as Script).source_code.contains(marker)
+
+			# What _revert_path does, with a sample taken in between: whether
+			# the cached resource is still dirty once Perforce has put the
+			# depot file back is the whole question the fix turns on.
+			await _p4_exec_logged(["revert", global])
+			_checked_out_this_session.erase(path)
+			var cached_dirty_at_reload: bool = (ResourceLoader.load(path) as Script).source_code.contains(marker)
+			_log("[selftest] cached still dirty when the reload starts: %s" % cached_dirty_at_reload)
+			await _reload_path(path)
+
+			var disk_clean: bool = not FileAccess.get_file_as_string(global).contains(marker)
+			var cached_clean: bool = not (ResourceLoader.load(path) as Script).source_code.contains(marker)
+			var still_open := false
+			for s in EditorInterface.get_script_editor().get_open_scripts():
+				if (s as Script).resource_path == path:
+					still_open = true
+			var shown := _current_script_code_edit()
+			var tab_clean: bool = shown != null and not shown.text.contains(marker)
+			_log("[selftest] dirty before revert=%s; disk clean=%s; cached clean=%s; tab still open=%s; tab clean=%s"
+					% [dirty_before, disk_clean, cached_clean, still_open, tab_clean])
+
+			# Second case, and the one only the CACHE_MODE_IGNORE load can
+			# cover: the script has no tab open when the revert happens. There
+			# is nothing to close and reopen, so if the cached resource isn't
+			# re-read, the edit is still sitting there waiting to be served
+			# the next time the user opens the file.
+			await _do_checkout(path)
+			var f2 := FileAccess.open(global, FileAccess.WRITE)
+			f2.store_string(edited)
+			f2.close()
+			(ResourceLoader.load(path) as Script).source_code = edited
+			EditorInterface.get_script_editor().close_file(path)
+			await _settle_frames(2)
+			var closed: bool = not _is_open_in_editor(path)
+			await _p4_exec_logged(["revert", global])
+			_checked_out_this_session.erase(path)
+			await _reload_path(path)
+			var closed_cached_clean: bool = not (ResourceLoader.load(path) as Script).source_code.contains(marker)
+			_log("[selftest] with no tab open: closed=%s cached clean after reload=%s"
+					% [closed, closed_cached_clean])
+
+			var ok: bool = dirty_before and disk_clean and cached_clean and still_open \
+					and tab_clean and closed and closed_cached_clean
+			_log("[selftest] %s: script-revert" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-decline-reprompt="):
+			# Live: declining a checkout must not turn checkout off for the
+			# rest of the session. The decline reloads the file from disk, so
+			# the NEXT edit is a genuinely new one and has to prompt again.
+			# Leaves the scene opened - revert afterwards.
+			var path := arg.substr("--p4-selftest-decline-reprompt=".length())
+			var global := ProjectSettings.globalize_path(path)
+			auto_checkout_checkbox.set_pressed_no_signal(true)
+			_selftest_auto_answer = "cancel"
+			await _selftest_simulate_edit(path)
+			await _selftest_drain_frames()
+			var opened_after_decline := not await _needs_checkout(global)
+			var suppressed := _declined_this_session.has(path)
+			# A second edit, accepted this time. Reaching the prompt at all is
+			# what's under test; the checkout is how we observe it.
+			#
+			# It has to land in the SAME tab, with no reopen: opening the
+			# scene again would hand the editor a fresh undo history, which
+			# hides a stale recorded version (the reload resets the version to
+			# 1, so a version left on record from before the reload is a
+			# number later edits can never reach).
+			_selftest_auto_answer = "confirm"
+			var root := EditorInterface.get_edited_scene_root()
+			var root_path := "<none>" if root == null else root.get_scene_file_path()
+			if root != null:
+				var ur2 := get_undo_redo()
+				ur2.create_action("[P4 selftest] second edit, same tab")
+				ur2.add_do_method(root, "set_meta", "_p4_selftest_2", true)
+				ur2.add_undo_method(root, "remove_meta", "_p4_selftest_2")
+				ur2.commit_action()
+			await _selftest_drain_frames()
+			var opened_after_second := not await _needs_checkout(global)
+			_log("[selftest] after decline: opened=%s suppressed=%s; second edit in tab '%s': opened=%s"
+					% [opened_after_decline, suppressed, root_path, opened_after_second])
+			var ok: bool = not opened_after_decline and not suppressed and opened_after_second
+			_log("[selftest] %s: decline-reprompt" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-opened-cache="):
+			# Live: the session's "already checked out" cache is rebuilt from
+			# `p4 opened` on every refresh, so a submit or revert made outside
+			# Godot can't leave a file marked checked out here for the rest of
+			# the session (which would make later edits to it silently skip
+			# the checkout). Leaves the file opened - revert afterwards.
+			var path := arg.substr("--p4-selftest-opened-cache=".length())
+			_selftest_auto_answer = "confirm"
+			await _do_checkout(path)
+			await _selftest_drain_frames()
+			# A file someone else reverted or submitted, still on record here.
+			_checked_out_this_session["res://a_file_reverted_elsewhere.tscn"] = true
+			_refresh_changelists()
+			await _selftest_drain_frames()
+			var stale_dropped: bool = not _checked_out_this_session.has("res://a_file_reverted_elsewhere.tscn")
+			var real_kept: bool = _checked_out_this_session.has(path)
+			_log("[selftest] stale entry dropped=%s; really-open entry kept=%s (cache holds %d)"
+					% [stale_dropped, real_kept, _checked_out_this_session.size()])
+			_log("[selftest] %s: opened-cache" % ("PASS" if stale_dropped and real_kept else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-external-scan":
+			# Live: a file another program dropped into the workspace must be
+			# found by the focus-in scan and offered for checkout, and a set
+			# the user declined must not ask again. Self-cleaning: it adds its
+			# own scratch file, then reverts and deletes it.
+			var rel := "res://p4godot_external_%d.txt" % Time.get_unix_time_from_system()
+			var global := ProjectSettings.globalize_path(rel)
+			var f := FileAccess.open(rel, FileAccess.WRITE)
+			f.store_string("written by a program that knows nothing about Perforce\n")
+			f.close()
+			detect_external_checkbox.set_pressed_no_signal(true)
+			auto_open_checkbox.set_pressed_no_signal(false)
+
+			# The scan reconciles everything it finds, and this workspace can
+			# hold unrelated changes - narrow it to our own file.
+			var preview := await _reconcile_preview()
+			var found := false
+			for rec in preview:
+				if _local_to_res(String(rec.get("clientFile", ""))) == rel:
+					found = true
+			_log("[selftest] reconcile preview saw the new file: %s" % found)
+
+			# Decline once: the file stays unopened and the set is remembered,
+			# so the same set can't ask again on every alt-tab.
+			_selftest_auto_answer = "cancel"
+			await _offer_external_changes([global], [rel])
+			await _selftest_drain_frames()
+			var opened_after_decline := not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
+			var remembered := not _external_scan_dismissed.is_empty()
+
+			# Asked again with the identical set: the dialog must not reappear,
+			# so even a "confirm" answer leaves the file unopened.
+			_selftest_auto_answer = "confirm"
+			await _offer_external_changes([global], [rel])
+			await _selftest_drain_frames()
+			var silent_on_repeat := not not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
+
+			# A fresh set does ask, and accepting opens the file for add.
+			_external_scan_dismissed = ""
+			await _offer_external_changes([global], [rel])
+			await _selftest_drain_frames()
+			var opened := not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
+
+			await _p4_exec_logged(["revert", global])
+			DirAccess.remove_absolute(global)
+			_log("[selftest] preview-found=%s opened-after-decline=%s remembered=%s silent-on-repeat=%s opened-after-accept=%s"
+					% [found, opened_after_decline, remembered, silent_on_repeat, opened])
+			var ok: bool = found and not opened_after_decline and remembered \
+					and silent_on_repeat and opened
+			_log("[selftest] %s: external-scan" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
 		if arg.begins_with("--p4-selftest-history-gate="):
 			# Live: a history_changed with no edit (clear_history, as a tab switch
 			# does) must NOT check the scene out; a real commit_action must.
@@ -6016,7 +6477,7 @@ func _run_cli_self_test_if_requested() -> void:
 		elif arg.begins_with("--p4-selftest-reload="):
 			var path := arg.substr("--p4-selftest-reload=".length())
 			_log("[selftest] Forcing reload-from-disk of '%s'" % path)
-			_reload_path(path)
+			await _reload_path(path)
 			get_tree().quit()
 			return
 		elif arg.begins_with("--p4-selftest-simulate-edit="):
