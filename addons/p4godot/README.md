@@ -24,10 +24,17 @@ misbehaves.
 
 ## Quick start
 
-You need a Perforce server and an account on it. P4Godot connects to an
-existing server and doesn't include one. Get the server address (for example
-`ssl:perforce.example.com:1666`), your user name, and your password from
-whoever runs it. Setting up your own? Do that first, then come back.
+Before you start, you need:
+
+- **Godot 4.7 or later.**
+- **A Perforce server and an account on it.** P4Godot connects to a server
+  that already exists; it doesn't include one. Ask whoever runs it for the
+  server address (something like `ssl:perforce.example.com:1666`), your user
+  name, and your password. Don't have a server? Perforce is
+  [free for up to five users](https://www.perforce.com/products/helix-core) —
+  set that up first, then come back.
+- **A Godot project inside a Perforce workspace folder**, or the willingness
+  to put one there. Step 4 explains what a workspace is.
 
 1. **Install the `p4` command-line client.** To check whether you already
    have it, run `p4 -V` in a terminal. If it prints a version, skip this step.
@@ -41,25 +48,51 @@ whoever runs it. Setting up your own? Do that first, then come back.
    zips. It contains an `addons` folder. Copy that folder into your project
    folder, next to `project.godot`, merging it with any `addons` folder you
    already have.
-3. **Enable it.** Godot saves the list of enabled plugins in
-   `project.godot`, which is read-only until you check it out. So first check
-   out `project.godot`: in P4V, right-click it → **Check Out**, or run
-   `p4 edit project.godot`. Then in Godot, open **Project → Project Settings →
-   Plugins** and tick **P4Godot**.
-4. **Connect.** The **P4G** dock appears at the bottom of the editor.
-   P4Godot needs a *workspace*, Perforce's link between folders on the server
-   and a folder on your disk, whose folder contains this project. If the
-   `p4` command line already knows it (from `p4 set` or a `P4CONFIG` file),
-   P4Godot connects by itself. If you've only used P4V, you'll probably be
-   asked to pick the workspace. Setup asks only for what's missing: the
-   server address, your password, or the workspace.
-5. **Share it with your team.** Press **Reconcile** in the P4G dock to open
-   the new `addons/p4godot/` files for add, then submit them together with
-   `project.godot`.
+3. **Enable it.** In Godot, open **Project → Project Settings → Plugins**
+   and tick **P4Godot**.
+   *You should see* a new **P4G** tab at the bottom of the editor.
+   Godot records enabled plugins in `project.godot`. If that file is already
+   in Perforce and Godot says it can't write it, check it out first — in P4V,
+   right-click it → **Check Out**, or run `p4 edit project.godot` — then tick
+   the box again.
+4. **Connect.** P4Godot needs a *workspace*: Perforce's link between a folder
+   on the server and a folder on your disk. The one you want is whichever
+   workspace folder contains this project. If the `p4` command line already
+   knows it, P4Godot connects by itself; if you've only ever used P4V, it
+   asks you to pick. It asks only for what's missing — the server address,
+   your password, or the workspace.
+   *You should see* your user name and workspace in the P4G toolbar.
+5. **Tell Perforce what to ignore — before your first submit.** Godot keeps
+   a `.godot/` cache folder that every machine rebuilds for itself, and it
+   must stay out of the depot. Save this as `.p4ignore` in your project
+   folder:
+
+   ```
+   # Godot's local cache and per-user editor state
+   .godot/
+   # Temporary files from interrupted saves
+   *.tmp
+   ```
+
+   Then run `p4 ignores -i .godot/x` in that folder. It should print a line
+   ending in `ignored`. If it says `not ignored`, run
+   `p4 set P4IGNORE=.p4ignore` and try again. Skip this and your next submit
+   pushes thousands of cache files to the server.
+   [More on setting up a project →](#setting-up-a-godot-project-in-perforce)
+6. **Share the plugin with your team.** Press **Reconcile** in the P4G dock
+   to open the new `addons/p4godot/` files for add, then submit them together
+   with `project.godot`. This matters —
+   [here's why](#keep-the-plugin-itself-in-perforce).
 
 Now edit a scene or script that's already in Perforce. P4Godot offers to
 check it out the moment you change it. Files not yet in Perforce get no
 prompt: add them with Reconcile.
+
+**Getting your teammates' work.** P4Godot syncs one file at a time
+(right-click → **P4: Get Latest (Sync)**). It has no whole-project "get
+latest" yet, so use P4V's **Get Latest Revision** on the project folder, or
+run `p4 sync` in a terminal. Restart Godot afterwards if scenes or scripts
+changed.
 
 ## Keep the plugin itself in Perforce
 
