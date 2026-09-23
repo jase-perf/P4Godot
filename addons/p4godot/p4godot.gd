@@ -68,6 +68,13 @@ extends EditorPlugin
 
 const SETTINGS_SECTION := "p4godot"
 
+## Shown wherever an action needs Perforce and there's no connection. One
+## constant because six copies of it drifted apart.
+const NOT_CONNECTED_MESSAGE := ("Godot isn't connected to Perforce, so it can't do " +
+		"this.\n\nOpen the P4G panel - normally at the bottom of the editor - and press " +
+		"the circular-arrow Refresh button. It walks you through connecting. The \"Log\" " +
+		"button in that panel shows what went wrong.")
+
 # A light P4 brand accent over Godot's native theme (from the Perforce Force UI
 # palette). The dock otherwise uses editor theme colors/icons so it reads native.
 const P4_ACCENT := Color("00cfff") # cyan - tints the changelist icons
@@ -760,7 +767,9 @@ func _login_flow() -> bool:
 				_override_user = String(ures.text).strip_edges()
 				who = _override_user
 				continue
-		await _show_alert("Login failed:\n\n%s" % msg)
+		await _show_alert(("Perforce didn't accept that:\n\n%s\n\nYou can try again in a " +
+				"moment. If it keeps failing, ask whoever runs your Perforce server to " +
+				"reset your password.") % msg)
 	return false # unreachable; while-true exits via return
 
 
@@ -1074,7 +1083,11 @@ func _prompt_then_checkout(res_path: String) -> void:
 	_log("'%s' isn't checked out - prompting..." % res_path)
 	var choices: Array = await _pending_changelist_choices()
 	var picked: Dictionary = await _show_checkout_target_dialog(
-			"'%s' isn't checked out of Perforce yet.\n\nCheck it out now so your change can be saved?" % res_path,
+			("Check out '%s'?\n\nChecking out tells Perforce you're editing this file. " +
+			"Godot can't save it until you do, and your team can see it's in use.\n\n" +
+			"If you don't, the file is reloaded from disk and any unsaved edits to it " +
+			"are lost - for a scene, that's all of its unsaved edits, not just this one.")
+					% res_path,
 			"Check Out", "Discard My Changes", choices)
 	if picked.ok:
 		var result: Dictionary = await _do_checkout(res_path, picked.change)
@@ -1101,12 +1114,13 @@ func _prompt_then_checkout(res_path: String) -> void:
 ## lock clears) or discard the change now.
 func _on_edit_checkout_failed(res_path: String, reason: String) -> void:
 	var keep: bool = await _show_confirm_dialog(
-			("Couldn't check out '%s' - %s.\n\n" +
-			"Your change is still in the editor, but it can't be saved until the file " +
-			"becomes available (ask the holder to submit, shelve, or revert it).\n\n" +
-			"Keep your change (checkout will be retried when you save), or discard it " +
-			"and reload the file from disk?") % [res_path, reason],
-			"Keep My Changes", "Discard My Changes")
+			("Perforce won't let you edit '%s' right now - %s.\n\n" +
+			"That usually means a teammate is working on the same file, and only they " +
+			"can change it until they're done. Ask them to send their work to the " +
+			"server or set it aside.\n\n" +
+			"Your edit is still here in Godot. Keep it and Godot will try again each " +
+			"time you save.") % [res_path, reason],
+			"Keep My Edit", "Throw It Away")
 	if keep:
 		# Also stops _handle_edit() from re-prompting on every keystroke.
 		_pending_save_checkout[res_path] = true
@@ -1160,19 +1174,22 @@ func _apply_changes() -> void:
 				_rescue_skip_frame[res_path] = Engine.get_process_frames()
 		if not failures.is_empty():
 			if OS.get_name() == "Windows":
-				_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
-						"Unsaved changes to these files stay in the editor, but the files can't " +
-						"be written until they become available (ask the holder to submit, shelve, " +
-						"or revert them). Checkout is retried automatically on your next save.")
+				_show_alert(("Perforce wouldn't let you edit these files, so Godot couldn't " +
+						"save them:\n\n%s\n\n" +
+						"Your changes are still here in the editor - nothing is lost. The note " +
+						"beside each file says why; most often a teammate is working on it, and " +
+						"you have to wait for them to send their work to the server or set it " +
+						"aside. Godot tries again every time you save.")
 						% "\n".join(failures))
 			else:
 				# macOS/Linux saves replace the file by rename, which a read-only
 				# target doesn't block: the write lands anyway (_scene_saved_probe
 				# and _on_resource_saved then leave the file writable).
-				_show_alert(("Perforce couldn't check out before saving:\n\n%s\n\n" +
-						"The files are saved to disk anyway but are NOT checked out, so " +
-						"Perforce doesn't know about the change yet. Checkout is retried " +
-						"automatically on your next save; Reconcile also picks them up.")
+				_show_alert(("Perforce wouldn't let you edit these files:\n\n%s\n\n" +
+						"Your work IS saved on disk, so nothing is lost - but Perforce doesn't " +
+						"know about it, which means your team won't get it. Godot tries again " +
+						"each time you save. You can also press \"Reconcile...\" in the P4G " +
+						"panel, which finds changed files and tells Perforce about them.")
 						% "\n".join(failures))
 		# Only with checkout-on-save on: the pass ends by checking out whatever
 		# the save changed. With it off, a read-only file's save fails and the
@@ -1401,10 +1418,12 @@ func _finish_prewrite_pass() -> void:
 		# (Its next save retries the checkout via the "saved while not checked
 		# out" path in _scene_saved_probe / _on_resource_saved.)
 		_set_file_writable(global_path, true)
-		_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
-				"Perforce doesn't know about this change yet. The file is left writable " +
-				"so a sync won't overwrite it; checkout is retried on your next save, and " +
-				"Reconcile also picks it up once the file becomes available.")
+		_show_alert(("Godot saved '%s', but Perforce wouldn't record the change - %s.\n\n" +
+				"Your work is safe on your computer. Perforce still doesn't know about " +
+				"it, so your team won't get it yet, and Godot has left the file unlocked " +
+				"so that downloading the latest version can't overwrite what you wrote. " +
+				"Godot tries again each time you save; \"Reconcile...\" in the P4G panel " +
+				"also picks it up once the file is free.")
 				% [res_path, result.reason])
 
 
@@ -1633,10 +1652,11 @@ func _checkout_reimported(global_paths: Array) -> void:
 				% [global_paths.size(), sample])
 		return
 	if global_paths.size() > REIMPORT_CONFIRM_THRESHOLD:
-		var ok: bool = await _show_confirm_dialog(("Godot's reimport changed %d .import files " +
-				"that aren't checked out (this usually follows a Godot upgrade or a change to " +
-				"import defaults).\n\nCheck them out now? If not, they stay writable and " +
-				"Reconcile picks them up later.") % global_paths.size(), "Check Out", "Not Now")
+		var ok: bool = await _show_confirm_dialog(("Godot rewrote the settings files for %d " +
+				"imported assets (this normally happens after a Godot update, or when import " +
+				"settings change).\n\nTell Perforce you changed them? If not, they're left as " +
+				"they are, and the \"Reconcile...\" button in the P4G panel can pick them up " +
+				"later.") % global_paths.size(), "Check Out", "Not Now")
 		if not ok:
 			_log("Left %d changed .import file(s) writable and unopened - Reconcile picks them up." % global_paths.size())
 			return
@@ -1745,10 +1765,12 @@ func _scene_saved_probe(path: String) -> void:
 			_log("'%s' was saved while not checked out - checked it out to keep the changelist accurate." % res_path)
 		else:
 			_set_file_writable(global_path, true)
-			_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
-					"Perforce doesn't know about this change yet. Once the file becomes " +
-					"available, right-click it in the FileSystem dock and choose 'P4: Check Out' (or use Reconcile) so the " +
-					"change lands in a changelist.") % [res_path, result.reason])
+			_show_alert(("Godot saved '%s', but Perforce wouldn't record the change - %s.\n\n" +
+					"Your work is safe on your computer, but Perforce doesn't know about " +
+					"it, so it won't reach your team. Once whoever is using the file lets " +
+					"go of it, right-click the file in the FileSystem dock and choose " +
+					"'P4: Check Out' - or press \"Reconcile...\" in the P4G panel - so the " +
+					"change joins your list of pending changes.") % [res_path, result.reason])
 		return
 
 	if checkout_was_refused_this_save:
@@ -2079,20 +2101,24 @@ func _run_rescue_flow() -> void:
 	var message: String
 	var ok_text: String
 	if paths.size() == 1:
-		message = ("Saving '%s' failed because it isn't checked out of Perforce " +
-				"(the file is read-only).\n\nCheck it out and save again?") % paths[0]
+		message = ("Godot couldn't save '%s'.\n\nPerforce keeps files locked until you " +
+				"tell it you're editing them, and you haven't yet for this one. Tell " +
+				"Perforce now and save again?") % paths[0]
 		ok_text = "Check Out and Save"
 	else:
 		var lines: Array = []
 		for p in paths:
 			lines.append("- '%s'" % p)
-		message = ("These files couldn't be saved because they aren't checked out " +
-				"of Perforce (the files are read-only):\n\n%s\n\nCheck them out and " +
-				"save again?") % "\n".join(lines)
+		message = ("Godot couldn't save these files:\n\n%s\n\nPerforce keeps files " +
+				"locked until you tell it you're editing them, and you haven't yet " +
+				"for these. Tell Perforce now and save them again?") % "\n".join(lines)
 		ok_text = "Check Out All and Save"
 
 	var choices: Array = await _pending_changelist_choices()
-	var picked: Dictionary = await _show_checkout_target_dialog(message, ok_text, "Not Now", choices)
+	# "Leave Unsaved" rather than "Not Now": declining means the work stays on
+	# screen and not on disk, and nothing asks again.
+	var picked: Dictionary = await _show_checkout_target_dialog(message, ok_text,
+			"Leave Unsaved", choices)
 	if not picked.ok:
 		_log("File(s) remain unsaved. Check them out (FileSystem dock 'P4: Check Out', or `p4 edit`) when you're ready.")
 		return
@@ -2108,9 +2134,10 @@ func _run_rescue_flow() -> void:
 			failed_paths.append(res_path)
 			failures.append("- '%s': %s" % [res_path, result.reason])
 	if not failures.is_empty():
-		await _show_alert(("Perforce couldn't check out:\n\n%s\n\n" +
-				"These files stay unsaved until they become available (ask the holder " +
-				"to submit, shelve, or revert them). Save again later to retry.")
+		await _show_alert(("Perforce wouldn't let you edit these files:\n\n%s\n\n" +
+				"They stay unsaved until whoever is using them finishes - ask them to " +
+				"send their work to the server or set it aside. Your changes are still " +
+				"in the editor; save again once the files are free.")
 				% "\n".join(failures))
 	if succeeded.is_empty():
 		return
@@ -2200,10 +2227,12 @@ func _on_resource_saved(res: Resource) -> void:
 		_log("'%s' was saved while not checked out - checked it out to keep the changelist accurate." % res_path)
 	else:
 		_set_file_writable(global_path, true)
-		_show_alert(("'%s' was saved to disk but couldn't be checked out - %s.\n\n" +
-				"Perforce doesn't know about this change yet. Once the file becomes " +
-				"available, right-click it in the FileSystem dock and choose 'P4: Check Out' (or use Reconcile) so the " +
-				"change lands in a changelist.") % [res_path, result.reason])
+		_show_alert(("Godot saved '%s', but Perforce wouldn't record the change - %s.\n\n" +
+				"Your work is safe on your computer, but Perforce doesn't know about it, " +
+				"so it won't reach your team. Once whoever is using the file lets go of " +
+				"it, right-click the file in the FileSystem dock and choose 'P4: Check " +
+				"Out' - or press \"Reconcile...\" in the P4G panel - so the change joins " +
+				"your list of pending changes.") % [res_path, result.reason])
 
 
 # ---------------------------------------------------------------------------
@@ -2672,31 +2701,31 @@ func _on_diff_window_close_requested() -> void:
 ## degenerates into remove-all/add-all.
 func _diff_path(res_path: String) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
+		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	var local_path := ProjectSettings.globalize_path(res_path)
 	var result := await _p4_exec(["diff", "-dul", local_path])
 	var text := "" if result.output.is_empty() else String(result.output[0])
 	if not _diff_has_changes(text):
-		await _show_alert("No differences: '%s' matches the depot revision you have." % res_path)
+		await _show_alert("'%s' is identical to the version you downloaded from the server - there's nothing to compare." % res_path)
 		return
 	if text.contains("files differ"):
-		await _show_alert("'%s' differs from the depot revision you have, but it is a binary file - there is no text diff to show." % res_path)
+		await _show_alert("'%s' is different from the version you downloaded, but it isn't text - it's an image, sound or model - so there's nothing to show side by side." % res_path)
 		return
 	# Revision syntax goes on the depot path from the diff header: it comes back
 	# from p4 already escaped (a local path with @/#/% in it can't carry "#have").
 	var depot_path := _diff_depot_path(text, "")
 	if not depot_path.begins_with("//"):
-		await _show_alert("Couldn't find the depot path of '%s' in the diff - see the P4 Log." % res_path)
+		await _show_alert("Godot couldn't work out where '%s' lives on the Perforce server, so it can't compare the two. Press \"Log\" in the P4G panel to see what Perforce said." % res_path)
 		return
 	var have := await _p4_exec(["print", "-q", depot_path + "#have"])
 	if have.exit_code != 0:
-		await _show_alert("Couldn't fetch the depot revision of '%s' - see the P4 Log." % res_path)
+		await _show_alert("Godot couldn't download the server's copy of '%s' to compare against. Press \"Log\" in the P4G panel to see what Perforce said." % res_path)
 		return
 	var old_text := "" if have.output.is_empty() else String(have.output[0])
 	var f := FileAccess.open(local_path, FileAccess.READ)
 	if f == null:
-		await _show_alert("Couldn't read '%s' from disk." % res_path)
+		await _show_alert("Godot couldn't read '%s' from your computer, so it can't compare it. Check the file still exists and isn't open in another program." % res_path)
 		return
 	var new_text := f.get_as_text()
 	f.close()
@@ -3455,14 +3484,19 @@ func _checkout_path(res_path: String) -> void:
 	else:
 		var result: Dictionary = await _do_checkout(res_path)
 		if not result.ok:
-			_show_alert("Couldn't check out '%s' - %s." % [res_path, result.reason])
+			_show_alert(("Perforce won't let you edit '%s' - %s.\n\nMost often that means a " +
+					"teammate has it. You can keep working, but Godot can't save this file " +
+					"until they're done.") % [res_path, result.reason])
 			return
 	var import_res := res_path + ".import"
 	if FileAccess.file_exists(ProjectSettings.globalize_path(import_res)) \
 			and await _needs_checkout(ProjectSettings.globalize_path(import_res)):
 		var side: Dictionary = await _do_checkout(import_res)
 		if not side.ok:
-			_show_alert("Couldn't check out '%s' - %s." % [import_res, side.reason])
+			_show_alert(("Perforce won't let you edit the import-settings file that goes " +
+					"with this asset ('%s') - %s.\n\nYou can still edit the asset itself, " +
+					"but changes to its import settings can't be saved yet.")
+					% [import_res, side.reason])
 
 
 ## The file selected in the changelist tree (a file row), or "" if none. The
@@ -3486,9 +3520,10 @@ func _get_selected_res_path() -> String:
 ## toolbar "Revert Selected File" button and the tree's per-row context menu.
 func _revert_path(res_path: String) -> void:
 	var proceed: bool = await _show_confirm_dialog(
-			("Revert '%s'?\n\nThis reverts the Perforce checkout AND discards any unsaved " +
-			"changes to this file in the editor, reloading it from disk.") % res_path,
-			"Revert", "Cancel")
+			("Throw away your changes to '%s'?\n\nPerforce puts this file back to the " +
+			"version on the server. Everything you changed is lost - what you saved as " +
+			"well as anything unsaved in the editor - and this can't be undone.") % res_path,
+			"Throw Away My Changes", "Cancel")
 	if not proceed:
 		_log("Revert of '%s' cancelled." % res_path)
 		return
@@ -3513,9 +3548,12 @@ func _sync_path(res_path: String) -> void:
 	EditorInterface.get_resource_filesystem().scan()
 	if not _is_open_in_editor(res_path):
 		return
-	var reload: bool = await _show_confirm_dialog(("Sync updated '%s', which is open in the " +
-			"editor.\n\nReload it now? Unsaved changes to it in the editor will be lost.") % res_path,
-			"Reload", "Keep Editor Version")
+	var reload: bool = await _show_confirm_dialog(("Godot just downloaded a newer version of " +
+			"'%s' from the server, and the file is open in the editor.\n\nShow the new " +
+			"version? Anything you changed but didn't save is lost.\n\nIf you keep what's " +
+			"in the editor instead, saving it later overwrites the version you just " +
+			"downloaded - your teammate's work.") % res_path,
+			"Show New Version", "Keep Editor Version")
 	if reload:
 		await _reload_path(res_path)
 	else:
@@ -3590,7 +3628,7 @@ func _on_reconcile_pressed() -> void:
 
 func _reconcile_flow() -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
+		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", _project_scope()])
 	var found := _summarize_reconcile(_parse_ztag(result))
@@ -3599,7 +3637,7 @@ func _reconcile_flow() -> void:
 		if int(refused.count) > 0:
 			await _show_alert(_refusal_alert_text(refused))
 		else:
-			await _show_alert("Reconcile found nothing to open - the workspace already matches Perforce.")
+			await _show_alert("Nothing to tell Perforce about - every file in this project already matches what Perforce has.")
 		return
 	if not await _confirm_reconcile(found, refused, "Reconcile", "Cancel"):
 		_log("Reconcile cancelled.")
@@ -3648,9 +3686,10 @@ func _confirm_reconcile(found: Dictionary, refused: Dictionary, ok_text: String,
 		cancel_text: String) -> bool:
 	var note := ""
 	if int(found.deletes) > 0:
-		note += ("\n\nThe %d file(s) opened for delete are missing from your workspace. " +
-				"Submitting that removes them from the depot - cancel if you expected " +
-				"them to be there and your sync is incomplete.") % found.deletes
+		note += ("\n\nCAREFUL: %d of these are missing from your project folder, so " +
+				"Perforce will be told to delete them for the whole team the next time " +
+				"you submit. If you expected them to still be there, stop here - you " +
+				"may simply not have downloaded everything yet.") % found.deletes
 	var cache_files: int = _count_godot_cache_paths(found.names)
 	if cache_files > 0:
 		# .godot/ is Godot's per-machine cache and editor state, and P4Godot
@@ -3658,17 +3697,18 @@ func _confirm_reconcile(found: Dictionary, refused: Dictionary, ok_text: String,
 		# Submitting it hands your connection settings to your teammates and
 		# starts a stream of conflicts on files that are rebuilt locally
 		# anyway.
-		note += ("\n\n%d of these are inside `.godot/`, Godot's local cache. It's " +
-				"rebuilt on each machine and holds your own editor state, including " +
-				"this project's Perforce connection settings, so it doesn't belong " +
-				"in the depot. Add `.godot/` to the project's .p4ignore, then run " +
-				"Reconcile again.") % cache_files
+		note += ("\n\n%d of these are inside `.godot/`. That folder is Godot's own " +
+				"scratch space: every machine rebuilds it, and it holds your personal " +
+				"editor settings, so it shouldn't go to the server. Add a line reading " +
+				"`.godot/` to the .p4ignore file in this project, then press " +
+				"\"Reconcile...\" again.") % cache_files
 	if int(refused.count) > 0:
 		note += "\n\nPerforce won't open %d other file(s):\n\n%s" \
 				% [refused.count, _file_listing(refused.lines)]
 	return await _show_confirm_dialog(
-			("%d change(s) on disk - add: %d, edit: %d, delete: %d\n\n%s\n\n" +
-			"Open these in Perforce? Your files on disk are not modified.%s")
+			("Perforce doesn't know about %d file(s) yet:\n%d new, %d changed, %d " +
+			"missing.\n\n%s\n\nTell Perforce about them? This only records what you " +
+			"already did - none of your files are changed, moved or deleted.%s")
 			% [found.names.size(), found.adds, found.edits, found.deletes,
 			_file_listing(found.names), note],
 			ok_text, cancel_text)
@@ -3775,17 +3815,17 @@ func _check_plugin_tracked() -> void:
 	if await _is_in_depot(plugin_dir.path_join("plugin.cfg")):
 		return
 
-	var consequence := ("Godot records the enabled plugins in project.godot, which IS in " +
-			"Perforce. A teammate who syncs this project won't have the plugin files, so " +
-			"Godot reports \"Addon failed to load\" and drops it from the enabled list - " +
-			"and the next save of the project settings can put that removal in the depot, " +
-			"turning P4Godot off for the whole team.")
+	var consequence := ("Godot keeps the list of enabled plugins in project.godot, and that " +
+			"file IS in Perforce. Teammates who don't have P4Godot's own files get " +
+			"\"Addon failed to load\" and Godot switches it off for them - which can then " +
+			"be sent back to the server, switching it off for everyone.")
 
 	if await _p4_path_ignored(plugin_dir):
 		settings.set_project_metadata(SETTINGS_SECTION, "plugin_add_declined", true)
-		await _show_alert(("'%s' isn't in Perforce, and your .p4ignore rules cover it, so " +
-				"Reconcile can't add it.\n\n%s\n\nEither narrow the ignore rule and press " +
-				"Reconcile, or make sure everyone installs P4Godot themselves.")
+		await _show_alert(("'%s' isn't in Perforce, and your project's .p4ignore file tells " +
+				"Perforce to skip it, so Reconcile can't add it.\n\n%s\n\nEither edit " +
+				".p4ignore so it no longer covers this folder and press \"Reconcile...\" " +
+				"again, or ask everyone on the team to install P4Godot themselves.")
 				% [plugin_res, consequence])
 		return
 
@@ -3805,11 +3845,13 @@ func _check_plugin_tracked() -> void:
 		await _show_alert(_refusal_alert_text(refused))
 		return
 	if not await _is_in_depot(plugin_dir.path_join("plugin.cfg")):
-		await _show_alert(("Perforce didn't open '%s' for add. The P4 Log (the dock's Log " +
-				"button) has what it said.") % plugin_res)
+		await _show_alert(("Perforce wouldn't add '%s'.\n\nPress \"Log\" in the P4G panel " +
+				"to see exactly what it said. If the reason isn't obvious, ask whoever " +
+				"runs your Perforce server.") % plugin_res)
 		return
-	await _show_alert(("Opened P4Godot for add. Submit it - together with project.godot - " +
-			"so your team gets the plugin when they sync."))
+	await _show_alert(("P4Godot is now lined up to be added to Perforce. Send it to the " +
+			"server with Submit, together with project.godot, so your team gets the " +
+			"plugin the next time they download the project."))
 
 
 ## The scan is a full reconcile preview of the project, so it costs real work
@@ -3958,11 +4000,11 @@ func _on_revert_unchanged_pressed() -> void:
 
 func _revert_unchanged_flow() -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
+		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	var preview := await _revert_unchanged_preview()
 	if preview.is_empty():
-		await _show_alert("No open-but-unchanged files to revert.")
+		await _show_alert("Nothing to give back - every file you have checked out in this project has real changes in it.")
 		return
 
 	# A file "unchanged" on disk can still have UNSAVED edits held only in an open
@@ -3985,9 +4027,11 @@ func _revert_unchanged_flow() -> void:
 			revert_names.append(res if not res.is_empty() else local)
 
 	if to_revert.is_empty():
-		await _show_alert(("All %d open-but-unchanged file(s) are open in the editor and were " +
-				"skipped to protect unsaved changes:\n\n%s\n\nClose a file (or revert it from " +
-				"the tree) if you really mean to revert it.")
+		await _show_alert(("All %d of the files you have checked out are unchanged, but every " +
+				"one is also open in a Godot tab, so nothing was given back - they may still " +
+				"hold edits you haven't saved:\n\n%s\n\nClose a file's tab first, or " +
+				"right-click it in the P4G panel and revert it there, if you really mean to " +
+				"give up the checkout.")
 				% [skipped.size(), _file_listing(skipped)])
 		return
 
@@ -4106,7 +4150,9 @@ func _delete_changelist(change: String) -> void:
 	var result := await _p4_exec_logged(["change", "-d", change])
 	if result.exit_code != 0:
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
-		await _show_alert("Could not delete changelist #%s:\n\n%s" % [change, msg])
+		await _show_alert(("Perforce wouldn't delete changelist #%s:\n\n%s\n\nMost often " +
+				"it still has files in it - move them to another changelist or submit " +
+				"them first.") % [change, msg])
 	_request_refresh()
 
 
@@ -4220,7 +4266,7 @@ func _submit_changelist_from_meta(meta: Dictionary) -> void:
 ## files (`submit -d <desc> <scope>`).
 func _submit_changelist(change: String, files: Array, preset_desc: String = "") -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
+		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	# The dock's file list can be stale; confirm (and submit) what's opened now.
 	files = await _submit_file_list(change, files)
@@ -4284,10 +4330,14 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			_pending_save_checkout.erase(f.label)
 	else:
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
-		await _show_alert(("Submit failed:\n\n%s\n\nNothing reached the depot. If the message " +
-				"above names a changelist number, Perforce moved the files into that pending " +
-				"changelist - fix the problem (usually: sync and resolve out-of-date files) and " +
-				"submit it from the dock.") % msg)
+		await _show_alert(("Perforce didn't accept your files:\n\n%s\n\nNothing was sent, and " +
+				"your work is untouched. The usual cause is that a teammate changed one of " +
+				"the same files first, so you need their version before you can send yours: " +
+				"right-click the file in the P4G panel and choose \"Sync This File\", then " +
+				"combine their changes with yours (P4V, or `p4 resolve` in a terminal) and " +
+				"submit again.\n\nIf the message above contains a number, Perforce has moved " +
+				"your files into a group with that number. It shows up in the P4G panel, and " +
+				"you submit it from there once the problem is sorted out.") % msg)
 	_request_refresh()
 
 
@@ -5031,12 +5081,14 @@ func _refusals(result: Dictionary) -> Dictionary:
 ## The alert text for files Perforce would not open. The exclusive-lock
 ## explanation only appears when a lock was actually the reason.
 func _refusal_alert_text(refused: Dictionary) -> String:
-	var text := "Perforce would not open %d file(s):\n\n%s" \
+	var text := "Perforce wouldn't let you take %d file(s):\n\n%s" \
 			% [refused.count, _file_listing(refused.lines)]
 	if refused.locked:
-		text += ("\n\nA file with the `+l` filetype can only be open for edit by one " +
-				"person at a time. Your change is on disk, but it can't be submitted " +
-				"until the other user submits, shelves, or reverts theirs.")
+		text += ("\n\nThese files are set up so only one person can change them at a " +
+				"time - studios do that for art, because two people's edits to the same " +
+				"image can't be combined. The name after \"also opened by\" above is who " +
+				"has it. Your work is safe on disk, but you can't send it to the server " +
+				"until they finish with the file and let it go.")
 	return text
 
 
@@ -5626,7 +5678,7 @@ func _ctx_status(paths: PackedStringArray) -> void:
 ## files. Refreshes the changelist tree.
 func _add_path(res_path: String) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
+		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	await _p4_exec_logged(["add", ProjectSettings.globalize_path(res_path)])
 	_request_refresh()
@@ -5637,7 +5689,7 @@ func _add_path(res_path: String) -> void:
 ## tooltip cache for these files.
 func _status_to_log(files: Array) -> void:
 	if not await _ensure_identity():
-		await _show_alert("Perforce is unavailable - press Refresh (the circular-arrow button) in the P4G dock to run connection setup (details in the P4 Log).")
+		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	for res in files:
 		var rec := await _fetch_fstat_record(res)
@@ -5801,9 +5853,10 @@ func _handle_fs_delete(res_path: String, is_folder: bool) -> void:
 			_log("Deleted folder '%s' - no Perforce-tracked files under it." % res_path)
 			return
 		if not await _confirm_fs_action(
-				("You deleted the folder '%s' (%d Perforce-tracked file(s)).\n\nOpen those " +
-				"files for delete in Perforce so the deletion lands in your changelist?")
-				% [res_path, count], "Open for Delete", "Leave in Perforce"):
+				("You deleted the folder '%s', which held %d file(s) that are in " +
+				"Perforce.\n\nTell Perforce to delete them too, so the deletion reaches " +
+				"your team when you submit?")
+				% [res_path, count], "Delete in Perforce", "Not Yet"):
 			_log("Left the deleted folder '%s' tracked in Perforce - run Reconcile to record it." % res_path)
 			return
 		await _p4_exec_logged(["reconcile", "-d", scope])
@@ -5816,8 +5869,8 @@ func _handle_fs_delete(res_path: String, is_folder: bool) -> void:
 		_log("Deleted '%s' - not tracked by Perforce, nothing to record." % res_path)
 		return
 	if not await _confirm_fs_action(
-			("You deleted '%s'.\n\nOpen it for delete in Perforce so the deletion lands in " +
-			"your changelist?") % res_path, "Open for Delete", "Leave in Perforce"):
+			("You deleted '%s'.\n\nTell Perforce to delete it too, so the deletion reaches " +
+			"your team when you submit?") % res_path, "Delete in Perforce", "Not Yet"):
 		_log("Left '%s' tracked in Perforce - run Reconcile to record the deletion." % res_path)
 		return
 	await _p4_open_for_delete(res_path, decision)

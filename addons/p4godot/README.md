@@ -110,25 +110,44 @@ latest" yet, so use P4V's **Get Latest Revision** on the project folder, or
 run `p4 sync` in a terminal. Restart Godot afterwards if scenes or scripts
 changed.
 
+## Your first change, start to finish
+
+This is the loop you'll repeat all day. Five steps.
+
+1. **Get everyone else's work first.** In P4V, right-click the project folder
+   → **Get Latest Revision**. (P4Godot does this one file at a time, not the
+   whole project — see the note above.) If scenes or scripts changed,
+   restart Godot.
+2. **Change something.** Move a node, edit a script, whatever. The moment you
+   do, P4Godot asks whether to check the file out. Say **Check Out**.
+   *You should see* the file appear in the P4G panel under **Default
+   changelist**.
+3. **Work and save normally.** Ctrl+S behaves as it always has. Files you
+   change get added to the panel as you go.
+4. **Look at what you're about to send.** In the P4G panel, right-click a
+   file → **Diff vs Depot** shows exactly what you changed. If you changed
+   something by mistake, → **Revert This File** throws your changes away and
+   puts the file back to the server's version. That deletes work, so read
+   the confirmation.
+5. **Send it to the team.** Right-click **Default changelist** →
+   **Submit Changelist...**, and type a sentence saying what you did.
+   P4Godot shows you the file list before anything is sent.
+   *You should see* the files leave the panel. They're on the server now.
+
+If a submit is refused, it's almost always because a teammate changed the
+same file first. Get their version (step 1), combine it with yours, and
+submit again.
+
 ## Keep the plugin itself in Perforce
 
-Put `addons/p4godot/` in the depot, however you installed it. Installing from
-the asset store and copying the folder in by hand produce the same files in
-the same place, so there's one answer for both.
+Put `addons/p4godot/` in the depot, however you installed it.
 
-It matters more than it looks. Godot records the enabled plugins in
-`project.godot`, which your team does keep in Perforce. A teammate who syncs
-a project that references a plugin they don't have gets this:
-
-```
-WARNING: Addon 'res://addons/p4godot/plugin.cfg' failed to load.
-         No directory found. Removing from enabled plugins.
-```
-
-Godot drops it from the enabled list, and the next save of the project
-settings writes that back — quietly, because `project.godot` is usually `+w`
-and needs no checkout. Submit that and P4Godot is off for everyone. P4Godot
-checks for this on startup and offers to add itself.
+**Why it matters:** Godot stores the list of enabled plugins inside
+`project.godot`, which your team *does* keep in Perforce. If a teammate gets
+the project but not the plugin files, Godot quietly drops P4Godot from that
+list — and the next time anyone saves project settings, that removal can be
+submitted, switching the plugin off for everyone. P4Godot checks for this at
+startup and offers to add itself.
 
 Nothing about the plugin needs to be writable at runtime: it keeps its cache
 and temporary files in your user cache folder, never inside `addons/`.
@@ -140,7 +159,7 @@ projects skip all of `addons/` to avoid build output, which would silently
 leave the plugin out of Perforce. If the answer is `ignored`, it names the
 rule and the line to change.
 
-### Updating it
+### Updating P4Godot to a new version
 
 Tracked files are read-only, so an installer can't overwrite them. Check the
 folder out first, whichever way you install:
@@ -239,7 +258,7 @@ use P4V), check that nothing under `.godot/` is listed, and submit.
 
 ## Features
 
-### Automatic checkout
+### Claiming files as you edit them
 
 - Offers to check out a file the moment you first modify it in the editor. A
   dropdown in the prompt picks the pending changelist, and it defaults to the
@@ -252,7 +271,7 @@ use P4V), check that nothing under `.godot/` is listed, and submit.
   checked out right after the save if the save changed it. An untouched
   Ctrl+S opens nothing.
 
-### Read-only files, handled
+### Why files are locked until you check them out
 
 In a standard workspace, files you haven't checked out are read-only. Godot
 rewrites files whether or not anything changed: every open scene and its
@@ -275,7 +294,7 @@ P4Godot makes those files writable just long enough for Godot's write:
   `.import` isn't checked out. The file is checked out if the settings really
   changed.
 
-### Guided connection setup
+### Connecting to your server
 
 If the project doesn't already resolve to a Perforce workspace, a short setup
 flow opens at startup and asks only for what's missing:
@@ -295,7 +314,7 @@ command-line flags. Your terminal, P4V, and other projects are unaffected.
 <!-- 📷 SCREENSHOT (optional): the workspace-suggestion dialog from connection
      setup. Suggested file: docs/images/connection-setup.png -->
 
-### Changelist dock
+### The P4G panel: everything you have changed
 
 The P4G dock shows your pending changelists and the files opened in each.
 From there you can:
@@ -324,7 +343,7 @@ submitted.
 <!-- 📷 SCREENSHOT: the submit confirmation dialog listing files + description.
      Suggested file: docs/images/submit-confirm.png -->
 
-### FileSystem dock integration
+### Right-click actions in Godot's file browser
 
 - **Right-click P4 actions** on any file (not folders): **P4: Check Out**,
   **P4: Mark for Add**, **P4: Get Latest (Sync)**, **P4: Diff vs Depot**,
@@ -342,7 +361,7 @@ submitted.
   asset are recorded too. These actions prompt by default, or apply silently
   with the "Auto add/edit/delete" setting.
 
-### Changes made outside Godot
+### Files you edited in Photoshop, Blender, or anywhere else
 
 Textures, models and audio get edited in Photoshop, Blender and Audition,
 which know nothing about Perforce. Each time you switch back to Godot,
@@ -379,7 +398,7 @@ while Windows workspaces usually sync CRLF.
 <!-- 📷 SCREENSHOT: the diff window on a file with a few added and removed
      lines visible. Suggested file: docs/images/diff-viewer.png -->
 
-### Runs in the background
+### Speed, and the activity log
 
 p4 commands run on a background thread, so the editor stays responsive
 while the server works. The exception is the work right before a save (a
@@ -388,7 +407,7 @@ status check and any checkout), which has to finish before Godot writes. The
 long output is truncated), and the Verbose setting adds the read-only status
 queries.
 
-## Requirements
+## What you need
 
 - **Godot 4.7 or later.**
 - **The `p4` command-line client.** P4Godot looks for it on your `PATH`,
@@ -411,14 +430,23 @@ project and per user, and never written into project files.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | Checkout on edit | on | Offer to check out a file the moment it is first modified. |
-| Checkout on save | on | Check out edited files right before the editor writes them, and handle read-only files around saves (see [Read-only files, handled](#read-only-files-handled)). When off, on Windows a scene save to a read-only file fails and the rescue dialog asks what to do (a script save shows Godot's own error). macOS and Linux don't block saves to read-only files, so there the save goes through and the file is checked out afterward if it changed. |
+| Checkout on save | on | Check files out just before Godot writes them, and take care of locked files around saves. Leave this on — turning it off means saves can fail. See [Why files are locked](#why-files-are-locked-until-you-check-them-out) and [Turning "Checkout on save" off](#turning-checkout-on-save-off). |
 | Auto add/edit/delete | off | Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs. |
-| Detect external changes | on | When Godot regains focus, look for files changed by other programs and offer to check them out (see [Changes made outside Godot](#changes-made-outside-godot)). |
-| Verbose log | off | Also log read-only status queries (fstat/opened/where/changes). |
+| Detect external changes | on | When Godot regains focus, look for files changed by other programs and offer to check them out (see [Changes made outside Godot](#files-you-edited-in-photoshop-blender-or-anywhere-else)). |
+| Verbose log | off | Also log the commands that only ask questions and change nothing (`fstat`, `opened`, `where`, `changes`). |
 
 One setting lives in **Editor Settings → Perforce** because it applies to
 every project: **Executable Path**, the full path to `p4` if P4Godot can't
 find it on its own.
+
+### Turning "Checkout on save" off
+
+On Windows, saving a scene to a file you haven't checked out fails, and
+P4Godot asks what you want to do. Saving a script shows Godot's own error
+message instead.
+
+On macOS and Linux nothing blocks the save, so the file is written. If the
+contents really changed, P4Godot checks it out afterwards.
 
 ## Known limitations
 
@@ -450,6 +478,23 @@ find it on its own.
 
 ## Troubleshooting
 
+- **"Perforce won't let you edit this file."** Someone else is working on
+  it. Studios mark art files — images, models, audio — so only one person
+  can change them at a time, because there's no way to combine two people's
+  edits to the same `.png`. The message names who has it; ask them to submit
+  their work or set it aside. Meanwhile your own changes are safe: they stay
+  in the editor, or on disk if you already saved, and P4Godot keeps the file
+  unlocked so a download can't overwrite them. It tries again every time you
+  save.
+- **"Addon 'res://addons/p4godot/plugin.cfg' failed to load. No directory
+  found."** Whoever set this project up didn't put the plugin's own files
+  into Perforce. Ask them to, or install P4Godot yourself. Don't ignore it:
+  Godot switches the plugin off when it sees this, and that can get
+  submitted and switch it off for the whole team. See
+  [Keep the plugin itself in Perforce](#keep-the-plugin-itself-in-perforce).
+- **P4Godot says it can't add itself.** Your `.p4ignore` covers the plugin
+  folder. Run `p4 ignores -i -v addons/p4godot/x` — if it answers `ignored`,
+  it names the rule and the line number to change.
 - **"Not connected" in the toolbar.** Click it, or press Refresh (the
   circular-arrow button at the left end of the P4G toolbar), to rerun
   connection setup. It names what's missing. The P4 Log window (toolbar →

@@ -4,6 +4,30 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## 0.14.1 — 2026-09-23
 
+- **Plain-English rewrite of the dialogs, aimed at someone who has never used
+  version control.** Two of them were misleading rather than merely dense:
+  - Reverting a file said it discarded "any unsaved changes". It also throws
+    away everything you *saved*, because Perforce puts the file back to the
+    server's version. It now says so, and the button reads "Throw Away My
+    Changes".
+  - The prompt after a sync didn't mention what happens if you keep the
+    editor's version: your next save overwrites the teammate's work you just
+    downloaded.
+  - "Open for Delete" / "Leave in Perforce" read backwards — the second
+    sounded like the safe choice while quietly leaving the depot out of step.
+    Now "Delete in Perforce" / "Not Yet".
+  - "Keep My Changes" / "Discard My Changes" differed by one word on an
+    unrecoverable choice. Now "Keep My Edit" / "Throw It Away".
+  - Messages that reported a problem without a next step now end in one, and
+    "Perforce is unavailable" (six copies that had drifted) is one constant.
+- README: says what Perforce *is* before using its vocabulary, and a new
+  `docs/glossary.md` covers the words that don't mean what you'd guess —
+  "open" means "put in a changelist", "revert" throws work away.
+- The `p4 ignores` checks in the README could not be followed. They said the
+  answer "should end in `ignored`, not `not ignored`", which is not a usable
+  test, and `p4 ignores -i` prints nothing at all when a path isn't ignored.
+  Both now use `-i -v`, which says which it is and names the rule.
+
 - **P4Godot checks that it is itself in Perforce**, and offers to add itself
   when it isn't. Godot keeps the enabled-plugin list in `project.godot`,
   which teams do track, so a teammate who syncs a project referencing a
