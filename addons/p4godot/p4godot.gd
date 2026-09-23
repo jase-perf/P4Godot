@@ -1940,6 +1940,44 @@ func _accept_dialog_full_text(dlg: AcceptDialog) -> String:
 	return text
 
 
+## Does this error line name `res_path`? The editor writes the path in
+## several shapes depending on which dialog it is, so accept any of them -
+## but a bare file name only counts on a name boundary. Matching it anywhere
+## in the line would let a registered `level.tscn` dismiss a REAL failure
+## reported for `sublevel.tscn`.
+func _line_names_file(line: String, res_path: String) -> bool:
+	if line.contains(res_path):
+		return true
+	var global_path := ProjectSettings.globalize_path(res_path)
+	if line.contains(global_path) or line.contains(global_path.replace("/", "\\")):
+		return true
+	var base := res_path.get_file()
+	var from := 0
+	while true:
+		var at := line.find(base, from)
+		if at == -1:
+			return false
+		var before := "" if at == 0 else line[at - 1]
+		var end := at + base.length()
+		var after := "" if end >= line.length() else line[end]
+		if _is_name_boundary(before) and _is_name_boundary(after):
+			return true
+		from = at + 1
+	return false
+
+
+## Is this character something a file name can't run through? An empty string
+## means the start or end of the line, which always counts. "." counts too,
+## so a trailing sentence period doesn't hide a match.
+static func _is_name_boundary(c: String) -> bool:
+	if c.is_empty():
+		return true
+	var code := c.unicode_at(0)
+	var alphanumeric: bool = (code >= 48 and code <= 57) or (code >= 65 and code <= 90) \
+			or (code >= 97 and code <= 122)
+	return not (alphanumeric or c == "_" or c == "-")
+
+
 ## True when the text has at least one non-empty line and EVERY non-empty
 ## line names a file registered as a verified no-op. The per-line rule is
 ## what keeps a mixed dialog (a no-op's line plus a real failure's line)
@@ -1953,7 +1991,7 @@ func _all_error_lines_covered(text: String) -> bool:
 			continue
 		var covered := false
 		for dismiss_name in _error_dismiss_names:
-			if line.contains(String(dismiss_name).get_file()):
+			if _line_names_file(line, String(dismiss_name)):
 				covered = true
 				break
 		if not covered:
@@ -6027,9 +6065,24 @@ func _run_cli_self_test_if_requested() -> void:
 			var ours_untouched: bool = ours.visible
 			mixed.queue_free()
 			ours.queue_free()
-			_log("[selftest] bare-hidden=%s loaderr-hidden=%s mixed-untouched=%s ours-untouched=%s"
-					% [bare_hidden, loaderr_hidden, mixed_untouched, ours_untouched])
-			if bare_hidden and loaderr_hidden and mixed_untouched and ours_untouched:
+
+			# A real failure for a DIFFERENT file whose name merely ends with
+			# the registered one must stay up. Matching the bare file name
+			# anywhere in the line dismissed this, hiding a genuine error.
+			var lookalike := AcceptDialog.new()
+			lookalike.dialog_text = "Unable to write to file 'C:\\ws\\sublevel.tscn', file in use, locked or lacking permissions."
+			gui.add_child(lookalike)
+			lookalike.visible = true
+			_queue_error_dialog_dismissal("res://level.tscn")
+			while _error_dismiss_running:
+				await get_tree().process_frame
+			var lookalike_untouched: bool = lookalike.visible
+			lookalike.queue_free()
+
+			_log("[selftest] bare-hidden=%s loaderr-hidden=%s mixed-untouched=%s ours-untouched=%s lookalike-untouched=%s"
+					% [bare_hidden, loaderr_hidden, mixed_untouched, ours_untouched, lookalike_untouched])
+			if bare_hidden and loaderr_hidden and mixed_untouched and ours_untouched \
+					and lookalike_untouched:
 				_log("[selftest] PASS: dismiss-dialog")
 			else:
 				_log("[selftest] FAIL: dismiss-dialog")

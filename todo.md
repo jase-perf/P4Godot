@@ -28,7 +28,7 @@
 - [x] (0.14.0) Escape `@ # % *` in local-path args (central `_escape_path_args`); add/reconcile take raw names + `-f`. Depot paths are still shown escaped in the UI (`%40`).
 - [ ] Connection overrides live in `.godot/editor/project_metadata.cfg`; if `.godot/` gets submitted, teammates inherit them. Move to the per-user editor config dir keyed by project path, and warn in Reconcile when `.godot/` paths appear.
 - [x] (0.14.0, `_history_advanced`, verified with a negative control) `history_changed` also fires from `clear_history` on tab switches, which prompted checkout for an untouched scene.
-- [ ] Error-dialog dismissal matches by basename substring (`level.tscn` also covers `sublevel.tscn`); match the full path.
+- [x] (0.14.1, `_line_names_file` + `dismiss-dialog` selftest with a negative control) Error-dialog dismissal matched by basename substring, so `level.tscn` also covered `sublevel.tscn` and could hide a real failure. Now matches the full res:// or OS path, falling back to a name-boundary match on the bare file name.
 - [x] (0.14.0) Import dock: the Reimport button's button_down arms the reimport guard before the dock saves `.import` settings. Import groups are still uncovered (Godot never reports group members to plugins).
 
 ## Allwrite workspaces + change detection (Godot) — designed, not started
