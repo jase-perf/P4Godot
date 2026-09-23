@@ -1,5 +1,13 @@
 # TODO
 
+## Next session (2026-09-24)
+
+- [ ] **Screenshots are the release gate for the beginner audience.** Six 📷 placeholders are still empty and `docs/images/` holds only `header.jpg` and logos. For a reader who doesn't know what a "dock" is, the images are the explanation, not decoration. Shot list is in `docs/manual-tests.md`.
+- [ ] Decide on the larger README restructure. Three audits (structure, jargon, in-editor text) ran on 2026-09-23; the unambiguous fixes are applied. Still on the table, because it's a judgement call about the page's shape: lead with "what you get" + screenshots, then the glossary, then "before you start", then split the page into "my project is already in Perforce" vs "it isn't yet" — the page currently assumes both in different sections. Also proposed: move `## Development` to CONTRIBUTING.md, and the typemap detail to a `docs/team-setup.md`.
+- [ ] Whole-project "Get Latest". The plugin syncs one file at a time (`_sync_path` + the per-file menu items); there is no project-wide sync. For someone new to version control, "how do I get my teammates' work" is half of what version control is. Documented as a gap in the README for now. Building it means overwriting files on disk, so it wants care: `noclobber` protects writable unopened files, open scenes need a warning, and Godot needs a rescan afterwards.
+- [ ] Tag `v0.14.1`, cut the GitHub release with a `git archive` zip, set repo description/topics. Repo goes public on Jase's say-so only.
+- [ ] Ask Jase whether the plugin source should stay in the Godot_Skeleton2D depot (added at change 3121 through the junction). `p4 delete -k` would remove it from that depot and keep the local files, leaving git as the only owner. The `.p4ignore` there now ignores `/addons/p4godot` (submitted as change 3132), so it won't be re-added.
+
 ## Release checklist (Godot Asset Store)
 
 - [ ] Capture README screenshots/GIF (placeholders marked with 📷 comments in README.md) — same captures feed the store's Media tab
