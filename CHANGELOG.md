@@ -4,6 +4,15 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## 0.14.1 — 2026-09-23
 
+- **P4Godot checks that it is itself in Perforce**, and offers to add itself
+  when it isn't. Godot keeps the enabled-plugin list in `project.godot`,
+  which teams do track, so a teammate who syncs a project referencing a
+  plugin they don't have sees "Addon failed to load. No directory found.
+  Removing from enabled plugins" — and the next project-settings save can put
+  that removal in the depot, turning the plugin off for everyone. If ignore
+  rules cover the addon folder, it says so instead of offering an add that
+  Perforce would skip. Asked once; declining is remembered per project.
+
 - **Reconcile tells you what it found and what it couldn't do.** The
   confirmation now lists the files by name and breaks them down by action,
   and anything Perforce refused is reported instead of swallowed. Refusals

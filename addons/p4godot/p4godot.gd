@@ -380,6 +380,9 @@ var _shader_files_dirty: bool = true
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
+## True while a --p4-selftest-* run is driving the plugin. Startup prompts and
+## the focus-in scan stay out of the way so a test sees only its own actions.
+var _selftest_mode: bool = false
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +417,8 @@ func _enter_tree() -> void:
 	_detect_p4_identity()
 	_log("P4Godot loaded.")
 	_run_cli_self_test_if_requested()
+	# Also fire-and-forget; it waits on the identity itself.
+	_check_plugin_tracked()
 
 
 func _exit_tree() -> void:
@@ -3580,6 +3585,112 @@ func _confirm_reconcile(found: Dictionary, refused: Dictionary, ok_text: String,
 # normally arrive within a frame of each other.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Is the plugin itself in Perforce?
+#
+# Godot records the enabled plugins in project.godot, which a team keeps in
+# Perforce - but the plugin's own files only get there if somebody adds them.
+# When they haven't, a teammate who syncs the project gets:
+#
+#     WARNING: Addon 'res://addons/p4godot/plugin.cfg' failed to load.
+#              No directory found. Removing from enabled plugins.
+#
+# (verified on Godot 4.7). Godot drops it from the in-memory enabled list, so
+# the next thing that saves project settings writes that pruned list back -
+# and project.godot is usually `+w`, so the write needs no checkout and makes
+# no noise. Submitting it turns P4Godot off for everyone. Worth one prompt.
+# ---------------------------------------------------------------------------
+
+## This plugin's own folder as a res:// path, read from the running script so
+## it stays right if someone renames or relocates the addon.
+func _plugin_dir() -> String:
+	var script := get_script() as Script
+	if script == null or script.resource_path.is_empty():
+		return "res://addons/p4godot"
+	return script.resource_path.get_base_dir()
+
+
+## Is this local path in the depot, or at least on its way in? A path p4 has
+## never heard of answers with a bare "no such file(s)" message, which yields
+## no tagged record at all.
+func _is_in_depot(global_path: String) -> bool:
+	var recs := _parse_ztag(await _p4_exec(["-ztag", "fstat", global_path]))
+	if recs.is_empty():
+		return false
+	var rec: Dictionary = recs[0]
+	if String(rec.get("depotFile", "")).is_empty():
+		return false
+	if not String(rec.get("action", "")).is_empty():
+		return true # already opened for add/edit - it's on its way in
+	return String(rec.get("headAction", "")) != "delete"
+
+
+## Does P4IGNORE cover this path? `p4 ignores -i` answers "<path> ignored" or
+## "<path> not ignored" - the negative contains the positive, so test for it
+## first.
+func _p4_path_ignored(global_path: String) -> bool:
+	var result: Dictionary = await _p4_exec(["ignores", "-i", global_path])
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	if text.contains("not ignored"):
+		return false
+	return text.contains("ignored")
+
+
+func _check_plugin_tracked() -> void:
+	if _shutting_down or _selftest_mode:
+		return
+	var settings := EditorInterface.get_editor_settings()
+	if settings.get_project_metadata(SETTINGS_SECTION, "plugin_add_declined", false):
+		return
+	if not await _ensure_identity():
+		return
+	# Nothing to warn about until the project itself is in Perforce: an
+	# un-added project picks the plugin up with everything else on its first
+	# Reconcile, and warning there would just be noise.
+	if not await _is_in_depot(ProjectSettings.globalize_path("res://project.godot")):
+		return
+	var plugin_res := _plugin_dir()
+	var plugin_dir := ProjectSettings.globalize_path(plugin_res)
+	if await _is_in_depot(plugin_dir.path_join("plugin.cfg")):
+		return
+
+	var consequence := ("Godot records the enabled plugins in project.godot, which IS in " +
+			"Perforce. A teammate who syncs this project won't have the plugin files, so " +
+			"Godot reports \"Addon failed to load\" and drops it from the enabled list - " +
+			"and the next save of the project settings can put that removal in the depot, " +
+			"turning P4Godot off for the whole team.")
+
+	if await _p4_path_ignored(plugin_dir):
+		settings.set_project_metadata(SETTINGS_SECTION, "plugin_add_declined", true)
+		await _show_alert(("'%s' isn't in Perforce, and your .p4ignore rules cover it, so " +
+				"Reconcile can't add it.\n\n%s\n\nEither narrow the ignore rule and press " +
+				"Reconcile, or make sure everyone installs P4Godot themselves.")
+				% [plugin_res, consequence])
+		return
+
+	var proceed: bool = await _show_confirm_dialog(
+			("P4Godot itself isn't in Perforce.\n\n%s\n\nAdd '%s' to Perforce now?")
+					% [consequence, plugin_res],
+			"Add to Perforce", "Not Now")
+	if not proceed:
+		settings.set_project_metadata(SETTINGS_SECTION, "plugin_add_declined", true)
+		_log("Left P4Godot out of Perforce; the dock's Reconcile can add it later.")
+		return
+
+	var result: Dictionary = await _p4_exec_logged(["reconcile", _as_recursive(plugin_dir)])
+	var refused := _refusals(result)
+	_request_refresh()
+	if int(refused.count) > 0:
+		await _show_alert(_refusal_alert_text(refused))
+		return
+	if not await _is_in_depot(plugin_dir.path_join("plugin.cfg")):
+		await _show_alert(("Perforce didn't open '%s' for add. The P4 Log (the dock's Log " +
+				"button) has what it said.") % plugin_res)
+		return
+	await _show_alert(("Opened P4Godot for add. Submit it - together with project.godot - " +
+			"so your team gets the plugin when they sync."))
+
+
 ## The scan is a full reconcile preview of the project, so it costs real work
 ## on a large workspace. One every few seconds is plenty for "the user just
 ## alt-tabbed back".
@@ -5739,6 +5850,7 @@ func _run_cli_self_test_if_requested() -> void:
 			_selftest_auto_answer = arg.substr("--p4-selftest-auto-answer=".length())
 	if not has_selftest_arg:
 		return
+	_selftest_mode = true
 	# The focus-in / filesystem_changed scan would otherwise fire in the
 	# middle of whatever a test is doing and reconcile the workspace behind
 	# its back, which makes every live test's result depend on what else was
@@ -6583,6 +6695,51 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] stale entry dropped=%s; really-open entry kept=%s (cache holds %d)"
 					% [stale_dropped, real_kept, _checked_out_this_session.size()])
 			_log("[selftest] %s: opened-cache" % ("PASS" if stale_dropped and real_kept else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-plugin-prompt":
+			# Live: run the startup check for real. Meant for a project whose
+			# project.godot is in Perforce while the addon folder is not -
+			# it reports what the check decided either way, and asserts it
+			# only opens the plugin when the plugin was actually missing.
+			var plugin_cfg := ProjectSettings.globalize_path(
+					_plugin_dir().path_join("plugin.cfg"))
+			var before := await _is_in_depot(plugin_cfg)
+			_selftest_mode = false # the whole point is to let the check run
+			EditorInterface.get_editor_settings().set_project_metadata(
+					SETTINGS_SECTION, "plugin_add_declined", false)
+			_selftest_auto_answer = "confirm"
+			await _check_plugin_tracked()
+			await _selftest_drain_frames()
+			var after := await _is_in_depot(plugin_cfg)
+			_log("[selftest] plugin in depot before=%s after=%s" % [before, after])
+			_log("[selftest] %s: plugin-prompt" % ("PASS" if after else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-plugin-tracked":
+			# Live and read-only: the three questions the startup check asks -
+			# where the plugin lives, whether a path is in the depot, and
+			# whether P4IGNORE covers it. A path p4 has never heard of must
+			# read as "not in the depot", which only works because a bare
+			# "no such file(s)" message yields no tagged record.
+			var plugin_res := _plugin_dir()
+			var plugin_dir := ProjectSettings.globalize_path(plugin_res)
+			var project_file := ProjectSettings.globalize_path("res://project.godot")
+			var absent := ProjectSettings.globalize_path("res://p4godot_no_such_file.txt")
+			var project_tracked := await _is_in_depot(project_file)
+			var absent_tracked := await _is_in_depot(absent)
+			var plugin_tracked := await _is_in_depot(plugin_dir.path_join("plugin.cfg"))
+			var godot_dir_ignored := await _p4_path_ignored(
+					ProjectSettings.globalize_path("res://.godot/x"))
+			var project_ignored := await _p4_path_ignored(project_file)
+			_log("[selftest] plugin dir=%s" % plugin_res)
+			_log("[selftest] in-depot: project.godot=%s plugin.cfg=%s absent-file=%s"
+					% [project_tracked, plugin_tracked, absent_tracked])
+			_log("[selftest] ignored: .godot/x=%s project.godot=%s"
+					% [godot_dir_ignored, project_ignored])
+			var ok: bool = plugin_res.ends_with("/p4godot") and project_tracked \
+					and not absent_tracked and godot_dir_ignored and not project_ignored
+			_log("[selftest] %s: plugin-tracked" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-reconcile-report":

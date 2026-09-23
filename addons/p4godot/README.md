@@ -61,6 +61,53 @@ Now edit a scene or script that's already in Perforce. P4Godot offers to
 check it out the moment you change it. Files not yet in Perforce get no
 prompt: add them with Reconcile.
 
+## Keep the plugin itself in Perforce
+
+Put `addons/p4godot/` in the depot, however you installed it. Installing from
+the asset store and copying the folder in by hand produce the same files in
+the same place, so there's one answer for both.
+
+It matters more than it looks. Godot records the enabled plugins in
+`project.godot`, which your team does keep in Perforce. A teammate who syncs
+a project that references a plugin they don't have gets this:
+
+```
+WARNING: Addon 'res://addons/p4godot/plugin.cfg' failed to load.
+         No directory found. Removing from enabled plugins.
+```
+
+Godot drops it from the enabled list, and the next save of the project
+settings writes that back — quietly, because `project.godot` is usually `+w`
+and needs no checkout. Submit that and P4Godot is off for everyone. P4Godot
+checks for this on startup and offers to add itself.
+
+Nothing about the plugin needs to be writable at runtime: it keeps its cache
+and temporary files in your user cache folder, never inside `addons/`.
+
+Check that your ignore rules don't cover it — `p4 ignores -i addons/p4godot/x`
+should say **not ignored**. Plenty of game `.p4ignore` templates catch
+`addons/` on the way to ignoring build output.
+
+### Updating it
+
+Tracked files are read-only, so an installer can't overwrite them. Check the
+folder out first, whichever way you install:
+
+1. **Check out** `addons/p4godot/` — right-click it in the FileSystem dock →
+   **P4: Check Out**, or `p4 edit addons/p4godot/...`.
+2. **Install the new version**, from the asset store or by extracting the zip
+   over the folder.
+3. **Reconcile.** A new version can add or remove files, which a checkout
+   alone doesn't cover.
+4. **Revert Unchanged**, so the changelist holds only what really changed.
+5. **Submit.** Everyone else gets it on their next sync; they should restart
+   Godot afterwards.
+
+One person does this for the team. On macOS and Linux an installer can
+replace a read-only file, so if you forget step 1 the files end up changed
+but not checked out — the focus-in scan offers them on your next alt-tab. On
+Windows the install fails instead, which is at least obvious.
+
 ## Setting up a Godot project in Perforce
 
 These steps apply to any Godot project under Perforce, with or without the

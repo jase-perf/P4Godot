@@ -47,6 +47,7 @@ by hand:
 | 8 | Repeat step 7 but answer **Not Now**, then alt-tab away and back twice. | It asks once and stays quiet after that. |
 | 9 | Create two new files and change one tracked file outside Godot, then press **Reconcile**. | The confirmation lists all three by name and reads `add: 2, edit: 1, delete: 0`. Accept: all three appear in the default changelist. |
 | 10 | Have a teammate check out a `+l` file, change that file locally in another program, then press **Reconcile** (and separately, click back into Godot and accept the checkout). | A dialog names the file Perforce refused and says who has it. Pressing Reconcile again does not report a phantom change that nothing can clear. |
+| 11 | In a project whose `project.godot` is in Perforce but whose `addons/p4godot/` is not, open the project. | On startup, a dialog explains that teammates would see the plugin fail to load, and offers **Add to Perforce**. Accept: the addon files show as adds in the default changelist. Reopen the project — it does not ask twice once answered. |
 
 ## Screenshots for the README
 
