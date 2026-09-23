@@ -3744,11 +3744,13 @@ func _is_in_depot(global_path: String) -> bool:
 	return String(rec.get("headAction", "")) != "delete"
 
 
-## Does P4IGNORE cover this path? `p4 ignores -i` answers "<path> ignored" or
-## "<path> not ignored" - the negative contains the positive, so test for it
-## first.
+## Does P4IGNORE cover this path? `-i` alone prints the path only when a rule
+## matches and stays silent otherwise, which is indistinguishable from the
+## command failing. `-v` makes it say which it is - "<path> ignored by
+## <file>:<line>:<rule>" or "<path> not ignored" - and the negative contains
+## the positive, so test for that first.
 func _p4_path_ignored(global_path: String) -> bool:
-	var result: Dictionary = await _p4_exec(["ignores", "-i", global_path])
+	var result: Dictionary = await _p4_exec(["ignores", "-i", "-v", global_path])
 	var text := "" if result.output.is_empty() else String(result.output[0])
 	if text.contains("not ignored"):
 		return false
