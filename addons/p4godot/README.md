@@ -11,7 +11,7 @@ changelist stays accurate. Submit, diff, and reconcile without leaving the
 editor. It is pure GDScript with no build step, and it drives the `p4`
 command-line client you already use.
 
-**Status: 0.14.0, the first public release.** Developed and tested on
+**Status: 0.14.1, the first public release.** Developed and tested on
 Windows 11 with Godot 4.7 and a P4 2025.2 server. It is designed to work on
 macOS and Linux too, but those platforms have had less testing. Please
 [open an issue](https://github.com/jase-perf/P4Godot/issues) if something
@@ -37,7 +37,7 @@ whoever runs it. Setting up your own? Do that first, then come back.
    - Linux: download it from the same page.
 2. **Add the plugin to your project.** From the
    [latest release](https://github.com/jase-perf/P4Godot/releases/latest),
-   download `p4godot-v0.14.0.zip` under **Assets**, not the "Source code"
+   download `p4godot-v0.14.1.zip` under **Assets**, not the "Source code"
    zips. It contains an `addons` folder. Copy that folder into your project
    folder, next to `project.godot`, merging it with any `addons` folder you
    already have.
@@ -226,6 +226,21 @@ submitted.
   asset are recorded too. These actions prompt by default, or apply silently
   with the "Auto add/edit/delete" setting.
 
+### Changes made outside Godot
+
+Textures, models and audio get edited in Photoshop, Blender and Audition,
+which know nothing about Perforce. When Godot comes back to the front, P4Godot
+runs the same `reconcile -n` preview the Reconcile button uses and offers to
+check out whatever changed. It opens exactly the files the dialog listed, and
+says so when Perforce refuses one, which usually means another user holds an
+exclusively locked (`+l`) file.
+
+Answering **Not Now** silences that same set of files until the set changes,
+so it can't ask again every time you alt-tab. With "Auto add/edit/delete" on,
+the files are opened silently instead. The scan is a full reconcile preview
+of the project, so on a very large workspace you may want it off; the
+Reconcile button still does the job on demand.
+
 <!-- 📷 SCREENSHOT: the FileSystem dock with the P4 context menu open on a file,
      and (second shot or same composition) a hover tooltip showing
      "//depot/...#3 (head #5 - out of date) opened for edit".
@@ -277,6 +292,7 @@ project and per user, and never written into project files.
 | Checkout on edit | on | Offer to check out a file the moment it is first modified. |
 | Checkout on save | on | Check out edited files right before the editor writes them, and handle read-only files around saves (see [Read-only files, handled](#read-only-files-handled)). When off, on Windows a scene save to a read-only file fails and the rescue dialog asks what to do (a script save shows Godot's own error). macOS and Linux don't block saves to read-only files, so there the save goes through and the file is checked out afterward if it changed. |
 | Auto add/edit/delete | off | Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs. |
+| Detect external changes | on | When Godot regains focus, look for files changed by other programs and offer to check them out (see [Changes made outside Godot](#changes-made-outside-godot)). |
 | Verbose log | off | Also log read-only status queries (fstat/opened/where/changes). |
 
 One setting lives in **Editor Settings → Perforce** because it applies to
@@ -287,14 +303,16 @@ find it on its own.
 
 - **Declining the checkout prompt reloads the file.** Choosing **Discard My
   Changes** reloads the file from disk. For a scene, that discards all of its
-  unsaved changes, not only the edit that triggered the prompt. For a
-  script, it closes the script's tab.
-- **Edits made outside the editor aren't detected automatically.** Use
-  **Reconcile** to pick them up. The same applies to `project.godot`, which
-  Godot writes without telling plugins.
-- **New files aren't added automatically**, because Godot doesn't announce
-  them (the "Auto add/edit/delete" setting doesn't cover adds). Add them with
-  right-click → **P4: Mark for Add**, or with Reconcile.
+  unsaved changes, not only the edit that triggered the prompt. A script's
+  tab is closed and reopened on the file's contents, which loses that file's
+  undo history.
+- **`project.godot` isn't covered by change detection while you edit it.**
+  Godot writes it without telling plugins. The focus-in scan picks it up
+  afterwards, and **Reconcile** always does.
+- **New files aren't added the moment you create them**, because Godot
+  doesn't announce them. The focus-in scan offers them on the next alt-tab;
+  to add one straight away, use right-click → **P4: Mark for Add**, or
+  Reconcile.
 - **Import groups** (atlas textures and other assets imported as a group)
   aren't covered by the read-only reimport handling. Check out their
   `.import` files before reimporting.

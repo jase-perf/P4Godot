@@ -30,7 +30,7 @@ Setup:
 If a step fails, turn on **Verbose log** in the settings menu, repeat it,
 and save the Log contents.
 
-## Any platform: GUI-only checks (5 minutes)
+## Any platform: GUI-only checks (10 minutes)
 
 The headless self-tests can't click through Godot's own docks, so check these
 by hand:
@@ -41,6 +41,11 @@ by hand:
 | 2 | Select it again and press **Reimport** without changing anything. | Nothing new is opened; the `.import` stays read-only. |
 | 3 | Add a file named `icon@2x.png` to the project, right-click → **P4: Mark for Add**, submit it, then rename it in the FileSystem dock. | The add and submit work. The rename is recorded as `move/add` + `move/delete`. Clean up afterwards. |
 | 4 | Switch scene tabs between two tracked scenes you haven't edited. | No checkout prompt. |
+| 5 | Edit a tracked scene, answer the prompt with **Discard My Changes**, then edit it again. | The second edit prompts again straight away, not only at save time. |
+| 6 | Check out a tracked `.gd`, add a line, save, then revert it from the P4G dock. | The script's tab stays open and shows the depot text, at roughly the line you were on. Close and reopen the file: still the depot text. |
+| 7 | With Godot in front, change a tracked `.png` in another program and save it. Click back into Godot. | A dialog lists the file and offers **Check Out**. Accept: it appears in the default changelist. |
+| 8 | Repeat step 7 but answer **Not Now**, then alt-tab away and back twice. | It asks once and stays quiet after that. |
+| 9 | Have a teammate check out a `+l` file, change that file locally in another program, then click back into Godot and accept the checkout. | A dialog names the file Perforce refused and says who has it. |
 
 ## Screenshots for the README
 

@@ -2,6 +2,26 @@
 
 Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
+## 0.14.1 — 2026-09-23
+
+- **Changes made outside Godot are detected.** When Godot regains focus,
+  P4Godot looks for files that other programs changed and offers to check
+  them out, naming any that Perforce refused (usually a `+l` file someone
+  else holds). New **Detect external changes** setting, on by default.
+- **Declining a checkout no longer turns checkout off for that file.** The
+  decline suppressed re-prompting so a failed reload couldn't prompt on every
+  keystroke, but nothing cleared the suppression: the next edit went
+  unnoticed until you saved. Suppression now applies only when the reload
+  couldn't be confirmed.
+- **Reverting a script puts the depot text back in the editor.** It used to
+  close the script's tab and leave the edited source in Godot's resource
+  cache, so reopening the file served the reverted change straight back. The
+  tab now reopens on the file's real contents with your place in it kept.
+- A submit or revert done outside Godot (P4V, a terminal) no longer leaves a
+  file marked checked out for the rest of the session, which made later edits
+  to it skip the checkout. The session's record is rebuilt from `p4 opened`
+  on every refresh.
+
 ## 0.14.0 — 2026-09-22
 
 First public release.

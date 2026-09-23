@@ -5108,7 +5108,12 @@ func _current_script_code_edit() -> CodeEdit:
 
 func _settle_frames(count: int) -> void:
 	for _i in count:
-		await get_tree().process_frame
+		# The plugin can be torn down mid-reload (project closed, plugin
+		# disabled); there's no tree left to wait on then.
+		var scene_tree := get_tree()
+		if scene_tree == null or _shutting_down:
+			return
+		await scene_tree.process_frame
 
 
 func _clear_auto_checkout_suppression() -> void:
@@ -5594,6 +5599,12 @@ func _run_cli_self_test_if_requested() -> void:
 			_selftest_auto_answer = arg.substr("--p4-selftest-auto-answer=".length())
 	if not has_selftest_arg:
 		return
+	# The focus-in / filesystem_changed scan would otherwise fire in the
+	# middle of whatever a test is doing and reconcile the workspace behind
+	# its back, which makes every live test's result depend on what else was
+	# lying around. The external-scan test turns it back on for itself.
+	if detect_external_checkbox:
+		detect_external_checkbox.set_pressed_no_signal(false)
 	# Identity detection is async now - resolve it before dispatching so tests
 	# exercise the plugin's steady state, not its boot race.
 	await _ensure_identity()
@@ -6392,6 +6403,19 @@ func _run_cli_self_test_if_requested() -> void:
 			detect_external_checkbox.set_pressed_no_signal(true)
 			auto_open_checkbox.set_pressed_no_signal(false)
 
+			# The focus notification is what drives the scan in normal use, and
+			# a headless session never gets a real one. Propagating it by hand
+			# at least proves it reaches this plugin node and starts a scan
+			# (the scan stamps _external_scan_last_msec when it finishes).
+			_selftest_auto_answer = "cancel"
+			_external_scan_last_msec = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
+			var stamp_before := _external_scan_last_msec
+			get_tree().root.propagate_notification(NOTIFICATION_APPLICATION_FOCUS_IN)
+			await _selftest_drain_frames()
+			var focus_scanned := _external_scan_last_msec != stamp_before
+			_log("[selftest] focus notification started a scan: %s" % focus_scanned)
+			_external_scan_dismissed = ""
+
 			# The scan reconciles everything it finds, and this workspace can
 			# hold unrelated changes - narrow it to our own file.
 			var preview := await _reconcile_preview()
@@ -6426,8 +6450,8 @@ func _run_cli_self_test_if_requested() -> void:
 			DirAccess.remove_absolute(global)
 			_log("[selftest] preview-found=%s opened-after-decline=%s remembered=%s silent-on-repeat=%s opened-after-accept=%s"
 					% [found, opened_after_decline, remembered, silent_on_repeat, opened])
-			var ok: bool = found and not opened_after_decline and remembered \
-					and silent_on_repeat and opened
+			var ok: bool = found and focus_scanned and not opened_after_decline \
+					and remembered and silent_on_repeat and opened
 			_log("[selftest] %s: external-scan" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
