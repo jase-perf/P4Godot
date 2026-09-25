@@ -48,15 +48,30 @@ because no headless test can see a dialog's layout or a tooltip.
 ## Before sending a change
 
 - Run the server-independent tests.
-- Check for GDScript warnings. Copy the addon into a throwaway project whose
-  `project.godot` enables warnings for `res://addons`, then:
+- Check for GDScript warnings. Godot excludes `res://addons` from warnings by
+  default, so you have to ask for them. Copy the addon into a throwaway
+  project whose `project.godot` contains at least:
+
+  ```
+  [debug]
+  gdscript/warnings/directory_rules={"res://addons": 1}
+  gdscript/warnings/unused_variable=2
+  gdscript/warnings/shadowed_variable=2
+  gdscript/warnings/integer_division=2
+  gdscript/warnings/unreachable_code=2
+  ```
+
+  (`1` warns, `2` is an error. Add any other warning you want treated as one.)
+  Then:
 
   ```
   godot --headless --path <project> --check-only --script res://addons/p4godot/p4godot.gd
   ```
 
-  Grep the output for `SCRIPT ERROR`. The plugin is warning-clean at Godot's
-  defaults, and should stay that way — people enable warnings for addons.
+  It exits 1 and prints a `SCRIPT ERROR:` line for both a parse error and a
+  warning-turned-error, naming the identifier (measured on Godot 4.7). The
+  plugin is warning-clean at Godot's defaults and should stay that way,
+  because people do turn warnings on for addons.
 - When you fix a bug, add a test and then **neuter the fix and confirm the
   test fails**. A test that passes either way is worse than no test: it looks
   like evidence. Several tests here were rewritten after that check showed
