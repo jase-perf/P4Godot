@@ -25,7 +25,29 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
     your have revision to head and leaves the file alone, emitting no record
     at all — so it silently became a file that couldn't be submitted until it
     was merged. Those files are now named, pointing at P4V's Resolve, since
-    P4Godot has no merge of its own.
+    P4Godot has no merge of its own. For art it says the part that matters:
+    resolving isn't a merge, you keep one version and lose the other.
+
+  Everything the report says comes from what the sync itself printed, never
+  from the preview. Counting the preview would have claimed a file downloaded
+  when Perforce had refused to overwrite it, and it would have missed a file a
+  teammate submitted while the confirmation sat open — whose open tab needs
+  reloading just as much. The rest of that pass:
+  - A tab left open on a file the sync **deleted** is called out before and
+    after. Godot can't close a scene tab, so the tab survives on a file that no
+    longer exists, and saving it would put the file back and re-add it to the
+    depot — undoing the team's delete from the other direction.
+  - Files Godot has **cached but has no tab for** are reloaded too. Closing a
+    tab doesn't drop the resource, so reopening it later served the pre-sync
+    copy, and saving that overwrote the downloaded work.
+  - "Your project is already up to date" is no longer said over the top of a
+    message Perforce did give. Anything unrecognised — a permissions refusal on
+    part of the tree, say — is reported instead of dropped.
+  - A sync that failed for a reason p4 didn't explain says so rather than
+    reading as success, and a double-click no longer runs two syncs.
+  - Deletions are described as removals rather than downloads, and lines of
+    p4's answer that couldn't be read are counted and reported instead of
+    silently shortening the list.
 
 - Documentation split by what the reader is actually doing. The README now
   assumes the normal case — the project is already in Perforce and you're
@@ -38,6 +60,21 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
   Perforce configuration it reads before asking) moved to the places that
   need them. Notes for people working on the plugin moved to
   `CONTRIBUTING.md`.
+- The quick start now starts where a new teammate actually starts: making a
+  workspace in P4V and downloading the project. It never said how to do that,
+  so every later step assumed a project already on disk.
+- Warnings the dialogs give but the page didn't: that Get Latest reloads open
+  files and loses unsaved changes in them, that **Discard My Changes** on the
+  checkout prompt throws away everything unsaved in the scene rather than just
+  your last edit, and that files Reconcile lists as *missing* get deleted for
+  the whole team on submit.
+- `docs/first-time-setup.md` sets up the `p4` command line before using it.
+  P4V keeps its connection settings to itself, so a P4V-only reader hit
+  "Connect to server failed" on the page's first command.
+- Glossary: added **Resolve** and a short section of Godot words (dock, addon,
+  scene, resource, `.import`/`.uid`) for people new to the engine too.
+  **Revert** said it gives the file "back to the server", which sounds like
+  uploading; it doesn't send anything.
 
 ## 0.14.1 — 2026-09-23
 

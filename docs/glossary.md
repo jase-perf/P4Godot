@@ -43,12 +43,19 @@ becomes a **numbered** one. **Pending** means "not sent yet".
 **Sync** (also **Get Latest**) — download the newest files from the server
 onto your disk.
 
-**Revert** — throw away your changes to a file and give it back to the
-server. It does **not** mean "go back one version". This one deletes work, so
-read the confirmation.
+**Revert** — throw away your changes to a file and go back to the copy you
+last downloaded. The file also leaves your changelist. Nothing is sent to the
+server. It does **not** mean "go back one version". This one deletes work —
+what you saved as well as what you didn't — so read the confirmation.
 
 **Reconcile** — compare the files on your disk against what the server thinks
 you have, and list what's new, changed, or missing.
+
+**Resolve** — combine your version of a file with a newer one from the server.
+Perforce won't let you submit until you do. For text, it can usually merge the
+two automatically. For an image, a model or a sound there is nothing to
+combine: you keep one version and the other is lost, which is why studios put
+`+l` on art.
 
 **Diff** — show, line by line, what's different between your copy and the
 server's.
@@ -94,3 +101,25 @@ a while, and then you log in again.
 
 **`...`** — in a Perforce command, `...` means "this folder and everything
 inside it". It's part of the command; type it literally.
+
+## Godot words, if Godot is new too
+
+**Dock** (also **panel**) — one of the areas around the edge of the Godot
+editor holding a tool: the FileSystem dock, the Inspector, the Import dock.
+P4Godot adds one called **P4G** at the bottom.
+
+**Addon** (also **plugin**) — code you drop into your project's `addons/`
+folder to add features to the editor. P4Godot is one. You switch it on under
+**Project → Project Settings → Plugins**.
+
+**Scene** (`.tscn`) — a tree of nodes saved as a file: a level, a character, a
+menu. Scenes can contain other scenes.
+
+**Resource** (`.tres`, and every asset) — anything Godot loads from a file: a
+texture, a material, a tileset, a script.
+
+**`.import` and `.uid`** — small files Godot writes next to each asset.
+`.import` holds that asset's import settings, `.uid` its stable identity. Both
+belong in Perforce: without them your teammates' copies of the project break.
+Godot rewrites them on its own, which is why P4Godot has special handling for
+them.

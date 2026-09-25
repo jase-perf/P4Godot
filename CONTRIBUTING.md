@@ -29,6 +29,15 @@ A test that checks a result logs `[selftest] PASS: <name>` or
 `[selftest] FAIL: <name>`. Judge by those lines, not by the exit code. Tests
 that only list something print what they found.
 
+**On Windows, run the `..._console.exe` build.** The normal `.exe` is a GUI
+binary and prints nothing to the terminal, so every test looks silent. The
+`[selftest]` lines also go to stdout, which is block-buffered when redirected
+and lost if the process is killed — so trust only a run that exited on its
+own. No lines at all means the run failed, not that the test passed. Godot's
+headless editor also deadlocks on its first filesystem scan now and then; that
+run prints the banner and nothing else, and the fix is to wait a few seconds
+and run it again.
+
 **Server-independent** tests run anywhere, including a throwaway project:
 `save-guards`, `prewrite`, `unchanged-save`, `exec-quoting`, `parse-ztag`,
 `sync-report`, `diff-align`, `dismiss-dialog`, `breaker`.

@@ -35,11 +35,29 @@ that holds your Godot project — or that will hold it.
 Your project folder has to be the root or sit inside it. If it isn't there
 yet, move it now, before anything is submitted.
 
-(The command-line version, `p4 client`, opens a form in a terminal text
-editor, which on macOS and Linux is usually `vi`. Use P4V unless you're at
-home in `vi`.)
+## 2. Tell the `p4` command line who you are
 
-## 2. Tell Perforce to ignore Godot's cache
+The rest of this page uses `p4` in a terminal, and so does P4Godot. P4V keeps
+its connection settings to itself, so setting it up in step 1 taught the
+terminal nothing. Give `p4` the same details, once:
+
+```
+p4 set P4PORT=ssl:perforce.example.com:1666
+p4 set P4USER=yourname
+p4 set P4CLIENT=the-workspace-you-just-made
+p4 set P4IGNORE=.p4ignore
+p4 login
+```
+
+Check it worked with `p4 info` — it should print your user name, your
+workspace, and the server address. If instead you get
+`Connect to server failed`, the address is wrong; if you get
+`Perforce password (P4PASSWD) invalid or unset`, run `p4 login` again.
+
+`P4IGNORE` is the one people miss. It tells `p4` what your ignore file is
+called, and without it the next step does nothing at all.
+
+## 3. Tell Perforce to ignore Godot's cache
 
 Godot keeps a `.godot/` folder next to your project file. It's a cache and
 your personal editor state: every machine rebuilds it, and nobody else wants
@@ -72,7 +90,7 @@ names the rule that did it, or `not ignored`. If you get `not ignored`, run
 `p4 set P4IGNORE=.p4ignore` — that tells Perforce what your ignore file is
 called — and ask again.
 
-## 3. Set filetypes for art and `project.godot`
+## 4. Set filetypes for art and `project.godot`
 
 A file's *filetype* is how Perforce handles it: as text, as binary, as
 always-writable. That's a different question from "PNG or WAV". The *typemap*
@@ -105,14 +123,16 @@ TypeMap:
 - `.tscn`, `.tres`, `.gd`, and `.import` files are text, and Perforce's
   defaults already suit them.
 
-The typemap only applies to files added after it. For a file already
-submitted, run `p4 edit -t <type> <file>` and submit.
+**Don't do step 5 until the typemap is actually on the server.** If you submit
+first, every art file lands as ordinary text with no exclusive checkout, and
+you fix them one at a time afterwards with `p4 edit -t binary+l <file>` plus a
+submit. If you had to hand this step to an admin, wait for them.
 
-## 4. Submit the project
+## 5. Submit the project
 
 In P4V, right-click your project folder and choose **Mark for Add**. Before
 you submit, read the file list and check that **nothing under `.godot/` is in
-it**. If any is, step 2 didn't take — fix it and try again, because taking
+it**. If some is, step 3 didn't take — fix it and try again, because taking
 files back out afterwards is more work.
 
 Then submit, with a description like "initial import of the project".
@@ -125,7 +145,7 @@ Your project is in Perforce. Two things follow from that:
 - Your teammates can get the project by making their own workspace (step 1)
   and running **Get Latest Revision** on it in P4V.
 
-## 5. Install P4Godot
+## 6. Install P4Godot
 
 Now go back to the [quick start](../README.md#quick-start) and add the plugin.
 Everyone on the team follows that page, including you.

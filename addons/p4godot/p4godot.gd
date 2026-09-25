@@ -4126,6 +4126,14 @@ const CLOBBER_MESSAGE := "Can't clobber writable file "
 const BIG_DOWNLOAD_BYTES := 50 * 1024 * 1024
 
 
+# Single-flights the flow. The dock's other long operations each have one
+# (_refresh_inflight, _external_scan_inflight). Without it a double-click runs
+# two flows: the second confirms against a preview the first already satisfied,
+# then reloads every tab a second time - discarding whatever was typed since
+# the first reload, having warned about it before the first sync even started.
+var _get_latest_inflight: bool = false
+
+
 func _on_get_latest_pressed() -> void:
 	await _get_latest_flow()
 
@@ -4133,76 +4141,122 @@ func _on_get_latest_pressed() -> void:
 ## Returns the text it put in front of the user, so a self-test can assert on
 ## what the flow actually concluded rather than re-deriving it.
 func _get_latest_flow() -> String:
+	if _get_latest_inflight:
+		_log("Get Latest is already running.")
+		return ""
+	_get_latest_inflight = true
+	var report := await _get_latest_body()
+	_get_latest_inflight = false
+	return report
+
+
+func _get_latest_body() -> String:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return ""
 	var preview: Dictionary = await _p4_exec(["-ztag", "sync", "-n", _project_scope()])
 	var found := _summarize_sync(_parse_ztag(preview))
 	var notes := _sync_notes(preview)
-	if found.names.is_empty() and int(preview.get("exit_code", 0)) != 0:
-		var why := "" if preview.output.is_empty() else String(preview.output[0]).strip_edges()
-		var text := "Perforce couldn't work out what to download:\n\n%s" % why
-		if why.contains("no such file"):
-			text = ("Perforce has nothing stored under this project folder yet, so there " +
-					"is nothing to download. Press \"Reconcile...\" to put the project " +
-					"into Perforce for the first time.")
-		await _show_alert(text)
-		return text
-	if found.names.is_empty() and int(notes.opened_behind) == 0:
-		var up_to_date := ("Your project is already up to date - nobody has submitted " +
-				"anything you don't have yet.")
-		await _show_alert(up_to_date)
-		return up_to_date
+	if bool(notes.nothing_in_depot) and found.names.is_empty():
+		var none := ("Perforce has nothing stored under this project folder yet, so there " +
+				"is nothing to download. Press \"Reconcile...\" to put the project into " +
+				"Perforce for the first time.")
+		await _show_alert(none)
+		return none
+	if found.names.is_empty() and int(preview.get("exit_code", 0)) != 0 \
+			and notes.problems.is_empty():
+		var failed := "Perforce couldn't work out what to download:\n\n%s" % _first_line(preview)
+		await _show_alert(failed)
+		return failed
+	if not _get_latest_has_work(found, notes):
+		# Anything p4 said that is neither a record nor a shape _sync_notes
+		# recognises has to surface here. Claiming "up to date" over the top of
+		# it is how a protected subtree - or any message not enumerated below -
+		# would leave someone working against a stale project.
+		var idle := ("Your project is already up to date - nobody has submitted anything " +
+				"you don't have yet.")
+		if not notes.problems.is_empty():
+			idle = "Nothing to download. Perforce also said:\n\n%s" \
+					% _file_listing(notes.problems, 5)
+		await _show_alert(idle)
+		return idle
 	if not await _confirm_get_latest(found, notes):
 		_log("Get Latest cancelled.")
 		return ""
-	_log("Get Latest: downloading %d file(s) (%s)..." % [found.names.size(),
-			_human_bytes(int(found.bytes))])
+	_log("Get Latest: %d file(s), %s..." % [found.names.size(), _human_bytes(int(found.bytes))])
 	var result: Dictionary = await _p4_exec_logged(["-ztag", "sync", _project_scope()])
+	if _shutting_down:
+		return ""
 	var after := _sync_notes(result)
+	# Everything below is driven by what the sync ITSELF reported, never by the
+	# preview. Two reasons: p4 prints a normal-looking record for a file it
+	# refused to overwrite, and a file a teammate submitted while the
+	# confirmation sat open is in this output and was never in the preview - its
+	# open tab needs reloading just as much.
+	var done := _summarize_sync(_parse_ztag(result))
 	_request_refresh()
 	EditorInterface.get_resource_filesystem().scan()
-	var reloaded: Array = await _reload_after_sync(found.names, after.clobbered)
+	var reload := await _reload_after_sync(done, after.clobbered)
 	# The resolve list only means anything after the sync: the sync is what
 	# moves the have revision and schedules the merge.
 	var to_resolve: Array = await _resolve_preview_names()
-	var report := _get_latest_report(found, after, reloaded, to_resolve)
+	var report := _get_latest_report(done, after, reload, to_resolve,
+			int(result.get("exit_code", 0)))
 	await _show_alert(report)
 	return report
 
 
-## Fold a `sync -n` preview into counts and names. `action` here says what
-## happens to the file on disk - `added` is a file that isn't there yet,
+## Whether a sync has anything to do. Records alone are not the answer: a file
+## you have checked out that is behind head produces no record at all, only a
+## message, so counting records makes a sync with real work look idle.
+static func _get_latest_has_work(found: Dictionary, notes: Dictionary) -> bool:
+	return not found.names.is_empty() or int(notes.opened_behind) > 0
+
+
+## Fold a sync's records into counts and names. `action` says what happens to
+## the file on disk - `added` is a file that isn't there yet,
 ## `updated`/`refreshed`/`replaced` a rewrite, `deleted` a removal - which is a
 ## different vocabulary from reconcile's, where `add` means "open for add".
-func _summarize_sync(preview: Array) -> Dictionary:
+func _summarize_sync(records: Array) -> Dictionary:
 	var rows: Array = []
 	var updates := 0
 	var adds := 0
 	var deletes := 0
 	var total := 0
-	for rec in preview:
+	var malformed := 0
+	var deleted_names: Array = []
+	for rec in records:
 		var local := String(rec.get("clientFile", ""))
-		if local.is_empty():
+		var action := String(rec.get("action", ""))
+		# A record missing either field, or holding a clientFile that swallowed
+		# the line after it, means p4's message output interleaved into the
+		# record stream. Dropping it silently would take a real file out of the
+		# download list and out of the reload set with it, so it is counted and
+		# reported instead.
+		if local.is_empty() or action.is_empty() or local.contains("\n"):
+			malformed += 1
 			continue
 		var res := _local_to_res(local)
-		var action := String(rec.get("action", ""))
+		var shown := res if not res.is_empty() else local
 		if action.contains("delete"):
 			deletes += 1
+			deleted_names.append(shown)
 		elif action.contains("add"):
 			adds += 1
 		else:
 			updates += 1
 		total += int(rec.get("fileSize", 0))
-		rows.append({"local": local, "name": res if not res.is_empty() else local})
+		rows.append({"local": local, "name": shown})
 	rows.sort_custom(func(a, b): return String(a.name) < String(b.name))
 	var locals: Array = []
 	var names: Array = []
 	for row in rows:
 		locals.append(row.local)
 		names.append(row.name)
+	deleted_names.sort()
 	return {"locals": locals, "names": names, "updates": updates, "adds": adds,
-			"deletes": deletes, "bytes": total}
+			"deletes": deletes, "bytes": total, "malformed": malformed,
+			"deleted_names": deleted_names}
 
 
 ## What a sync's output says that its records don't:
@@ -4212,15 +4266,18 @@ func _summarize_sync(preview: Array) -> Dictionary:
 ##   - `opened_behind`: files left alone because you have them checked out.
 ##     These produce no record either, so without counting them a sync that has
 ##     real work to do looks like "already up to date".
-##   - `problems`: anything else p4 said, for the report - so an unexpected
-##     failure is shown rather than swallowed.
+##   - `nothing_in_depot`: p4 has never heard of this path.
+##   - `problems`: anything else p4 said, so an unexpected failure gets
+##     reported rather than swallowed.
 func _sync_notes(result: Dictionary) -> Dictionary:
 	var clobbered: Array = []
 	var opened_behind := 0
+	var nothing_in_depot := false
 	var problems: Array = []
 	var output: Array = result.get("output", [])
 	if output.is_empty():
-		return {"clobbered": clobbered, "opened_behind": 0, "problems": problems}
+		return {"clobbered": clobbered, "opened_behind": 0, "problems": problems,
+				"nothing_in_depot": false}
 	for raw_line in String(output[0]).split("\n"):
 		var line := raw_line.rstrip("\r").strip_edges()
 		if line.is_empty():
@@ -4237,70 +4294,126 @@ func _sync_notes(result: Dictionary) -> Dictionary:
 			clobbered.append(res if not res.is_empty() else local)
 		elif line.contains("is opened and not being changed"):
 			opened_behind += 1
-		elif line.contains("must resolve") or line.contains("up-to-date") \
-				or line.contains("no such file"):
+		elif line.contains("no such file"):
+			nothing_in_depot = true
+		elif line.contains("must resolve") or line.contains("up-to-date"):
 			pass # reported from `resolve -n`, or simply nothing to act on
 		else:
 			problems.append(line)
-	return {"clobbered": clobbered, "opened_behind": opened_behind, "problems": problems}
+	return {"clobbered": clobbered, "opened_behind": opened_behind, "problems": problems,
+			"nothing_in_depot": nothing_in_depot}
 
 
-## The confirmation for a project-wide download. It names the files and calls
-## out the two outcomes that can startle someone: a file that vanishes, and a
-## file whose open tab changes underneath them.
-func _confirm_get_latest(found: Dictionary, notes: Dictionary) -> bool:
-	var note := ""
-	if int(found.deletes) > 0:
-		note += ("\n\n%d of these will be removed from your project folder, because " +
-				"somebody deleted them on the server.") % found.deletes
-	var open_files := _open_editor_files()
-	var open_hits: Array = []
+## The confirmation text, composed apart from the dialog so a self-test can
+## assert on it. Every warning a user gets before a project-wide download is in
+## this string; while it lived inside the dialog call, deleting the warnings
+## broke nothing that any test could see.
+func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
+		open_files: Dictionary) -> String:
+	# Open files split two ways. A file being rewritten gets its tab reloaded.
+	# A file being DELETED cannot be, and its surviving tab is the dangerous
+	# one: saving it puts back what the team just deleted.
+	var deleted: Dictionary = {}
+	for d in found.deleted_names:
+		deleted[String(d)] = true
+	var reloading: Array = []
+	var orphaned: Array = []
 	for name_any in found.names:
-		if open_files.has(String(name_any)):
-			open_hits.append(String(name_any))
-	if not open_hits.is_empty():
+		var res := String(name_any)
+		if not open_files.has(res):
+			continue
+		if deleted.has(res):
+			orphaned.append(res)
+		else:
+			reloading.append(res)
+
+	var note := ""
+	if not reloading.is_empty():
 		note += ("\n\n%d of them %s open in the editor:\n\n%s\n\nThose tabs will be " +
 				"reloaded on the downloaded version, so anything you changed in them and " +
 				"didn't save is lost. Save first if you want to keep it.") \
-				% [open_hits.size(), "is" if open_hits.size() == 1 else "are",
-				_file_listing(open_hits)]
+				% [reloading.size(), "is" if reloading.size() == 1 else "are",
+				_file_listing(reloading)]
+	if not orphaned.is_empty():
+		note += ("\n\nCAREFUL: %d file(s) being deleted %s open in the editor:\n\n%s\n\n" +
+				"Godot can't close a scene tab for you, so the tab stays open on a file " +
+				"that no longer exists - and saving it would put the file back and add it " +
+				"to the depot again. Close those tabs without saving.") \
+				% [orphaned.size(), "is" if orphaned.size() == 1 else "are",
+				_file_listing(orphaned)]
 	if int(notes.opened_behind) > 0:
 		note += ("\n\nYou have %d file(s) checked out that are behind the server. " +
 				"Perforce never overwrites a file you have checked out, so your version " +
 				"is safe - but you will have to combine the two before you can submit. " +
 				"P4Godot names them when it's finished.") % notes.opened_behind
+	if int(found.malformed) > 0:
+		note += ("\n\n%d line(s) of Perforce's answer couldn't be read, so this list may " +
+				"be incomplete. Run \"Get Latest...\" again afterwards.") % found.malformed
 	if int(found.bytes) >= BIG_DOWNLOAD_BYTES:
 		note += "\n\nThis is a large download and may take a while. The editor stays usable."
-	var headline := "Download %d file(s) from the server?" % found.names.size()
-	if int(found.bytes) > 0:
-		headline = "Download %d file(s) (%s) from the server?" \
-				% [found.names.size(), _human_bytes(int(found.bytes))]
+
+	# Say what will happen, not just how many files are involved: "download 200
+	# files" is wrong when all 200 are being erased from the project folder.
+	var writes: int = int(found.adds) + int(found.updates)
+	var size := _human_bytes(int(found.bytes))
+	var headline := ""
+	if writes > 0 and int(found.deletes) > 0:
+		headline = ("Download %d file(s) (%s) from the server, and remove %d from your " +
+				"project folder?") % [writes, size, found.deletes]
+	elif writes > 0:
+		headline = "Download %d file(s) (%s) from the server?" % [writes, size]
+	elif int(found.deletes) > 0:
+		headline = ("Remove %d file(s) from your project folder? They were deleted on the " +
+				"server. Nothing is downloaded.") % found.deletes
+	else:
+		# No records at all, but _get_latest_has_work said yes - so the work is
+		# on files you have checked out, which p4 never overwrites, or on lines
+		# of p4's answer that couldn't be read.
+		headline = "No files need downloading. Bring Perforce's record of what you have up to date?"
+	return "%s\n\n%s%s" % [headline, _file_listing(found.names), note]
+
+
+func _confirm_get_latest(found: Dictionary, notes: Dictionary) -> bool:
 	return await _show_confirm_dialog(
-			("%s\n%d new, %d changed, %d removed.\n\n%s%s")
-			% [headline, found.adds, found.updates, found.deletes,
-			_file_listing(found.names), note],
+			_get_latest_confirm_text(found, notes, _open_editor_files()),
 			"Get Latest", "Cancel")
 
 
-## Put the downloaded contents in front of the user. Godot serves an open tab
-## and the resource cache from memory, so a file rewritten underneath keeps
-## showing the old text - and saving that later overwrites the work that was
-## just downloaded. Files p4 refused to overwrite are skipped: they still hold
-## the user's own version, and reloading would be a no-op at best.
-func _reload_after_sync(names: Array, clobbered: Array) -> Array:
+## Put the downloaded contents in front of the user. Godot serves open tabs AND
+## its resource cache from memory, so a file rewritten underneath either one
+## keeps showing the old contents - and saving that later overwrites the work
+## just downloaded. Open tabs are not the whole set: a scene whose tab was
+## closed earlier is still cached, and reopening it would serve the pre-sync
+## copy, which is exactly why _reload_path has a branch for files with no tab.
+## Anything Godot never loaded needs nothing, and the filesystem scan covers it.
+##
+## Files p4 refused to overwrite are skipped - they still hold the user's own
+## version, so there is nothing new to show.
+func _reload_after_sync(done: Dictionary, clobbered: Array) -> Dictionary:
 	var reloaded: Array = []
+	var orphaned: Array = []
+	if _shutting_down:
+		return {"reloaded": reloaded, "orphaned": orphaned}
 	var open_files := _open_editor_files()
-	for name_any in names:
+	for name_any in done.names:
 		var res := String(name_any)
-		if not res.begins_with("res://") or not open_files.has(res) or clobbered.has(res):
+		if not res.begins_with("res://") or clobbered.has(res):
 			continue
 		# A sync can delete a file. There is nothing to reload then, and asking
-		# the editor to reload a missing scene is an error, not a no-op.
+		# the editor to reload a missing scene is an error rather than a no-op.
+		# An open tab on a deleted file is worth naming, though: saving it would
+		# put back what the team deleted.
 		if not FileAccess.file_exists(res):
+			if open_files.has(res):
+				orphaned.append(res)
 			continue
+		if not (open_files.has(res) or ResourceLoader.has_cached(res)):
+			continue
+		if _shutting_down:
+			break
 		await _reload_path(res)
 		reloaded.append(res)
-	return reloaded
+	return {"reloaded": reloaded, "orphaned": orphaned}
 
 
 ## The files that now need their two versions combined before they can be
@@ -4319,32 +4432,69 @@ func _resolve_preview_names() -> Array:
 	return names
 
 
-## What actually happened, in the order it matters to whoever pressed the
-## button: what arrived, what Perforce would not overwrite, what still needs
-## merging. Every problem here names the next step, because each one leaves the
-## workspace in a state the user has to finish by hand.
-func _get_latest_report(found: Dictionary, after: Dictionary, reloaded: Array,
-		to_resolve: Array) -> String:
+## What actually happened, taken from the sync's own output rather than the
+## preview's - p4 prints a normal-looking record for a file it refused to
+## overwrite, so the refusals are subtracted here. Every problem names its next
+## step, because each one leaves work for the user to finish by hand.
+func _get_latest_report(done: Dictionary, after: Dictionary, reload: Dictionary,
+		to_resolve: Array, exit_code: int) -> String:
 	var clobbered: Array = after.clobbered
-	var landed: int = maxi(found.names.size() - clobbered.size(), 0)
-	var text := "No files needed downloading." if found.names.is_empty() \
-			else "Downloaded %d file(s)." % landed
+	var written: int = maxi(int(done.adds) + int(done.updates) - clobbered.size(), 0)
+	var parts: Array = []
+	if written > 0:
+		parts.append("downloaded %d file(s)" % written)
+	if int(done.deletes) > 0:
+		parts.append("removed %d file(s) that were deleted on the server" % done.deletes)
+	var text := "Nothing was downloaded." if parts.is_empty() \
+			else "Get Latest %s." % " and ".join(parts)
+	var reloaded: Array = reload.reloaded
 	if not reloaded.is_empty():
-		text += " %d open in the editor %s reloaded." \
+		text += " %d file(s) already loaded in the editor %s reloaded." \
 				% [reloaded.size(), "was" if reloaded.size() == 1 else "were"]
+	if not reload.orphaned.is_empty():
+		text += ("\n\nCAREFUL: %d deleted file(s) %s still open in the editor:\n\n%s\n\n" +
+				"The file is gone from your project folder but the tab is still there. " +
+				"Close those tabs WITHOUT saving - a save would put the files back and " +
+				"add them to the depot again.") \
+				% [reload.orphaned.size(), "is" if reload.orphaned.size() == 1 else "are",
+				_file_listing(reload.orphaned)]
 	if not clobbered.is_empty():
 		text += ("\n\nPerforce would not overwrite %d file(s):\n\n%s\n\nThose are changed " +
 				"on your disk but not checked out, so Perforce left your version alone " +
 				"instead of throwing it away. Press \"Reconcile...\" to check them out, " +
-				"then \"Get Latest...\" again.") % [clobbered.size(), _file_listing(clobbered)]
+				"then \"Get Latest...\" again.") \
+				% [clobbered.size(), _file_listing(clobbered, 30)]
 	if not to_resolve.is_empty():
 		text += ("\n\n%d file(s) you have checked out need the two versions combined " +
 				"before you can submit them:\n\n%s\n\nP4Godot can't do that merge. In " +
 				"P4V, right-click the file and choose Resolve, or run `p4 resolve` in a " +
-				"terminal.") % [to_resolve.size(), _file_listing(to_resolve)]
+				"terminal. For an image or a model there is nothing to combine - you keep " +
+				"one version and lose the other - so talk to whoever made the other " +
+				"change first.") % [to_resolve.size(), _file_listing(to_resolve, 30)]
+	if int(done.malformed) > 0:
+		text += ("\n\n%d line(s) of Perforce's answer couldn't be read, so this summary " +
+				"may be incomplete. Press \"Get Latest...\" again to check.") % done.malformed
 	if not after.problems.is_empty():
 		text += "\n\nPerforce also said:\n\n%s" % _file_listing(after.problems, 5)
+	elif exit_code != 0 and clobbered.is_empty():
+		text += ("\n\nPerforce reported a failure but didn't say why (exit code %d). The " +
+				"Log window has the full output. Press \"Get Latest...\" again to see " +
+				"what arrived.") % exit_code
 	return text
+
+
+## The first line of a p4 result. OS.execute hands back one string holding the
+## whole blob, so `output[0]` is everything p4 printed, not its first line -
+## dumping all of it into a dialog buries the part that matters.
+static func _first_line(result: Dictionary) -> String:
+	var output: Array = result.get("output", [])
+	if output.is_empty():
+		return ""
+	for raw in String(output[0]).split("\n"):
+		var line := raw.rstrip("\r").strip_edges()
+		if not line.is_empty():
+			return line
+	return ""
 
 
 ## A file size for a dialog: "940 KB", "12.4 MB". Rounded on purpose - it is
@@ -6393,12 +6543,14 @@ func _run_cli_self_test_if_requested() -> void:
 		if arg == "--p4-selftest-sync-report":
 			# Server-independent: the `p4 sync` output shapes whose records say
 			# the wrong thing, copied from what a 2025.2 server really printed.
+			# It asserts on the two user-facing strings as well as the parsers,
+			# because the parsers were never where a lie would reach the user.
 			#
 			# (a) A refused overwrite. `sync -n` predicts nothing, and the
 			# failing sync prints a perfectly normal `action updated` record for
 			# the file alongside "Can't clobber writable file <path>", exiting
-			# 1. Counting records alone reports that file as downloaded when
-			# the user's own version is still sitting there.
+			# 1. Counting records reports that file as downloaded when the
+			# user's own version is still sitting there.
 			var clobber_blob := "//d/proj/nope.txt - no such file(s).\n" \
 					+ "... depotFile //d/proj/.p4ignore\n" \
 					+ "... clientFile C:\\ws\\proj\\.p4ignore\n" \
@@ -6412,35 +6564,49 @@ func _run_cli_self_test_if_requested() -> void:
 			var crecs := _parse_ztag(cres)
 			var csum := _summarize_sync(crecs)
 			var cnotes := _sync_notes(cres)
+			var no_reload := {"reloaded": [], "orphaned": []}
+			var creport := _get_latest_report(csum, cnotes, no_reload, [], 1)
 			_log("[selftest] clobber blob -> %d record(s), %d changed, clobbered=%s, problems=%s"
 					% [crecs.size(), csum.updates, cnotes.clobbered, cnotes.problems])
-			# problems must stay empty: the tagged field lines are fields, not
-			# messages, and "no such file(s)" is nothing to act on.
+			_log("[selftest] clobber report: %s" % creport.replace("\n", " | "))
+			# The report must count ONE download, not two, and must name the
+			# file it could not write. "problems" must stay empty: the tagged
+			# lines are fields, and "no such file(s)" is nothing to act on.
 			var clobber_ok: bool = crecs.size() == 2 and int(csum.updates) == 2 \
 					and cnotes.clobbered.size() == 1 \
 					and String(cnotes.clobbered[0]) == "C:\\ws\\proj\\.p4ignore" \
-					and cnotes.problems.is_empty()
+					and cnotes.problems.is_empty() \
+					and creport.contains("downloaded 1 file(s)") \
+					and not creport.contains("downloaded 2 file(s)") \
+					and creport.contains("would not overwrite") \
+					and creport.contains("C:\\ws\\proj\\.p4ignore")
 
 			# (b) A file you have checked out that is behind the server. p4
-			# emits NO record for it, only messages, so counting records makes
-			# a sync with real work to do look like "already up to date".
+			# emits NO record for it, only messages, so counting records makes a
+			# sync with real work to do look like "already up to date".
 			var opened_blob := "//d/proj/.p4ignore#3 - is opened and not being changed\n" \
 					+ "... //d/proj/.p4ignore - must resolve #2,#3 before submitting\n"
 			var ores := {"exit_code": 0, "output": [opened_blob]}
 			var osum := _summarize_sync(_parse_ztag(ores))
 			var onotes := _sync_notes(ores)
-			_log("[selftest] opened-behind blob -> %d to write, opened_behind=%d, problems=%s"
-					% [osum.names.size(), onotes.opened_behind, onotes.problems])
+			var has_work: bool = _get_latest_has_work(osum, onotes)
+			var empty_notes := _sync_notes({"exit_code": 0, "output": ["... - file(s) up-to-date.\n"]})
+			var idle_is_idle: bool = not _get_latest_has_work(
+					_summarize_sync([]), empty_notes)
+			_log("[selftest] opened-behind blob -> %d to write, opened_behind=%d, has_work=%s, idle-blob has_work=%s"
+					% [osum.names.size(), onotes.opened_behind, has_work, not idle_is_idle])
 			var opened_ok: bool = osum.names.is_empty() and int(onotes.opened_behind) == 1 \
-					and onotes.problems.is_empty()
+					and onotes.problems.is_empty() and has_work and idle_is_idle
 
 			# (c) sync's action vocabulary is its own: `added` is a file that
 			# wasn't on disk yet, `deleted` one being removed from disk - not
-			# reconcile's "open for add" / "open for delete".
+			# reconcile's "open for add" / "open for delete". totalFileSize is
+			# deliberately NOT the sum of the fileSizes, so summing and reading
+			# the total can be told apart.
 			var mixed_blob := "... depotFile //d/proj/new.png\n" \
 					+ "... clientFile C:\\ws\\proj\\new.png\n" \
 					+ "... rev 1\n... action added\n... fileSize 2048\n" \
-					+ "... totalFileSize 3072\n... totalFileCount 3\n... change 9\n\n" \
+					+ "... totalFileSize 999999\n... totalFileCount 3\n... change 9\n\n" \
 					+ "... depotFile //d/proj/gone.tscn\n" \
 					+ "... clientFile C:\\ws\\proj\\gone.tscn\n" \
 					+ "... rev 1\n... action deleted\n... fileSize 0\n\n" \
@@ -6448,22 +6614,90 @@ func _run_cli_self_test_if_requested() -> void:
 					+ "... clientFile C:\\ws\\proj\\level.gd\n" \
 					+ "... rev 4\n... action updated\n... fileSize 1024\n\n"
 			var msum := _summarize_sync(_parse_ztag({"exit_code": 0, "output": [mixed_blob]}))
-			_log("[selftest] mixed blob -> %d new, %d changed, %d removed, %s, first=%s"
+			_log("[selftest] mixed blob -> %d new, %d changed, %d removed, %s, first=%s, deleted=%s"
 					% [msum.adds, msum.updates, msum.deletes, _human_bytes(int(msum.bytes)),
-					"" if msum.names.is_empty() else msum.names[0]])
+					"" if msum.names.is_empty() else msum.names[0], msum.deleted_names])
 			var mixed_ok: bool = int(msum.adds) == 1 and int(msum.updates) == 1 \
 					and int(msum.deletes) == 1 and int(msum.bytes) == 3072 \
 					and msum.names.size() == 3 \
-					and String(msum.names[0]).ends_with("gone.tscn")
+					and String(msum.names[0]).ends_with("gone.tscn") \
+					and msum.deleted_names.size() == 1 \
+					and String(msum.deleted_names[0]).ends_with("gone.tscn")
 
-			if clobber_ok and opened_ok and mixed_ok:
+			# (d) The confirmation carries every warning the user gets before a
+			# project-wide download, and none of it was reachable by a test
+			# while it lived inside the dialog call. Two open files here: one
+			# being rewritten (its tab reloads, unsaved work is lost) and one
+			# being deleted (its tab CANNOT reload, and saving it would put the
+			# file back into the depot).
+			var open_files := {"C:\\ws\\proj\\level.gd": true, "C:\\ws\\proj\\gone.tscn": true}
+			var confirm := _get_latest_confirm_text(msum, {"opened_behind": 2}, open_files)
+			_log("[selftest] confirm text: %s" % confirm.replace("\n", " | "))
+			var confirm_ok: bool = confirm.contains("didn't save is lost") \
+					and confirm.contains("C:\\ws\\proj\\level.gd") \
+					and confirm.contains("CAREFUL") \
+					and confirm.contains("put the file back") \
+					and confirm.contains("C:\\ws\\proj\\gone.tscn") \
+					and confirm.contains("checked out that are behind the server") \
+					and confirm.contains("remove 1 from your project folder")
+
+			# (e) p4 writes its messages to stderr and its records to stdout,
+			# and OS.execute merges both into one blob, so a message can land
+			# mid-record. That leaves a record with no clientFile and a
+			# clientFile with a newline in it. Silently dropping those would
+			# take a real file out of the download list and out of the reload
+			# set with it, so they are counted and the user is told the list may
+			# be short.
+			var torn_blob := "... depotFile //d/proj/a.tscn\n" \
+					+ "//d/proj/b.gd#3 - is opened and not being changed\n" \
+					+ "... //d/proj/b.gd - must resolve #2,#3 before submitting\n" \
+					+ "... clientFile C:\\ws\\proj\\a.tscn\n"
+			var tsum := _summarize_sync(_parse_ztag({"exit_code": 0, "output": [torn_blob]}))
+			var tconfirm := _get_latest_confirm_text(tsum, {"opened_behind": 0}, {})
+			_log("[selftest] torn blob -> %d usable, %d unreadable" % [tsum.names.size(), tsum.malformed])
+			var torn_ok: bool = int(tsum.malformed) > 0 \
+					and tconfirm.contains("couldn't be read")
+
+			# (f) The two after-the-fact outcomes the user has to act on by
+			# hand: a tab left open on a deleted file, and a file that now needs
+			# the two versions combined. Both are reported from data the records
+			# don't carry, so both need asserting.
+			var orphan_reload := {"reloaded": [], "orphaned": ["res://gone.tscn"]}
+			var quiet_notes := {"clobbered": [], "opened_behind": 0, "problems": [],
+					"nothing_in_depot": false}
+			var handwork := _get_latest_report(msum, quiet_notes, orphan_reload,
+					["res://player.gd"], 0)
+			_log("[selftest] hand-work report: %s" % handwork.replace("\n", " | "))
+			var handwork_ok: bool = handwork.contains("res://gone.tscn") \
+					and handwork.contains("WITHOUT saving") \
+					and handwork.contains("res://player.gd") \
+					and handwork.contains("Resolve") \
+					and handwork.contains("removed 1 file(s)")
+
+			# (g) A sync that failed for a reason p4 didn't explain must not
+			# read as success.
+			var silent_fail := _get_latest_report(_summarize_sync([]), quiet_notes,
+					no_reload, [], 1)
+			_log("[selftest] silent-failure report: %s" % silent_fail.replace("\n", " | "))
+			var silent_ok: bool = silent_fail.contains("didn't say why")
+
+			if clobber_ok and opened_ok and mixed_ok and confirm_ok and torn_ok \
+					and handwork_ok and silent_ok:
 				_log("[selftest] PASS: sync-report")
 			elif not clobber_ok:
 				_log("[selftest] FAIL: sync-report - a refused overwrite read as a successful download")
 			elif not opened_ok:
 				_log("[selftest] FAIL: sync-report - a checked-out file behind the server read as nothing to do")
-			else:
+			elif not mixed_ok:
 				_log("[selftest] FAIL: sync-report - wrong counts for sync's own actions")
+			elif not confirm_ok:
+				_log("[selftest] FAIL: sync-report - the confirmation dropped a data-loss warning")
+			elif not torn_ok:
+				_log("[selftest] FAIL: sync-report - an unreadable record was dropped silently")
+			elif not handwork_ok:
+				_log("[selftest] FAIL: sync-report - the report didn't name the work left to do by hand")
+			else:
+				_log("[selftest] FAIL: sync-report - an unexplained failure read as success")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-unchanged-save":
@@ -7389,21 +7623,39 @@ func _run_cli_self_test_if_requested() -> void:
 			#   p4 sync <file>#1; chmod +w; append     the case sync -n cannot
 			#                                          predict - changed on
 			#                                          disk, not checked out
+			#   p4 sync <file>#1; p4 edit <file>       checked out and behind:
+			#                                          p4 leaves the file alone
+			#                                          and wants a resolve
 			#
-			# Then restore with `p4 sync -f <file>`. The test accepts either
-			# staging and asserts the outcome that staging demands, so one
-			# test covers both; it fails if nothing was staged at all, because
-			# "already up to date" would otherwise pass for free.
+			# Then restore with `p4 revert <file>` (third case) and
+			# `p4 sync -f <file>`. The test accepts any of the three and asserts
+			# the outcome that staging demands, so one test covers all of them;
+			# it fails if nothing was staged at all, because "already up to
+			# date" would otherwise pass for free. Note the third staging
+			# produces NO preview record - only a message - which is why the
+			# staging check has to consult the notes as well as the records.
+			# Pass a `.gd` as well as a `.tscn` across runs: scripts take the
+			# _reload_script path, which is the one with the CACHE_MODE_IGNORE
+			# subtlety, and a scene that only ever loads as a scene never
+			# exercises it.
 			var path := arg.substr("--p4-selftest-get-latest=".length())
 			_selftest_auto_answer = "confirm"
-			if path.get_extension().to_lower() in ["tscn", "scn"]:
+			var ext := path.get_extension().to_lower()
+			if ext == "tscn" or ext == "scn":
 				EditorInterface.open_scene_from_path(path)
 				await _selftest_drain_frames()
+			elif ext == "gd" or ext == "cs":
+				var scr := load(path) as Script
+				if scr:
+					EditorInterface.edit_script(scr)
+					await _selftest_drain_frames()
 			var was_open: bool = _open_editor_files().has(path)
-			var staged := _summarize_sync(_parse_ztag(
-					await _p4_exec(["-ztag", "sync", "-n", _project_scope()])))
-			_log("[selftest] staged %d file(s) behind head: %s (open in editor=%s)"
-					% [staged.names.size(), staged.names, was_open])
+			var before: Dictionary = await _p4_exec(["-ztag", "sync", "-n", _project_scope()])
+			var staged := _summarize_sync(_parse_ztag(before))
+			var staged_notes := _sync_notes(before)
+			var checked_out_behind: bool = int(staged_notes.opened_behind) > 0
+			_log("[selftest] staged: %d record(s) behind head %s, %d checked-out-and-behind (open in editor=%s)"
+					% [staged.names.size(), staged.names, staged_notes.opened_behind, was_open])
 			var report := await _get_latest_flow()
 			await _selftest_drain_frames()
 			_log("[selftest] report: %s" % report.replace("\n", " | "))
@@ -7411,25 +7663,38 @@ func _run_cli_self_test_if_requested() -> void:
 					await _p4_exec(["-ztag", "sync", "-n", _project_scope()])))
 			_log("[selftest] after the flow, %d file(s) still behind: %s"
 					% [still_behind.names.size(), still_behind.names])
-			var was_staged: bool = staged.names.has(path)
+			var was_staged: bool = staged.names.has(path) or checked_out_behind
 			var came_up_to_date: bool = not still_behind.names.has(path)
 			var refusal_reported: bool = report.contains("would not overwrite") \
 					and report.contains(path)
-			# A file p4 refused to overwrite MUST still be behind - that is the
-			# protection working - and the report must name it. Anything else
-			# had to come up to date.
-			var outcome_ok: bool = came_up_to_date or refusal_reported
-			var reload_ok: bool = not (was_open and came_up_to_date) \
+			var resolve_reported: bool = report.contains("two versions combined") \
+					and report.contains(path)
+			var outcome := ""
+			var outcome_ok := false
+			if checked_out_behind:
+				# p4 never overwrites a file you have checked out. It moves the
+				# have revision and wants a resolve, and the report must say so
+				# - left unsaid, the file silently can't be submitted.
+				outcome_ok = resolve_reported
+				outcome = "resolve reported"
+			elif not came_up_to_date:
+				# A file p4 refused to overwrite MUST still be behind - that is
+				# the protection working - and the report must name it.
+				outcome_ok = refusal_reported
+				outcome = "refusal reported"
+			else:
+				outcome_ok = true
+				outcome = "downloaded and reloaded"
+			var reload_ok: bool = not (was_open and came_up_to_date and not checked_out_behind) \
 					or report.contains("reloaded")
 			if not was_staged:
 				_log("[selftest] FAIL: get-latest - '%s' was not behind head; stage it first (see the source comment)" % path)
 			elif not outcome_ok:
-				_log("[selftest] FAIL: get-latest - the file is still behind and the report doesn't say why")
+				_log("[selftest] FAIL: get-latest - expected '%s' and the report doesn't say it" % outcome)
 			elif not reload_ok:
 				_log("[selftest] FAIL: get-latest - the open tab was not reloaded onto the downloaded version")
 			else:
-				_log("[selftest] PASS: get-latest (%s)"
-						% ("refusal reported" if refusal_reported else "downloaded and reloaded"))
+				_log("[selftest] PASS: get-latest (%s)" % outcome)
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-external-scan":
