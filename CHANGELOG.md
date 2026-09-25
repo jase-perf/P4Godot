@@ -2,6 +2,43 @@
 
 Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
+## 0.15.0 — 2026-09-24
+
+- **New "Get Latest..." button downloads the whole project.** Until now
+  P4Godot synced one file at a time, and getting a teammate's work meant
+  leaving Godot for P4V. It lists the files and the total size first, then
+  downloads, then reloads whatever you had open — an open scene showed the old
+  version otherwise, and saving it later would have overwritten the work just
+  downloaded. Scoped to the Godot project, not the whole workspace.
+
+  Two outcomes are reported instead of passing silently, because `p4 sync`
+  hides both (verified against a 2025.2 server):
+  - **A file changed on disk but not checked out.** Perforce refuses to
+    overwrite it, which is the point — and that is a state P4Godot creates on
+    purpose, since a refused checkout leaves the file writable so a later sync
+    can't erase it. `sync -n` predicts nothing, and the failing sync reports
+    the file as `action updated` while exiting 1, so counting records alone
+    would have claimed the file was downloaded when the user's own version was
+    still sitting there. Those files are now named, with the fix: Reconcile
+    them, then Get Latest again.
+  - **A file you have checked out that someone else changed too.** p4 moves
+    your have revision to head and leaves the file alone, emitting no record
+    at all — so it silently became a file that couldn't be submitted until it
+    was merged. Those files are now named, pointing at P4V's Resolve, since
+    P4Godot has no merge of its own.
+
+- Documentation split by what the reader is actually doing. The README now
+  assumes the normal case — the project is already in Perforce and you're
+  joining it — and putting a project in for the first time moved to
+  `docs/first-time-setup.md`, which does it in P4V. That is a one-time job for
+  one person, and no engine integration does it, the Unity and Unreal ones
+  included.
+- A "What you need" section that repeated the quick start's own list is gone;
+  the two facts only it carried (where P4Godot looks for `p4`, and which
+  Perforce configuration it reads before asking) moved to the places that
+  need them. Notes for people working on the plugin moved to
+  `CONTRIBUTING.md`.
+
 ## 0.14.1 — 2026-09-23
 
 - **Plain-English rewrite of the dialogs, aimed at someone who has never used

@@ -20,7 +20,7 @@ No alt-tabbing to another program.
 
 New to version control? This page assumes you've never used it. Perforce
 words that don't mean what you'd guess — *open*, *revert*, *check out* — are
-all in the [glossary](docs/glossary.md).
+all in the [glossary](https://github.com/jase-perf/P4Godot/blob/main/docs/glossary.md).
 
 P4Godot is written in GDScript, so there's nothing to compile. Behind the
 scenes it runs `p4`, Perforce's command-line program, for you.
@@ -41,8 +41,10 @@ Before you start, you need:
   name, and your password. Don't have a server? Perforce is
   [free for up to five users](https://www.perforce.com/products/helix-core) —
   set that up first, then come back.
-- **A Godot project inside a Perforce workspace folder**, or the willingness
-  to put one there. Step 4 explains what a workspace is.
+- **A Godot project that's already in Perforce.** Usually someone else set
+  that up and you're joining them. If nobody has yet, one person does it once
+  in P4V and then everybody follows this page:
+  [putting a project into Perforce for the first time](https://github.com/jase-perf/P4Godot/blob/main/docs/first-time-setup.md).
 
 1. **Install the `p4` command-line client.** To check whether you already
    have it, run `p4 -V` in a terminal. If it prints a version, skip this step.
@@ -70,54 +72,25 @@ Before you start, you need:
    asks you to pick. It asks only for what's missing — the server address,
    your password, or the workspace.
    *You should see* your user name and workspace in the P4G toolbar.
-5. **Tell Perforce what to ignore — before your first submit.** Godot keeps
-   a `.godot/` cache folder that every machine rebuilds for itself, and it
-   must stay out of the depot. Save this as `.p4ignore` in your project
-   folder:
-
-   ```
-   # Godot's local cache and per-user editor state
-   .godot/
-   # Temporary files from interrupted saves
-   *.tmp
-   ```
-
-   Then check the rule is working. In a terminal, in your project folder:
-
-   ```
-   p4 ignores -i -v .godot/x
-   ```
-
-   There is no file called `x` — you're asking Perforce a hypothetical: *if
-   one existed there, would you ignore it?* The answer ends in either
-   **ignored** (good, and it names the rule that did it) or **not ignored**.
-   If you get `not ignored`, run `p4 set P4IGNORE=.p4ignore` and ask again.
-   Skip this step and your next submit pushes thousands of cache files to
-   the server.
-   [More on setting up a project →](#setting-up-a-godot-project-in-perforce)
-6. **Share the plugin with your team.** Press **Reconcile** in the P4G dock.
-   It finds the new `addons/p4godot/` files and adds them to your changelist;
-   submit them along with `project.godot`. This matters —
+5. **Share the plugin with your team.** Press **Reconcile...** in the P4G
+   panel. It finds the new `addons/p4godot/` files and adds them to your
+   changelist; submit them along with `project.godot`. This matters —
    [here's why](#keep-the-plugin-itself-in-perforce).
+   If Reconcile warns that files under `.godot/` are about to go to the
+   server, stop and fix the ignore rule first —
+   [how to](https://github.com/jase-perf/P4Godot/blob/main/docs/first-time-setup.md#2-tell-perforce-to-ignore-godots-cache).
 
 Now edit a scene or script that's already in Perforce. P4Godot offers to
 check it out the moment you change it. Files not yet in Perforce get no
 prompt: add them with Reconcile.
 
-**Getting your teammates' work.** P4Godot syncs one file at a time
-(right-click → **P4: Get Latest (Sync)**). It has no whole-project "get
-latest" yet, so use P4V's **Get Latest Revision** on the project folder, or
-run `p4 sync` in a terminal. Restart Godot afterwards if scenes or scripts
-changed.
-
 ## Your first change, start to finish
 
 This is the loop you'll repeat all day. Five steps.
 
-1. **Get everyone else's work first.** In P4V, right-click the project folder
-   → **Get Latest Revision**. (P4Godot does this one file at a time, not the
-   whole project — see the note above.) If scenes or scripts changed,
-   restart Godot.
+1. **Get everyone else's work first.** Press **Get Latest...** in the P4G
+   panel. It lists what's about to arrive before it downloads anything.
+   *You should see* the files land, and any of them you have open reload.
 2. **Change something.** Move a node, edit a script, whatever. The moment you
    do, P4Godot asks whether to check the file out. Say **Check Out**.
    *You should see* the file appear in the P4G panel under **Default
@@ -179,84 +152,28 @@ replace a read-only file, so if you forget step 1 the files end up changed
 but not checked out — the focus-in scan offers them on your next alt-tab. On
 Windows the install fails instead, which is at least obvious.
 
-## Setting up a Godot project in Perforce
-
-These steps apply to any Godot project under Perforce, with or without the
-plugin. Do them in order: the ignore file and the typemap only affect files
-added after them.
-
-**1. Put the project inside a workspace.** A workspace is Perforce's link
-between the server and one folder on your computer, called its *root*. Your
-project folder has to be that root, or inside it. If you don't have a
-workspace yet, the easiest way is P4V → **Connection → New Workspace**. (The
-command-line equivalent, `p4 client`, opens a form in a terminal text editor
-— on macOS and Linux that's usually `vi`, which is hard to escape if you
-haven't met it. Use P4V unless you're comfortable there.)
-
-**2. Keep `.godot/` out of the depot.** It is Godot's local cache and
-per-user editor state, including the connection choice P4Godot stores for
-this project. Submit everything else, including `*.import` and `*.uid` files:
-they hold import settings and resource IDs your teammates need. Save this as
-`.p4ignore` in the project folder:
-
-```
-# Godot's local cache and per-user editor state
-.godot/
-# Temporary files from interrupted saves
-*.tmp
-```
-
-Then check it in a terminal, in the project folder:
-
-```
-p4 ignores -i -v .godot/x
-```
-
-`x` isn't a real file — you're asking whether a file there *would* be
-ignored. The answer says either **ignored** (and names the rule) or **not
-ignored**. If you get `not ignored`, run `p4 set P4IGNORE=.p4ignore`, which
-tells `p4` what your ignore file is called, and ask again.
-
-Ignore rules only stop files being *added*. If `.godot/` is already in the
-depot, take it out with `p4 delete -k .godot/...` and submit. The `-k` keeps
-your local copy of the files while removing them from the server.
-
-**3. Set filetypes for art and `project.godot`.** A file's *filetype* is how
-Perforce handles it — as text, as binary, as always-writable — which is a
-different idea from "PNG versus WAV". The *typemap* is a server-wide table
-that picks a filetype for each new file from its name.
-
-Changing it needs admin rights on the server. On a small team that's probably
-you; if it isn't, send this section to whoever runs your server. Run
-`p4 typemap`, add lines like these under `TypeMap:`, and save. (This opens a
-form in a terminal text editor — on macOS and Linux usually `vi`. If that's
-unfamiliar territory, ask your admin.)
-
-```
-TypeMap:
-	binary+l //....png
-	binary+l //....psd
-	binary+l //....blend
-	binary+l //....glb
-	binary+l //....wav
-	text+w //....godot
-```
-
-- `+l` is exclusive checkout. Binary art can't be merged, so it stops two
-  people from editing the same file, and P4Godot shows who holds the lock the
-  moment you try to edit it. Adjust the list to your asset types.
-- `+w` keeps a file always writable. Godot rewrites `project.godot` at
-  startup, and this stops that from failing.
-- `.tscn`, `.tres`, `.gd`, and `.import` files are text, and the defaults
-  suit them.
-
-The typemap only affects files added afterward. For a file already
-submitted, run `p4 edit -t <type> <file>` and submit.
-
-**4. Add and submit the project.** Press **Reconcile** in the P4G dock (or
-use P4V), check that nothing under `.godot/` is listed, and submit.
-
 ## Features
+
+### Getting everyone else's work
+
+**Get Latest...** downloads every file in the project that someone has
+submitted since you last looked. It shows you the list and the total size
+first, then downloads, then reloads anything you had open — so an open scene
+shows the new version instead of quietly keeping the old one.
+
+It also tells you about the two things it can't simply download:
+
+- **A file you changed without checking it out.** Perforce refuses to
+  overwrite it, which is the point: your work isn't thrown away. P4Godot names
+  those files and tells you to Reconcile them first.
+- **A file you have checked out that someone else changed too.** Perforce
+  leaves yours alone and expects the two versions to be combined. P4Godot
+  names those files; do the merge in P4V (right-click → **Resolve**) or with
+  `p4 resolve`.
+
+It covers the Godot project, not the whole workspace, because a workspace
+often holds more than one project. Single files still have right-click →
+**P4: Get Latest (Sync)**.
 
 ### Claiming files as you edit them
 
@@ -308,8 +225,14 @@ flow opens at startup and asks only for what's missing:
 - **Workspace**, suggested from your existing workspaces on the server,
   ranked by whether their root contains this project.
 
-Your choices are stored per project and per user, and passed to `p4` as
-command-line flags. Your terminal, P4V, and other projects are unaffected.
+Before it asks anything, P4Godot uses the Perforce configuration you already
+have: `P4CONFIG` files, values saved with `p4 set`, and login tickets. On
+macOS, variables exported in a shell profile don't reach apps launched from
+the Dock, so use `p4 set` or these prompts instead of your shell profile.
+
+Whatever you choose here is stored per project and per user, and passed to
+`p4` as command-line flags. Your terminal, P4V, and other projects are
+unaffected.
 
 <!-- 📷 SCREENSHOT (optional): the workspace-suggestion dialog from connection
      setup. Suggested file: docs/images/connection-setup.png -->
@@ -324,8 +247,8 @@ From there you can:
 - **Drag and drop files between changelists**, or move them from the
   right-click menu.
 - **Diff, revert, sync, and reload** individual files.
-- **Reconcile** the project to find edits, adds, and deletes made outside
-  the editor.
+- **Get Latest** the whole project, and **Reconcile** it to find edits, adds,
+  and deletes made outside the editor.
 - **Revert Unchanged** to clean up files with no actual edits. Files open in
   the editor are skipped, so unsaved changes are never lost.
 
@@ -407,20 +330,6 @@ status check and any checkout), which has to finish before Godot writes. The
 long output is truncated), and the Verbose setting adds the read-only status
 queries.
 
-## What you need
-
-- **Godot 4.7 or later.**
-- **The `p4` command-line client.** P4Godot looks for it on your `PATH`,
-  then in the usual install locations: `C:\Program Files\Perforce` on
-  Windows, and Homebrew's folders on macOS. Apps launched from the macOS Dock
-  don't see your shell's `PATH`, which is why the fallback exists. To use a
-  different copy, set **Editor Settings → Perforce → Executable Path**.
-- **A Perforce workspace that contains your Godot project.** P4Godot uses
-  your existing p4 configuration: `P4CONFIG` files, values saved with
-  `p4 set`, and login tickets. On macOS, variables exported in a shell
-  profile don't reach apps launched from the Dock, so use `p4 set` or the
-  setup prompts instead.
-
 ## Settings
 
 The settings button on the right of the P4G dock toolbar, next to **Log**
@@ -474,6 +383,10 @@ contents really changed, P4Godot checks it out afterwards.
   without checkout. Press Refresh to retry sooner.
 - **Single sign-on:** the login prompt asks for a password. With SSO, log in
   once with `p4 login` or P4V, and P4Godot uses that ticket.
+- **Combining two people's edits isn't implemented.** If you and a teammate
+  both changed the same text file, Perforce wants the versions merged
+  (*resolved*) before you can submit. Get Latest tells you which files need
+  it; do the merge in P4V (right-click → **Resolve**) or with `p4 resolve`.
 - **Shelving** isn't implemented yet.
 
 ## Troubleshooting
@@ -495,14 +408,22 @@ contents really changed, P4Godot checks it out afterwards.
 - **P4Godot says it can't add itself.** Your `.p4ignore` covers the plugin
   folder. Run `p4 ignores -i -v addons/p4godot/x` — if it answers `ignored`,
   it names the rule and the line number to change.
+- **"Perforce would not overwrite" some files after Get Latest.** Those files
+  are changed on your disk but not checked out, so Perforce left your version
+  alone rather than throw it away. That's usually a checkout it refused
+  earlier, or a file another program wrote. Press **Reconcile...** to check
+  them out, then **Get Latest...** again — after which Perforce will ask you
+  to combine the two versions.
 - **"Not connected" in the toolbar.** Click it, or press Refresh (the
   circular-arrow button at the left end of the P4G toolbar), to rerun
   connection setup. It names what's missing. The P4 Log window (toolbar →
   **Log**) shows the exact error.
 - **"Couldn't find the p4 command-line client."** Install `p4` (see
-  [Quick start](#quick-start)) and press Refresh. If it's installed somewhere
-  unusual, set **Editor Settings → Perforce → Executable Path** to its full
-  path.
+  [Quick start](#quick-start)) and press Refresh. P4Godot looks on your
+  `PATH`, then in `C:\Program Files\Perforce` on Windows and Homebrew's
+  folders on macOS — that fallback exists because apps launched from the macOS
+  Dock don't see your shell's `PATH`. If your copy is somewhere else again, set
+  **Editor Settings → Perforce → Executable Path** to its full path.
 - **Wrong workspace.** Click the connection status in the toolbar (it shows
   `user @ workspace`) and pick a different workspace. The choice is stored per
   project. If you'd rather use a `P4CONFIG` file in the workspace root, it
@@ -512,8 +433,9 @@ contents really changed, P4Godot checks it out afterwards.
   sometimes rewrites `project.godot` at startup (version stamps, plugin
   state), which fails while the file is read-only. Give it the
   always-writable filetype once with
-  `p4 edit -t text+w project.godot`, then submit. See the typemap above to
-  make it the default for new projects.
+  `p4 edit -t text+w project.godot`, then submit. To make that the default for
+  new projects, see
+  [filetypes for art and `project.godot`](https://github.com/jase-perf/P4Godot/blob/main/docs/first-time-setup.md#3-set-filetypes-for-art-and-projectgodot).
 - **Something else.** Turn on **Verbose log** in the settings menu and
   repeat the action. The log shows every command and its output. Please
   include it when you
@@ -527,23 +449,7 @@ Linux as well, but those have had less testing. Please
 [open an issue](https://github.com/jase-perf/P4Godot/issues) if something
 misbehaves.
 
-## Development
-
-Everything lives in `addons/p4godot/p4godot.gd`. The plugin has built-in
-self-tests, run headless:
-
-```
-godot --headless --editor --path <project> -- --p4-selftest-<name>
-```
-
-Server-independent tests include `save-guards`, `prewrite`,
-`unchanged-save`, `exec-quoting`, `parse-ztag`, `diff-align`, and
-`dismiss-dialog`. Live tests such as `probe`, `list-opened`, and
-`create-changelist` need a workspace. Tests that check a result log
-`[selftest] PASS: <name>` or `[selftest] FAIL: <name>`, and the listing tests
-print what they found. See `_run_cli_self_test_if_requested` for the full
-list, and `docs/manual-tests.md` for the checks that need a real editor
-window.
+Working on the plugin itself? See [CONTRIBUTING.md](https://github.com/jase-perf/P4Godot/blob/main/CONTRIBUTING.md).
 
 ## License
 

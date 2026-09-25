@@ -48,6 +48,10 @@ by hand:
 | 9 | Create two new files and change one tracked file outside Godot, then press **Reconcile**. | The confirmation lists all three by name and reads `add: 2, edit: 1, delete: 0`. Accept: all three appear in the default changelist. |
 | 10 | Have a teammate check out a `+l` file, change that file locally in another program, then press **Reconcile** (and separately, click back into Godot and accept the checkout). | A dialog names the file Perforce refused and says who has it. Pressing Reconcile again does not report a phantom change that nothing can clear. |
 | 11 | In a project whose `project.godot` is in Perforce but whose `addons/p4godot/` is not, open the project. | On startup, a dialog explains that teammates would see the plugin fail to load, and offers **Add to Perforce**. Accept: the addon files show as adds in the default changelist. Reopen the project — it does not ask twice once answered. |
+| 12 | With nothing out of date, press **Get Latest...**. | One dialog: "Your project is already up to date". No sync runs. |
+| 13 | Have a teammate submit a change to a scene you have open in a tab. Press **Get Latest...**. | The confirmation names the file, gives the download size, and warns that the open tab will reload. Accept: the tab shows the new version, and the report says 1 file downloaded and 1 reloaded. |
+| 14 | In a terminal: `p4 sync <file>#1`, then make that file writable and change it without checking it out. Press **Get Latest...**. | The report says **0** downloaded, names the file under "Perforce would not overwrite", and tells you to Reconcile first. The file on disk still has your change. (This is the case the preview cannot predict — it lists the file as if it would download fine.) |
+| 15 | Check out a file, then have a teammate submit a change to that same file. Press **Get Latest...**. | The confirmation warns that a checked-out file is behind the server. The report names the file as needing the two versions combined and points at P4V's **Resolve**. Your version on disk is untouched. |
 
 ## Screenshots for the README
 
