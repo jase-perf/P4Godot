@@ -2,6 +2,48 @@
 
 Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
+## Unreleased
+
+- **Get Latest and Sync This File can no longer overwrite an edit Perforce
+  doesn't know about.** They ran a plain `p4 sync`, which replaces any
+  read-only file without looking at it. A file can be changed and still
+  read-only: on macOS and Linux Godot saves by renaming a temporary file over
+  the target, which a read-only target doesn't stop. A plain sync then replaced
+  that edit with the server's version and reported only "updating"
+  (reproduced on Windows against a 2025.2 server, with a file edited and set
+  back to read-only). Both now run `p4 sync -s`, which compares each file with
+  the revision you have and leaves a changed one alone.
+  - The refused files are named before the download (the preview predicts
+    them), in the report afterwards, and when they are the only thing newer on
+    the server, where the old answer would have been "already up to date".
+  - A file that is unlocked but unchanged used to be reported as "would not
+    overwrite" with advice to Reconcile, which found nothing to do, so it
+    stayed behind the server for good. Those are now set back to read-only and
+    downloaded. The second pass is a safe sync too.
+  - Cost: `sync -s` reads every file it is about to replace, once for the
+    preview and once for the download.
+
+- **A failed submit no longer says "nothing was sent" without checking.** When
+  the connection drops partway through, the server may still finish the
+  submit. P4Godot now asks the server what became of the changelist before it
+  says anything, and reports one of three things: it was submitted (and as
+  which number), it was not, or it can't tell and you shouldn't submit again
+  yet.
+  - The default changelist is submitted as a numbered changelist carrying your
+    description, because the number is what makes the question askable. After
+    a refused submit your files are in that changelist, which the message
+    names.
+  - `p4 submit` waits up to 10 minutes for a silent server instead of 2, so a
+    slow server-side check isn't cut off.
+
+- **You can change the server, user, or workspace after setup.** The gear menu
+  has a new **Connection settings...** item, and the workspace picker shows
+  which server and user it is listing workspaces for, with a **Change Server
+  or User...** button. Until now the only route back was clicking the
+  connection status, which offered the workspace list and nothing else, and a
+  P4PORT pointing at another project's server looked the same as having no
+  workspace. Emptying a box goes back to your normal Perforce settings.
+
 ## 0.15.0 — 2026-09-24
 
 - **New "Get Latest..." button downloads the whole project.** Until now

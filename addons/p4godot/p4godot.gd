@@ -319,6 +319,8 @@ var _suppress_auto_checkout: bool = false
 var _dialog_busy: bool = false
 var _dialog_result_ready: bool = false
 var _dialog_result_confirmed: bool = false
+# Set when a dialog was closed by its extra button (see _show_option_dialog).
+var _dialog_result_extra: bool = false
 
 # Failed-save rescue batching. Save All emits one scene_saved per scene;
 # failures accumulate here and a single deferred dialog covers them all,
@@ -369,6 +371,11 @@ var _fstat_failed: Dictionary = {}
 # Network limits and the circuit breaker (see _with_connection_flags).
 const NET_MAXWAIT_SEC := 120     # background commands: bound a hung server
 const NET_MAXWAIT_SAVE_SEC := 30 # the blocking calls right before a save
+# `p4 submit` alone: a server-side submit trigger can legitimately say nothing
+# for minutes, and giving up on the read mid-submit doesn't stop the server
+# finishing it (see _submit_verdict). Still bounded, because nothing can cancel
+# a running p4 and a hung one would block every later command and editor exit.
+const NET_MAXWAIT_SUBMIT_SEC := 600
 const UNREACHABLE_BACKOFF_MSEC := 60000
 var _unreachable_until_msec: int = 0
 
@@ -696,48 +703,131 @@ func _suggest_port() -> String:
 	return ""
 
 
+const CHANGE_SERVER_TEXT := "Change Server or User..."
+
+
 ## Suggest one of the user's existing workspaces for this project; the picked
-## name becomes the per-project client override. Returns false on cancel.
+## name becomes the per-project client override. Returns false on cancel, and
+## true when something changed that setup should re-probe: a workspace was
+## picked, or the server or user was changed from here.
+##
+## The dialog names the server and user it is listing workspaces for. A
+## P4PORT that is set and reachable but belongs to a different project's
+## server looks, from here, like "you have no workspace for this project" -
+## and without the server on screen there is nothing to tell the two apart.
 func _pick_client() -> bool:
-	var result: Dictionary = await _p4_exec(["-ztag", "clients", "--me"])
-	if result.exit_code != 0:
-		# --me needs 2020.1+; fall back to filtering by user name.
+	while not _shutting_down:
 		var user := _override_user if not _override_user.is_empty() else _p4_user
-		if not user.is_empty():
-			result = await _p4_exec(["-ztag", "clients", "-u", user])
-	var clients: Array = _parse_ztag(result) if result.exit_code == 0 else []
-	var matches: Array = []
-	var others: Array = []
-	for c in clients:
-		if String(c.get("client", "")).is_empty():
+		var result: Dictionary = await _p4_exec(["-ztag", "clients", "--me"])
+		if result.exit_code != 0:
+			# --me needs 2020.1+; fall back to filtering by user name.
+			if not user.is_empty():
+				result = await _p4_exec(["-ztag", "clients", "-u", user])
+		var clients: Array = _parse_ztag(result) if result.exit_code == 0 else []
+		var matches: Array = []
+		var others: Array = []
+		for c in clients:
+			if String(c.get("client", "")).is_empty():
+				continue
+			if _project_inside_root(String(c.get("Root", ""))):
+				matches.append(c)
+			else:
+				others.append(c)
+		var ordered: Array = matches + others
+		var where := "Server:  %s\nUser:  %s\n\n" % [
+				_p4_port if not _p4_port.is_empty() else _override_port, user]
+		if ordered.is_empty():
+			# "No workspaces" is only true if the server was asked and answered.
+			var listed: bool = int(result.exit_code) == 0
+			var res: Dictionary = await _show_input_dialog("P4 Connection Setup", where +
+					("You have no workspaces on this server.\n\n" if listed else
+					"P4Godot couldn't list your workspaces on this server:\n%s\n\n"
+							% _first_line(result)) +
+					"If that's the wrong server or user, press \"" + CHANGE_SERVER_TEXT + "\".\n" +
+					"Otherwise create a workspace in P4V (or with `p4 client`) whose root contains\n" +
+					"this project, then press Refresh (the circular-arrow button) in the P4G dock.\n" +
+					"Or enter a workspace name to use directly:",
+					"", false, "Use Workspace", false, CHANGE_SERVER_TEXT)
+			if res.extra:
+				if (await _edit_connection()).changed:
+					return true
+				continue
+			if not res.ok or String(res.text).strip_edges().is_empty():
+				return false
+			_override_client = String(res.text).strip_edges()
+			return true
+		var options := PackedStringArray()
+		var preselect := 0
+		for i in ordered.size():
+			var ws_name := String(ordered[i].get("client", ""))
+			options.append("%s   (%s)" % [ws_name, String(ordered[i].get("Root", ""))])
+			if ws_name == _p4_client:
+				preselect = i
+		var head := "Found a workspace whose root contains this project.\n" if not matches.is_empty() \
+				else "None of your workspaces' roots contain this project - pick one anyway,\nor cancel and create a workspace for it first.\n"
+		var picked: Dictionary = await _show_option_dialog("P4 Connection Setup",
+				where + head + "Workspace to use for this project (stored per-project, per-user):",
+				options, preselect, "Use This Workspace", CHANGE_SERVER_TEXT)
+		if picked.extra:
+			if (await _edit_connection()).changed:
+				return true
 			continue
-		if _project_inside_root(String(c.get("Root", ""))):
-			matches.append(c)
-		else:
-			others.append(c)
-	var ordered: Array = matches + others
-	if ordered.is_empty():
-		var res: Dictionary = await _show_input_dialog("P4 Connection Setup",
-				("No workspaces found for your user on %s.\n" % _p4_port) +
-				"Create one in P4V (or with `p4 client`) whose root contains this project,\n" +
-				"then press Refresh (the circular-arrow button) in the P4G dock. Or enter a workspace name to use directly:",
-				"", false, "Use Workspace")
-		if not res.ok or String(res.text).strip_edges().is_empty():
+		if not picked.ok:
 			return false
-		_override_client = String(res.text).strip_edges()
+		_override_client = String(ordered[picked.index].get("client", ""))
 		return true
-	var options := PackedStringArray()
-	for c in ordered:
-		options.append("%s   (%s)" % [String(c.get("client", "")), String(c.get("Root", ""))])
-	var head := "Found a workspace whose root contains this project.\n" if not matches.is_empty() \
-			else "None of your workspaces' roots contain this project - pick one anyway,\nor cancel and create a workspace for it first.\n"
-	var picked: Dictionary = await _show_option_dialog("P4 Connection Setup",
-			head + "Workspace to use for this project (stored per-project, per-user):",
-			options, 0, "Use This Workspace")
-	if not picked.ok:
-		return false
-	_override_client = String(ordered[picked.index].get("client", ""))
-	return true
+	return false
+
+
+## Let the user change the server address and user name this project connects
+## with. Returns {ok, changed}: `ok` false means they cancelled.
+##
+## A box left showing what it showed is "no change", even when that value came
+## from the user's own Perforce settings rather than from an earlier choice
+## here - so pressing Connect without editing never turns inherited settings
+## into stored ones. An emptied box clears the stored value, which is the way
+## back to plain P4CONFIG / `p4 set` behaviour.
+##
+## A changed server or user also drops the stored workspace: workspaces belong
+## to a server and, nearly always, to one user.
+func _edit_connection() -> Dictionary:
+	var shown_port: String = await _suggest_port()
+	var shown_user := _override_user if not _override_user.is_empty() else _p4_user
+	var res: Dictionary = await _show_connection_dialog(shown_port, shown_user)
+	if not res.ok:
+		return {"ok": false, "changed": false}
+	# An untouched box keeps whatever was stored (possibly nothing). Emptying a
+	# box that showed an inherited value stores nothing either, so it isn't a
+	# change.
+	var new_port := String(res.port) if String(res.port) != shown_port else _override_port
+	var new_user := String(res.user) if String(res.user) != shown_user else _override_user
+	var changed := new_port != _override_port or new_user != _override_user
+	if changed:
+		_override_port = new_port
+		_override_user = new_user
+		_override_client = ""
+		_log("Connection settings changed - reconnecting...")
+		_reset_connection_state()
+		# Saved now, not when setup next succeeds: setup can stop at a login
+		# prompt or an empty workspace list, and a restart would then bring the
+		# old server back.
+		_save_connection_overrides()
+	return {"ok": true, "changed": changed}
+
+
+## Everything cached about the old server or workspace is wrong once the
+## connection changes. Leaves the plugin "not connected" until setup re-probes.
+func _reset_connection_state() -> void:
+	_checked_out_this_session.clear()
+	_declined_this_session.clear()
+	_pending_save_checkout.clear()
+	_prewrite_eligible_cache.clear()
+	_fstat_cache.clear()
+	_fstat_failed.clear()
+	_external_scan_dismissed = ""
+	_unreachable_until_msec = 0
+	_p4_available = false
+	_update_conn_status()
 
 
 ## The interactive login loop: password prompt -> `p4 login` (password fed via
@@ -2378,6 +2468,10 @@ func _add_toolbar_button(parent: Control, icon_name: String, text: String,
 	return button
 
 
+## Menu id of the one settings-menu item that isn't a checkbox (ids 0-4 are).
+const SETTINGS_MENU_CONNECTION := 10
+
+
 ## The gear menu fronting the setting checkboxes. Checkable popup items
 ## sync from the checkboxes on open and toggle them on click, so the existing
 ## persistence (_on_setting_toggled) and every reader stay untouched.
@@ -2402,6 +2496,10 @@ func _build_settings_menu(parent: Control) -> void:
 	popup.set_item_tooltip(2, "Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs.")
 	popup.set_item_tooltip(3, "When Godot regains focus, look for files changed by other programs and offer to check them out.")
 	popup.set_item_tooltip(4, "Log read-only status probes too, not just state-changing commands.")
+	popup.add_separator()
+	popup.add_item("Connection settings...", SETTINGS_MENU_CONNECTION)
+	popup.set_item_tooltip(popup.get_item_index(SETTINGS_MENU_CONNECTION),
+			"Change the Perforce server, user, or workspace this project uses.")
 	popup.about_to_popup.connect(_sync_settings_menu)
 	popup.id_pressed.connect(_on_settings_menu_id_pressed)
 	parent.add_child(settings_menu)
@@ -2425,6 +2523,9 @@ func _sync_settings_menu() -> void:
 
 
 func _on_settings_menu_id_pressed(id: int) -> void:
+	if id == SETTINGS_MENU_CONNECTION:
+		_open_connection_settings()
+		return
 	var cb := _settings_menu_checkbox(id)
 	if cb:
 		# Setting button_pressed emits toggled, which persists the change.
@@ -2455,25 +2556,41 @@ func _update_conn_status() -> void:
 func _on_conn_status_pressed() -> void:
 	_login_declined = false
 	if _p4_available and not _setup_active:
-		# Connected: a click means "use a different workspace". (Setup alone
-		# would stop at its first probe, which already says "ok".)
+		# Connected: a click means "use a different workspace" - and from that
+		# dialog, a different server or user. (Setup alone would stop at its
+		# first probe, which already says "ok".)
 		_setup_active = true
 		var old_client := _p4_client
 		var picked := await _pick_client()
 		_setup_active = false
-		if not picked or _override_client == old_client:
+		if not picked:
 			return
-		# Everything cached about the old workspace is now wrong.
-		_checked_out_this_session.clear()
-		_declined_this_session.clear()
-		_pending_save_checkout.clear()
-		_prewrite_eligible_cache.clear()
-		_fstat_cache.clear()
-		_fstat_failed.clear()
-		_external_scan_dismissed = ""
-		_p4_available = false
-		_update_conn_status()
+		# Still connected means the server and user are untouched (changing
+		# either disconnects), so only the workspace can have changed.
+		if _p4_available:
+			if _override_client == old_client:
+				return
+			_reset_connection_state()
 	_offer_connection_setup()
+
+
+## Settings menu > "Connection settings...": the server and user first, then
+## on to the workspace. Unlike the status button, this works the same whether
+## or not the plugin is connected - it is the way out when setup keeps stopping
+## at a login prompt for a server that was never the right one.
+func _open_connection_settings() -> void:
+	_login_declined = false
+	if _setup_active:
+		return
+	_setup_active = true
+	var edited: Dictionary = await _edit_connection()
+	_setup_active = false
+	if not edited.ok:
+		return
+	if edited.changed or not _p4_available:
+		_offer_connection_setup()
+	else:
+		await _on_conn_status_pressed()
 
 
 func _on_toolbar_resized() -> void:
@@ -3542,14 +3659,24 @@ func _revert_path(res_path: String) -> void:
 ## Sync res_path to the head revision and reload it from disk. Shared by the
 ## toolbar "Sync Selected File" button and the tree's per-row context menu.
 func _sync_path(res_path: String) -> void:
-	var result: Dictionary = await _p4_exec_logged(["sync", ProjectSettings.globalize_path(res_path)])
-	var text := "" if result.output.is_empty() else String(result.output[0])
+	var synced: Dictionary = await _safe_sync([ProjectSettings.globalize_path(res_path)])
+	var notes: Dictionary = synced.notes
+	_request_refresh()
+	if not notes.existing.is_empty():
+		await _show_alert("Perforce didn't download '%s'.%s" % [res_path,
+				_kept_existing_text(notes.existing)])
+		return
+	var refused: Array = notes.modified + notes.clobbered
+	if not refused.is_empty():
+		await _show_alert(("Perforce didn't download the newer version of '%s'.\n\nThe file " +
+				"is changed on your disk but not checked out, so Perforce left your version " +
+				"alone instead of throwing it away. Check it out (right-click it in the " +
+				"FileSystem dock and choose \"P4: Check Out\"), then sync it again - Perforce " +
+				"will then ask you to combine the two versions.") % res_path)
+		return
 	# Only a sync that rewrote the file changes anything the editor shows ("up
 	# to date", or an opened file getting a resolve scheduled, doesn't).
-	var rewrote: bool = int(result.exit_code) == 0 and (text.contains(" - updating ") \
-			or text.contains(" - added as ") or text.contains(" - refreshing ") \
-			or text.contains(" - replacing ") or text.contains(" - deleted as "))
-	_request_refresh()
+	var rewrote: bool = int(synced.exit_code) == 0 and not synced.done.names.is_empty()
 	if not rewrote:
 		return
 	EditorInterface.get_resource_filesystem().scan()
@@ -4122,6 +4249,19 @@ func _open_editor_files() -> Dictionary:
 ## prefix on the same line.
 const CLOBBER_MESSAGE := "Can't clobber writable file "
 
+## `sync -s`'s refusal to overwrite a file whose contents differ from the
+## revision you have: "<depot>#<rev> - can't update modified file <local>".
+## It comes with no record and exit code 0, and `sync -n -s` predicts it
+## (measured against a 2025.2 server, 2026-10-02).
+const MODIFIED_MESSAGE := " - can't update modified file "
+
+## `sync -s`'s refusal to write a file the server is adding over one that is
+## already on disk and that Perforce never put there (it isn't in the "have"
+## list): "<depot>#<rev> - can't overwrite existing file <local>". No record,
+## exit code 0, and it holds whether or not the local file is read-only
+## (measured 2026-10-02).
+const EXISTING_MESSAGE := " - can't overwrite existing file "
+
 ## Above this, the confirmation warns that the download will take a while.
 const BIG_DOWNLOAD_BYTES := 50 * 1024 * 1024
 
@@ -4154,10 +4294,11 @@ func _get_latest_body() -> String:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return ""
-	var preview: Dictionary = await _p4_exec(["-ztag", "sync", "-n", _project_scope()])
+	var preview: Dictionary = await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])
 	var found := _summarize_sync(_parse_ztag(preview))
 	var notes := _sync_notes(preview)
-	if bool(notes.nothing_in_depot) and found.names.is_empty():
+	var kept_only: bool = not (notes.modified.is_empty() and notes.existing.is_empty())
+	if bool(notes.nothing_in_depot) and found.names.is_empty() and not kept_only:
 		var none := ("Perforce has nothing stored under this project folder yet, so there " +
 				"is nothing to download. Press \"Reconcile...\" to put the project into " +
 				"Perforce for the first time.")
@@ -4175,35 +4316,138 @@ func _get_latest_body() -> String:
 		# would leave someone working against a stale project.
 		var idle := ("Your project is already up to date - nobody has submitted anything " +
 				"you don't have yet.")
+		if kept_only:
+			# Newer versions exist, but only of files p4 won't overwrite. "Up to
+			# date" would be false, and nothing else would ever tell the user.
+			idle = "Nothing was downloaded."
+			if not notes.modified.is_empty():
+				idle += _kept_modified_text(notes.modified)
+			if not notes.existing.is_empty():
+				idle += _kept_existing_text(notes.existing)
 		if not notes.problems.is_empty():
-			idle = "Nothing to download. Perforce also said:\n\n%s" \
-					% _file_listing(notes.problems, 5)
+			idle = ("Nothing to download." if not kept_only else idle + "\n\n") \
+					+ " Perforce also said:\n\n%s" % _file_listing(notes.problems, 5)
 		await _show_alert(idle)
 		return idle
 	if not await _confirm_get_latest(found, notes):
 		_log("Get Latest cancelled.")
 		return ""
 	_log("Get Latest: %d file(s), %s..." % [found.names.size(), _human_bytes(int(found.bytes))])
-	var result: Dictionary = await _p4_exec_logged(["-ztag", "sync", _project_scope()])
+	var synced: Dictionary = await _safe_sync([_project_scope()])
 	if _shutting_down:
 		return ""
-	var after := _sync_notes(result)
+	var after: Dictionary = synced.notes
 	# Everything below is driven by what the sync ITSELF reported, never by the
 	# preview. Two reasons: p4 prints a normal-looking record for a file it
 	# refused to overwrite, and a file a teammate submitted while the
 	# confirmation sat open is in this output and was never in the preview - its
 	# open tab needs reloading just as much.
-	var done := _summarize_sync(_parse_ztag(result))
+	var done: Dictionary = synced.done
 	_request_refresh()
 	EditorInterface.get_resource_filesystem().scan()
 	var reload := await _reload_after_sync(done, after.clobbered)
 	# The resolve list only means anything after the sync: the sync is what
 	# moves the have revision and schedules the merge.
 	var to_resolve: Array = await _resolve_preview_names()
-	var report := _get_latest_report(done, after, reload, to_resolve,
-			int(result.get("exit_code", 0)))
+	var report := _get_latest_report(done, after, reload, to_resolve, int(synced.exit_code))
 	await _show_alert(report)
 	return report
+
+
+## Every sync P4Godot runs goes through here, as `p4 sync -s` ("safe sync").
+##
+## Plain `sync` overwrites any read-only file without looking at it. That is
+## fine while read-only means "unchanged", but a file can be changed and still
+## read-only: on macOS and Linux, Godot saves by renaming a temp file over the
+## target, which a read-only target doesn't stop and which keeps its mode. A
+## plain sync then replaces that edit with the server's version and says only
+## "updating" (reproduced on Windows too, with a file edited and set back to
+## read-only). `-s` compares each file's contents with the revision you have
+## and refuses to overwrite one that differs - MODIFIED_MESSAGE.
+##
+## Under `-s` the other refusal, CLOBBER_MESSAGE, means something narrower than
+## it does for a plain sync: the file is writable but its contents are
+## UNCHANGED (a changed one gets MODIFIED_MESSAGE instead; measured). There is
+## nothing in it to protect and nothing Reconcile could open, so it would stay
+## stuck behind the server for good. Those files are put back to read-only and
+## synced once more. The second pass is `-s` as well, so a file edited in
+## between is still refused rather than overwritten.
+##
+## Returns {result, done, notes, exit_code}: the first sync's raw result, its
+## records folded by _summarize_sync, _sync_notes with the retry folded in
+## (`clobbered` holds only what is STILL refused), and an exit code that
+## forgets a clobber failure the retry fixed.
+func _safe_sync(targets: PackedStringArray) -> Dictionary:
+	var args := PackedStringArray(["-ztag", "sync", "-s"])
+	args.append_array(targets)
+	var result: Dictionary = await _p4_exec_logged(args)
+	var notes := _sync_notes(result)
+	var done := _summarize_sync(_parse_ztag(result))
+	var exit_code := int(result.get("exit_code", 0))
+	var stuck: Array = notes.clobbered_locals
+	if stuck.is_empty() or _shutting_down:
+		return {"result": result, "done": done, "notes": notes, "exit_code": exit_code}
+	_log("Retrying %d unlocked but unchanged file(s) as read-only..." % stuck.size())
+	var names: Array = notes.clobbered # parallel to `stuck`
+	var still: Array = []
+	var retry_failed := false
+	for start in range(0, stuck.size(), 100):
+		var end := mini(start + 100, stuck.size())
+		var batch := PackedStringArray(["-ztag", "sync", "-s"])
+		for i in range(start, end):
+			_set_file_writable(String(stuck[i]), false)
+			batch.append(String(stuck[i]))
+		var again: Dictionary = await _p4_exec_logged(batch)
+		var again_notes := _sync_notes(again)
+		notes.problems.append_array(again_notes.problems)
+		if int(again.get("exit_code", 0)) != 0:
+			retry_failed = true
+		# A file counts as downloaded only if this pass printed a record for it
+		# and didn't refuse it. No record - the connection dropped, the editor
+		# is closing, p4 said something else - means it is still not written,
+		# and the first sync's record for it must not be counted.
+		var written := {}
+		for rec in _parse_ztag(again):
+			written[_path_key(String(rec.get("clientFile", "")))] = true
+		for refused in again_notes.clobbered_locals:
+			written.erase(_path_key(String(refused)))
+		for i in range(start, end):
+			if not written.has(_path_key(String(stuck[i]))):
+				still.append(names[i])
+	# The first sync printed a record for each of these, so anything still
+	# not written has to stay in `clobbered`, which the report subtracts from
+	# the download count.
+	notes.clobbered = still
+	if not retry_failed and still.is_empty() and notes.problems.is_empty():
+		exit_code = 0
+	return {"result": result, "done": done, "notes": notes, "exit_code": exit_code}
+
+
+## A local path in a form two spellings of it compare equal in: p4 prints
+## Windows paths with backslashes and its own idea of the drive letter's case.
+static func _path_key(path: String) -> String:
+	return path.replace("\\", "/").to_lower()
+
+
+## The paragraph naming files `sync -s` left alone. Shared by the confirmation,
+## the "nothing to download" message and the final report, because all three
+## have to say it and it must not drift between them.
+func _kept_modified_text(modified: Array) -> String:
+	return ("\n\nPerforce would not overwrite %d file(s) that have a newer version on the " +
+			"server:\n\n%s\n\nThose are changed on your disk but not checked out, so Perforce " +
+			"left your version alone instead of throwing it away. Press \"Reconcile...\" to " +
+			"check them out, then \"Get Latest...\" again.") \
+			% [modified.size(), _file_listing(modified, 30)]
+
+
+## The paragraph naming files the server added that collide with a file
+## already on disk which Perforce never put there. Reconcile is the wrong
+## advice here: the local file isn't a changed copy of anything.
+func _kept_existing_text(existing: Array) -> String:
+	return ("\n\n%d new file(s) from the server were not downloaded, because a file with " +
+			"the same name is already on your disk and Perforce didn't put it there:\n\n%s\n\n" +
+			"Your file is untouched. Move or rename it, then press \"Get Latest...\" again to " +
+			"get the server's version.") % [existing.size(), _file_listing(existing, 30)]
 
 
 ## Whether a sync has anything to do. Records alone are not the answer: a file
@@ -4260,9 +4504,14 @@ func _summarize_sync(records: Array) -> Dictionary:
 
 
 ## What a sync's output says that its records don't:
-##   - `clobbered`: files p4 would not overwrite, because they are changed on
-##     disk and not checked out. Nothing in the preview predicts these, and the
-##     failing sync still prints a normal-looking record for each one.
+##   - `clobbered`: files p4 would not overwrite because they are writable and
+##     not checked out. Nothing in the preview predicts these, and the failing
+##     sync still prints a normal-looking record for each one.
+##     `clobbered_locals` holds the same files as raw local paths.
+##   - `modified`: files `sync -s` would not overwrite because their contents
+##     differ from the revision you have (MODIFIED_MESSAGE). No record at all.
+##   - `existing`: files the server is adding that `sync -s` would not write
+##     over a local file of the same name (EXISTING_MESSAGE). No record either.
 ##   - `opened_behind`: files left alone because you have them checked out.
 ##     These produce no record either, so without counting them a sync that has
 ##     real work to do looks like "already up to date".
@@ -4271,13 +4520,17 @@ func _summarize_sync(records: Array) -> Dictionary:
 ##     reported rather than swallowed.
 func _sync_notes(result: Dictionary) -> Dictionary:
 	var clobbered: Array = []
+	var clobbered_locals: Array = []
+	var modified: Array = []
+	var existing: Array = []
 	var opened_behind := 0
 	var nothing_in_depot := false
 	var problems: Array = []
 	var output: Array = result.get("output", [])
 	if output.is_empty():
-		return {"clobbered": clobbered, "opened_behind": 0, "problems": problems,
-				"nothing_in_depot": false}
+		return {"clobbered": clobbered, "clobbered_locals": clobbered_locals,
+				"modified": modified, "existing": existing, "opened_behind": 0,
+				"problems": problems, "nothing_in_depot": false}
 	for raw_line in String(output[0]).split("\n"):
 		var line := raw_line.rstrip("\r").strip_edges()
 		if line.is_empty():
@@ -4292,6 +4545,15 @@ func _sync_notes(result: Dictionary) -> Dictionary:
 			var local := line.substr(CLOBBER_MESSAGE.length()).strip_edges()
 			var res := _local_to_res(local)
 			clobbered.append(res if not res.is_empty() else local)
+			clobbered_locals.append(local)
+		elif line.contains(MODIFIED_MESSAGE):
+			var kept := line.substr(line.find(MODIFIED_MESSAGE) + MODIFIED_MESSAGE.length()).strip_edges()
+			var kept_res := _local_to_res(kept)
+			modified.append(kept_res if not kept_res.is_empty() else kept)
+		elif line.contains(EXISTING_MESSAGE):
+			var mine := line.substr(line.find(EXISTING_MESSAGE) + EXISTING_MESSAGE.length()).strip_edges()
+			var mine_res := _local_to_res(mine)
+			existing.append(mine_res if not mine_res.is_empty() else mine)
 		elif line.contains("is opened and not being changed"):
 			opened_behind += 1
 		elif line.contains("no such file"):
@@ -4300,7 +4562,10 @@ func _sync_notes(result: Dictionary) -> Dictionary:
 			pass # reported from `resolve -n`, or simply nothing to act on
 		else:
 			problems.append(line)
-	return {"clobbered": clobbered, "opened_behind": opened_behind, "problems": problems,
+	modified.sort()
+	existing.sort()
+	return {"clobbered": clobbered, "clobbered_locals": clobbered_locals, "modified": modified,
+			"existing": existing, "opened_behind": opened_behind, "problems": problems,
 			"nothing_in_depot": nothing_in_depot}
 
 
@@ -4346,6 +4611,18 @@ func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
 				"Perforce never overwrites a file you have checked out, so your version " +
 				"is safe - but you will have to combine the two before you can submit. " +
 				"P4Godot names them when it's finished.") % notes.opened_behind
+	var kept: Array = notes.get("modified", [])
+	if not kept.is_empty():
+		note += ("\n\n%d file(s) will NOT be downloaded, because you changed them on your " +
+				"disk without checking them out and Perforce won't overwrite that:\n\n%s\n\n" +
+				"Your versions stay as they are. Press \"Reconcile...\" afterwards to check " +
+				"them out.") % [kept.size(), _file_listing(kept)]
+	var colliding: Array = notes.get("existing", [])
+	if not colliding.is_empty():
+		note += ("\n\n%d new file(s) from the server will NOT be downloaded, because a " +
+				"file with the same name is already on your disk and Perforce didn't put " +
+				"it there:\n\n%s\n\nMove or rename yours first if you want the server's.") \
+				% [colliding.size(), _file_listing(colliding)]
 	if int(found.malformed) > 0:
 		note += ("\n\n%d line(s) of Perforce's answer couldn't be read, so this list may " +
 				"be incomplete. Run \"Get Latest...\" again afterwards.") % found.malformed
@@ -4458,12 +4735,15 @@ func _get_latest_report(done: Dictionary, after: Dictionary, reload: Dictionary,
 				"add them to the depot again.") \
 				% [reload.orphaned.size(), "is" if reload.orphaned.size() == 1 else "are",
 				_file_listing(reload.orphaned)]
-	if not clobbered.is_empty():
-		text += ("\n\nPerforce would not overwrite %d file(s):\n\n%s\n\nThose are changed " +
-				"on your disk but not checked out, so Perforce left your version alone " +
-				"instead of throwing it away. Press \"Reconcile...\" to check them out, " +
-				"then \"Get Latest...\" again.") \
-				% [clobbered.size(), _file_listing(clobbered, 30)]
+	# Two refusals, one paragraph: both leave the user's own version on disk and
+	# both end at Reconcile. Only `clobbered` is subtracted from the count
+	# above, because only those came with a record.
+	var kept: Array = after.get("modified", []) + clobbered
+	if not kept.is_empty():
+		text += _kept_modified_text(kept)
+	var colliding: Array = after.get("existing", [])
+	if not colliding.is_empty():
+		text += _kept_existing_text(colliding)
 	if not to_resolve.is_empty():
 		text += ("\n\n%d file(s) you have checked out need the two versions combined " +
 				"before you can submit them:\n\n%s\n\nP4Godot can't do that merge. In " +
@@ -4688,10 +4968,13 @@ func _submit_changelist_from_meta(meta: Dictionary) -> void:
 
 
 ## Submit a changelist. Irreversible and team-visible, so it always ends at an
-## explicit confirmation that lists the exact files and the description. Numbered
-## changelists submit by number (`submit -c`, using their own description); the
-## default changelist prompts for a description and submits its project-scoped
-## files (`submit -d <desc> <scope>`).
+## explicit confirmation that lists the exact files and the description.
+##
+## Everything is submitted by number (`submit -c N`). The default changelist
+## has no number, so its confirmed files are first moved into a new numbered
+## changelist carrying the description (`change -i`). The number is what makes
+## the outcome checkable: when the answer to `submit` never arrives, it is the
+## only handle for asking the server what became of it (see _submit_verdict).
 func _submit_changelist(change: String, files: Array, preset_desc: String = "") -> void:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
@@ -4735,7 +5018,7 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 		_log("Submit cancelled.")
 		return
 
-	var result: Dictionary
+	var number := change
 	if change == "default":
 		# A spec on stdin listing exactly the confirmed files: nothing opened
 		# while the dialog was up rides along, and the description never
@@ -4743,13 +5026,44 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 		var spec := "Change: new\n\nDescription:\n" + _indent_spec_text(desc) + "\nFiles:\n"
 		for f in files:
 			spec += "\t%s\n" % f.depot_path
-		result = await _p4_exec_spec(["submit", "-i"], spec)
-	else:
-		result = await _p4_exec_logged(["submit", "-c", change])
+		var made: Dictionary = await _p4_exec_spec(["change", "-i"], spec)
+		# Read the "created" line, not the exit code: a changelist can be
+		# created and the command still exit non-zero (a server-side check on
+		# the form), and then the files are in it, not in the default one.
+		number = _created_change_in(made)
+		if number.is_empty():
+			var why := "" if made.output.is_empty() else String(made.output[0]).strip_edges()
+			await _show_alert(("Perforce couldn't get your files ready to submit:\n\n%s\n\n" +
+					"Nothing was sent. Press Refresh in the P4G panel to see where your files " +
+					"are - normally still in the default changelist.") % why)
+			_request_refresh()
+			return
 
-	if result.exit_code == 0:
-		var submitted := _parse_change_number(result)
-		_log("Submit complete." if submitted.is_empty() else "Submitted as change %s." % submitted)
+	var result: Dictionary = await _p4_exec(["submit", "-c", number], true,
+			NET_MAXWAIT_SUBMIT_SEC)
+	# What p4 printed and how it exited are not the outcome. A submit whose
+	# answer never arrived may still have gone through, so on anything short of
+	# an explicit "submitted", ask the server what became of the changelist.
+	var final := _submitted_change_in(result)
+	var outcome := "submitted"
+	var said := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+	if final.is_empty():
+		var lost := _submit_connection_lost(result)
+		if lost:
+			_log("The submit didn't end with a clear answer - asking the server what became of it...")
+		var verdict: Dictionary = await _submit_verdict(number, lost)
+		outcome = String(verdict.outcome)
+		final = String(verdict.change)
+		await _show_alert(_submit_outcome_text(outcome, number, final, said, lost))
+	elif int(result.exit_code) != 0:
+		# The server said "submitted" and then something failed - a check that
+		# runs after the submit, say. The files are in; the complaint still
+		# has to reach the user.
+		await _show_alert(("Your files were submitted as change %s, but Perforce reported a " +
+				"problem afterwards:\n\n%s") % [final, said])
+
+	if outcome == "submitted":
+		_log("Submit complete." if final.is_empty() else "Submitted as change %s." % final)
 		# Submitted files are no longer opened. The cache is keyed by res://
 		# path, which files missing from the last refresh don't have here - so
 		# drop it all; the refresh below re-adds whatever is still opened.
@@ -4757,16 +5071,195 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 		for f in files:
 			_pending_save_checkout.erase(f.label)
 	else:
-		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
-		await _show_alert(("Perforce didn't accept your files:\n\n%s\n\nNothing was sent, and " +
-				"your work is untouched. The usual cause is that a teammate changed one of " +
-				"the same files first, so you need their version before you can send yours: " +
-				"right-click the file in the P4G panel and choose \"Sync This File\", then " +
-				"combine their changes with yours (P4V, or `p4 resolve` in a terminal) and " +
-				"submit again.\n\nIf the message above contains a number, Perforce has moved " +
-				"your files into a group with that number. It shows up in the P4G panel, and " +
-				"you submit it from there once the problem is sorted out.") % msg)
+		_log("Submit of changelist %s: %s." % [number,
+				"not submitted" if outcome == "not_submitted" else "outcome unknown"])
 	_request_refresh()
+
+
+## The number a submit landed as, read from p4's own "submitted" line - or ""
+## when the output doesn't say it was submitted. A submit the server renumbers
+## says "Change 12 renamed change 14 and submitted."
+static func _submitted_change_in(result: Dictionary) -> String:
+	var output: Array = result.get("output", [])
+	if output.is_empty():
+		return ""
+	var text := String(output[0])
+	var renamed := RegEx.create_from_string("renamed change (\\d+) and submitted").search(text)
+	if renamed:
+		return renamed.get_string(1)
+	var plain := RegEx.create_from_string("Change (\\d+) submitted").search(text)
+	return plain.get_string(1) if plain else ""
+
+
+## The number `p4 change -i` created, from its "Change N created" line, or "".
+static func _created_change_in(result: Dictionary) -> String:
+	var output: Array = result.get("output", [])
+	if output.is_empty():
+		return ""
+	var m := RegEx.create_from_string("Change (\\d+) created").search(String(output[0]))
+	return m.get_string(1) if m else ""
+
+
+## Whether a submit that didn't say "submitted" may have lost its connection,
+## as opposed to the server answering "no". Only the second is an answer.
+## After the first, the server may have finished the submit, may still be
+## working on it, or may never have started.
+##
+## The default is "may have been lost". It is the server's own refusal that
+## has to be recognised, because guessing wrong the other way ends in telling
+## someone nothing was sent while the server finishes sending it. A network
+## error outranks a refusal line in the same output.
+static func _submit_connection_lost(result: Dictionary) -> bool:
+	var output: Array = result.get("output", [])
+	var text := "" if output.is_empty() else String(output[0])
+	for marker in ["TCP receive", "TCP send", "TCP connect", "SSL receive", "SSL send",
+			"Connect to server failed", "exceeded maximum configured duration",
+			"Partner exited unexpectedly", "Connection reset", "WSAECONN", "Broken pipe"]:
+		if text.contains(marker):
+			return true
+	for refusal in ["Submit failed", "Submit aborted", "Submit validation failed",
+			"No files to submit"]:
+		if text.contains(refusal):
+			return false
+	return true
+
+
+## What `p4 -ztag describe -s [-O] <n>` says about a changelist:
+## {"status": "submitted" | "pending" | "missing" | "unknown", "change": <n>}.
+## "missing" is p4's "no such changelist" - which is also what a changelist
+## that was renumbered on submit answers under its old number. "unknown" is
+## anything else, a failed connection included.
+##
+## `describe` prints a blank line after the description, in the middle of the
+## record, so _parse_ztag hands back two records and `status` is in the second.
+func _describe_status(result: Dictionary) -> Dictionary:
+	var status := ""
+	var number := ""
+	for rec in _parse_ztag(result):
+		if rec.has("status"):
+			status = String(rec.status)
+		if rec.has("change"):
+			number = String(rec.change)
+	if status == "submitted" or status == "pending":
+		return {"status": status, "change": number}
+	var output: Array = result.get("output", [])
+	var text := "" if output.is_empty() else String(output[0])
+	if text.contains("no such changelist"):
+		return {"status": "missing", "change": ""}
+	return {"status": "unknown", "change": ""}
+
+
+## Whether `p4 -ztag monitor show` lists a submit this user is running:
+## 1 yes, 0 no, -1 can't tell (monitoring is off, or we aren't allowed to look).
+## A working answer always lists at least our own `monitor` command, so an
+## answer with no records at all is "can't tell", never "no".
+func _monitor_submit_running(result: Dictionary, user: String) -> int:
+	if int(result.get("exit_code", 0)) != 0:
+		return -1
+	var records := _parse_ztag(result)
+	if records.is_empty():
+		return -1
+	# Matched loosely on purpose. What a submit is called while the server is
+	# committing it has not been measured (it may be an internal name such as
+	# "dm-CommitSubmit"), and a miss here reads as "nothing running", which
+	# turns a submit in progress into "not submitted".
+	for rec in records:
+		if String(rec.get("user", "")) == user \
+				and String(rec.get("command", "")).to_lower().contains("submit"):
+			return 1
+	return 0
+
+
+const SUBMIT_VERDICT_WINDOW_MSEC := 30000
+const SUBMIT_VERDICT_POLL_SEC := 2.0
+
+
+## Ask the server what became of changelist `number` after a submit that
+## didn't report success: {"outcome": "submitted" | "not_submitted" |
+## "unknown", "change": <the number it was submitted as, or "">}.
+##
+## When the server answered the submit with a refusal (`connection_lost`
+## false), a changelist that is still pending was simply not submitted.
+##
+## When the answer never arrived, "still pending" proves nothing: the server
+## finishes a submit whose files it has already received even after the client
+## is gone, and until it does the changelist reads as pending. So keep asking
+## for SUBMIT_VERDICT_WINDOW_MSEC while the server still lists a submit of ours
+## as running. Pending with none running is "not submitted". If the server
+## can't tell us what is running, or a submit is still running when the window
+## closes, the honest answer is "unknown". The window is a deadline and not a
+## number of tries because one try against an unreachable server already costs
+## the operating system's connect timeout.
+func _submit_verdict(number: String, connection_lost: bool) -> Dictionary:
+	var deadline := Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC
+	var attempt := 0
+	while not _shutting_down:
+		if attempt > 0:
+			if not connection_lost or Time.get_ticks_msec() >= deadline:
+				break
+			await get_tree().create_timer(SUBMIT_VERDICT_POLL_SEC).timeout
+		attempt += 1
+		# Ask what is running BEFORE asking for the status. In the other order a
+		# submit that finishes between the two questions reads as "pending,
+		# nothing running" - not submitted - when it just was.
+		var running := -1
+		if connection_lost:
+			running = _monitor_submit_running(
+					await _p4_exec(["-ztag", "monitor", "show"], false), _p4_user)
+		var seen := _describe_status(await _p4_exec(["-ztag", "describe", "-s", number], false))
+		if seen.status == "missing":
+			# Gone under its own number: either renumbered on submit, which
+			# `-O` finds by the original number, or deleted.
+			seen = _describe_status(
+					await _p4_exec(["-ztag", "describe", "-s", "-O", number], false))
+		match String(seen.status):
+			"submitted":
+				return {"outcome": "submitted", "change": String(seen.change)}
+			"pending":
+				if not connection_lost or running == 0:
+					return {"outcome": "not_submitted", "change": ""}
+			_:
+				pass # can't reach the server, or it has no such changelist: ask again
+	return {"outcome": "unknown", "change": ""}
+
+
+## What the user is told after a submit that didn't simply succeed. Composed
+## apart from the dialog so a self-test can assert on it: this is the text that
+## used to say "nothing was sent" without anyone having checked.
+func _submit_outcome_text(outcome: String, number: String, final: String, said: String,
+		connection_lost: bool) -> String:
+	match outcome:
+		"submitted":
+			return ("Your files were submitted as change %s.\n\nThe server's answer didn't " +
+					"reach Godot, so P4Godot asked it afterwards - the submit went through.") \
+					% (final if not final.is_empty() else number)
+		"not_submitted":
+			if connection_lost:
+				return ("The connection to the Perforce server dropped before your files " +
+						"were submitted:\n\n%s\n\nP4Godot checked with the server afterwards: " +
+						"nothing was sent, and your work is untouched. Your files are in " +
+						"changelist %s in the P4G panel - submit it again from there.") \
+						% [said, number]
+			return ("Perforce didn't accept your files:\n\n%s\n\nNothing was sent, and your " +
+					"work is untouched. The usual cause is that a teammate changed one of the " +
+					"same files first, so you need their version before you can send yours: " +
+					"right-click the file in the P4G panel and choose \"Sync This File\", then " +
+					"combine their changes with yours (P4V, or `p4 resolve` in a terminal) and " +
+					"submit again.\n\nYour files are in changelist %s in the P4G panel, with " +
+					"your description. Submit it from there once the problem is sorted out.") \
+					% [said, number]
+	# The panel is only evidence once it is showing real data again: with the
+	# server unreachable it lists nothing, and "changelist gone" would then
+	# read as "submitted" when nothing was asked.
+	return ("P4Godot can't tell whether your files were submitted.\n\n%s\n\nThe submit " +
+			"didn't finish cleanly, and when P4Godot asked the server afterwards it got no " +
+			"clear answer - the server couldn't be reached, or was still working on it.\n\n" +
+			"Don't submit again yet. Wait a minute and press Refresh in the P4G panel. An " +
+			"empty panel only means the server still isn't answering, so wait until your " +
+			"checked-out files are listed again. Then: if changelist %s is listed, it was " +
+			"not submitted - submit it again. If it isn't, the submit went through. " +
+			"(`p4 describe -s %s` in a terminal answers the same question.)") \
+			% [said, number, number]
 
 
 ## The files a submit will include, queried fresh: the default changelist's
@@ -5098,7 +5591,8 @@ func _local_to_res(local_path: String) -> String:
 
 ## Async `p4 <args>` via the worker thread. Returns {exit_code, output}. Commands
 ## are logged to the log window per the Verbose setting (see _should_log_cmd).
-func _p4_exec(args: PackedStringArray, offer_login: bool = true) -> Dictionary:
+func _p4_exec(args: PackedStringArray, offer_login: bool = true,
+		maxwait_sec: int = NET_MAXWAIT_SEC) -> Dictionary:
 	if _shutting_down:
 		# Continuations that resume during teardown must not start new p4
 		# commands (they'd run blocking on the main thread while the editor quits).
@@ -5106,12 +5600,14 @@ func _p4_exec(args: PackedStringArray, offer_login: bool = true) -> Dictionary:
 	if _p4_thread == null:
 		return _p4_exec_sync(args)
 	# Circuit breaker: status queries skip a server that just stopped answering
-	# (connection probes and logins always try - they're how it recovers).
+	# (connection probes and logins always try - they're how it recovers; `set`
+	# never contacts the server, and connection settings need its answer most
+	# exactly when the server is unreachable).
 	if _server_unreachable() and _is_probe_command(args) \
-			and not _p4_subcommand(args) in ["info", "login"]:
+			and not _p4_subcommand(args) in ["info", "login", "set"]:
 		return _skipped_result()
 	var loud := _should_log_cmd(args) # decided BEFORE the -p/-u/-c flags join in
-	args = _with_connection_flags(_escape_path_args(args))
+	args = _with_connection_flags(_escape_path_args(args), maxwait_sec)
 	if loud:
 		_log_p4_cmd(args)
 	var req := P4Request.new()
@@ -5596,18 +6092,23 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 ## lock as the other dialogs. `multiline` picks a TextEdit vs a LineEdit;
 ## `secret` masks a single-line field (passwords).
 func _show_input_dialog(title: String, message: String, default_text: String,
-		multiline: bool, ok_text: String, secret: bool = false) -> Dictionary:
+		multiline: bool, ok_text: String, secret: bool = false,
+		extra_text: String = "") -> Dictionary:
 	if _shutting_down:
-		return {"ok": false, "text": ""}
+		return {"ok": false, "text": "", "extra": false}
 	while _dialog_busy:
 		await get_tree().process_frame
 	_dialog_busy = true
 	_dialog_result_ready = false
 	_dialog_result_confirmed = false
+	_dialog_result_extra = false
 
 	var dialog := ConfirmationDialog.new()
 	dialog.title = title
 	dialog.set_ok_button_text(ok_text)
+	if not extra_text.is_empty():
+		dialog.add_button(extra_text, true, "extra")
+		dialog.custom_action.connect(_on_dialog_extra_action)
 	var vbox := VBoxContainer.new()
 	var label := Label.new()
 	label.text = message
@@ -5655,6 +6156,8 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 		if is_instance_valid(dialog):
 			if _selftest_auto_answer == "confirm":
 				dialog.confirmed.emit()
+			elif _selftest_auto_answer == "extra" and not extra_text.is_empty():
+				dialog.custom_action.emit(&"extra")
 			else:
 				dialog.canceled.emit()
 
@@ -5662,26 +6165,33 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 		await get_tree().process_frame
 	var confirmed := _dialog_result_confirmed
 	var text: String = input.text if (confirmed and is_instance_valid(input)) else ""
+	var extra := _dialog_result_extra
 	_discard_dialog(dialog)
 	_dialog_busy = false
-	return {"ok": confirmed, "text": text}
+	return {"ok": confirmed, "text": text, "extra": extra}
 
 
 ## Shows a modal dialog with a message and a dropdown of options; returns
-## {ok: bool, index: int}. Used by connection setup to pick a workspace.
+## {ok: bool, index: int, extra: bool}. Used by connection setup to pick a
+## workspace. `extra_text` adds a third button; pressing it closes the dialog
+## with `extra` true and `ok` false.
 func _show_option_dialog(title: String, message: String, options: PackedStringArray,
-		preselect: int, ok_text: String) -> Dictionary:
+		preselect: int, ok_text: String, extra_text: String = "") -> Dictionary:
 	if _shutting_down:
-		return {"ok": false, "index": -1}
+		return {"ok": false, "index": -1, "extra": false}
 	while _dialog_busy:
 		await get_tree().process_frame
 	_dialog_busy = true
 	_dialog_result_ready = false
 	_dialog_result_confirmed = false
+	_dialog_result_extra = false
 
 	var dialog := ConfirmationDialog.new()
 	dialog.title = title
 	dialog.set_ok_button_text(ok_text)
+	if not extra_text.is_empty():
+		dialog.add_button(extra_text, true, "extra")
+		dialog.custom_action.connect(_on_dialog_extra_action)
 	var vbox := VBoxContainer.new()
 	var label := Label.new()
 	label.text = message
@@ -5704,16 +6214,79 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 		if is_instance_valid(dialog):
 			if _selftest_auto_answer == "confirm":
 				dialog.confirmed.emit()
+			elif _selftest_auto_answer == "extra" and not extra_text.is_empty():
+				dialog.custom_action.emit(&"extra")
 			else:
 				dialog.canceled.emit()
 
 	while not _dialog_result_ready:
 		await get_tree().process_frame
 	var confirmed := _dialog_result_confirmed
+	var extra := _dialog_result_extra
 	var index: int = picker.selected if (confirmed and is_instance_valid(picker)) else -1
 	_discard_dialog(dialog)
 	_dialog_busy = false
-	return {"ok": confirmed and index >= 0, "index": index}
+	return {"ok": confirmed and index >= 0, "index": index, "extra": extra}
+
+
+## The connection dialog: the server address and user name this project
+## connects with. Returns {ok: bool, port: String, user: String}.
+func _show_connection_dialog(port: String, user: String) -> Dictionary:
+	if _shutting_down:
+		return {"ok": false, "port": port, "user": user}
+	while _dialog_busy:
+		await get_tree().process_frame
+	_dialog_busy = true
+	_dialog_result_ready = false
+	_dialog_result_confirmed = false
+
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "P4 Connection Settings"
+	dialog.set_ok_button_text("Connect")
+	var vbox := VBoxContainer.new()
+	var intro := Label.new()
+	intro.text = ("Which Perforce server this project uses, and who you are on it.\n" +
+			"Stored for this project only, for you only. Leave a box empty to use\n" +
+			"your normal Perforce settings (a P4CONFIG file, or `p4 set`).")
+	vbox.add_child(intro)
+	var port_label := Label.new()
+	port_label.text = "Server address:"
+	vbox.add_child(port_label)
+	var port_edit := LineEdit.new()
+	port_edit.text = port
+	port_edit.placeholder_text = "ssl:perforce.example.com:1666"
+	port_edit.custom_minimum_size = Vector2(420, 0)
+	vbox.add_child(port_edit)
+	var user_label := Label.new()
+	user_label.text = "User name:"
+	vbox.add_child(user_label)
+	var user_edit := LineEdit.new()
+	user_edit.text = user
+	vbox.add_child(user_edit)
+	dialog.add_child(vbox)
+	dialog.register_text_enter(port_edit)
+	dialog.register_text_enter(user_edit)
+	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	dialog.canceled.connect(_on_confirm_dialog_canceled)
+	dialog.close_requested.connect(_on_confirm_dialog_canceled)
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+
+	if not _selftest_auto_answer.is_empty():
+		await get_tree().process_frame
+		if is_instance_valid(dialog):
+			if _selftest_auto_answer == "confirm":
+				dialog.confirmed.emit()
+			else:
+				dialog.canceled.emit()
+
+	while not _dialog_result_ready:
+		await get_tree().process_frame
+	var confirmed := _dialog_result_confirmed
+	var new_port: String = port_edit.text.strip_edges() if confirmed else port
+	var new_user: String = user_edit.text.strip_edges() if confirmed else user
+	_discard_dialog(dialog)
+	_dialog_busy = false
+	return {"ok": confirmed, "port": new_port, "user": new_user}
 
 
 ## The checkout prompt: a confirm dialog with a "Check out to:" dropdown of
@@ -5838,6 +6411,14 @@ func _on_confirm_dialog_confirmed() -> void:
 
 func _on_confirm_dialog_canceled() -> void:
 	_dialog_result_confirmed = false
+	_dialog_result_ready = true
+
+
+## A dialog's extra button (AcceptDialog.add_button) doesn't close it or emit
+## `confirmed`; it emits `custom_action`. Recorded as "not confirmed, extra".
+func _on_dialog_extra_action(_action: StringName) -> void:
+	_dialog_result_confirmed = false
+	_dialog_result_extra = true
 	_dialog_result_ready = true
 
 
@@ -6681,9 +7262,57 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] silent-failure report: %s" % silent_fail.replace("\n", " | "))
 			var silent_ok: bool = silent_fail.contains("didn't say why")
 
+			# (h) `sync -s` refusing to overwrite a file whose contents changed
+			# without a checkout - the macOS/Linux "saved over a read-only file"
+			# case. Copied from a 2025.2 server: one message per file, NO record,
+			# exit code 0. Read as "nothing to say", that is a project silently
+			# left behind the server; read as a download, it is a lie.
+			var modified_blob := "//d/proj/.p4ignore#3 - can't update modified file " \
+					+ "C:\\ws\\proj\\.p4ignore\n" \
+					+ "//d/proj/project.godot#5 - can't update modified file " \
+					+ "C:\\ws\\proj\\project.godot\n" \
+					+ "... depotFile //d/proj/level.gd\n" \
+					+ "... clientFile C:\\ws\\proj\\level.gd\n" \
+					+ "... rev 4\n... action updated\n... fileSize 1024\n\n"
+			var mres := {"exit_code": 0, "output": [modified_blob]}
+			var mnotes := _sync_notes(mres)
+			var mdone := _summarize_sync(_parse_ztag(mres))
+			var mreport := _get_latest_report(mdone, mnotes, no_reload, [], 0)
+			var mconfirm := _get_latest_confirm_text(mdone, mnotes, {})
+			var only_modified := _sync_notes({"exit_code": 0, "output": [
+					"//d/proj/.p4ignore#3 - can't update modified file C:\\ws\\proj\\.p4ignore\n"]})
+			# The third refusal: the server adds a file where an untracked one of
+			# the same name already sits. Reconcile is the wrong advice for it.
+			var enotes := _sync_notes({"exit_code": 0, "output": [
+					"//d/proj/notes.md#1 - can't overwrite existing file C:\\ws\\proj\\notes.md\n"]})
+			var ereport := _get_latest_report(_summarize_sync([]), enotes, no_reload, [], 0)
+			_log("[selftest] existing-file report: %s" % ereport.replace("\n", " | "))
+			var existing_ok: bool = enotes.existing.size() == 1 and enotes.problems.is_empty() \
+					and enotes.modified.is_empty() \
+					and ereport.contains("C:\\ws\\proj\\notes.md") \
+					and ereport.contains("Move or rename") and not ereport.contains("Reconcile")
+			_log("[selftest] modified blob -> modified=%s, clobbered=%s, problems=%s, %d record(s)"
+					% [mnotes.modified, mnotes.clobbered, mnotes.problems, mdone.names.size()])
+			_log("[selftest] modified report: %s" % mreport.replace("\n", " | "))
+			var modified_ok: bool = mnotes.modified.size() == 2 \
+					and String(mnotes.modified[0]) == "C:\\ws\\proj\\.p4ignore" \
+					and mnotes.clobbered.is_empty() and mnotes.problems.is_empty() \
+					and mdone.names.size() == 1 \
+					and mreport.contains("downloaded 1 file(s)") \
+					and mreport.contains("would not overwrite 2 file(s)") \
+					and mreport.contains("C:\\ws\\proj\\project.godot") \
+					and mreport.contains("Reconcile") \
+					and mconfirm.contains("will NOT be downloaded") \
+					and mconfirm.contains("C:\\ws\\proj\\.p4ignore") \
+					and only_modified.modified.size() == 1 \
+					and not _get_latest_has_work(_summarize_sync([]), only_modified) \
+					and existing_ok
+
 			if clobber_ok and opened_ok and mixed_ok and confirm_ok and torn_ok \
-					and handwork_ok and silent_ok:
+					and handwork_ok and silent_ok and modified_ok:
 				_log("[selftest] PASS: sync-report")
+			elif not modified_ok:
+				_log("[selftest] FAIL: sync-report - a file safe sync refused to overwrite wasn't reported")
 			elif not clobber_ok:
 				_log("[selftest] FAIL: sync-report - a refused overwrite read as a successful download")
 			elif not opened_ok:
@@ -7276,6 +7905,227 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: submit-roundtrip")
 			else:
 				_log("[selftest] FAIL: submit-roundtrip")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-submit-verdict":
+			# Server-independent: the pieces that decide what a user is told
+			# after a submit that didn't plainly succeed. Blobs are copied from
+			# a 2025.2 server (2026-10-02). The point of all of it: "the command
+			# failed" and "nothing was sent" are different claims, and only the
+			# server can back the second one.
+			#
+			# `describe` puts a blank line after the description, so the status
+			# sits in what _parse_ztag sees as a second record.
+			var pending_blob := "... change 3148\n... user jase\n... client ws\n... time 1790968052\n" \
+					+ "... desc a description\n\n... status pending\n... changeType public\n" \
+					+ "... depotFile0 //d/proj/a.txt\n... action0 add\n... type0 text\n... rev0 1\n\n"
+			var renamed_blob := "... change 3150\n... user jase\n... client ws\n... time 1790968053\n" \
+					+ "... desc a description\n\n... status submitted\n... changeType public\n" \
+					+ "... path //d/proj/*\n... oldChange 3148\n... depotFile0 //d/proj/a.txt\n\n"
+			var p_status := _describe_status({"exit_code": 0, "output": [pending_blob]})
+			var r_status := _describe_status({"exit_code": 0, "output": [renamed_blob]})
+			# A renumbered changelist answers "no such changelist" under its old
+			# number - with exit code 0.
+			var gone_status := _describe_status({"exit_code": 0,
+					"output": ["3148 - no such changelist.\n"]})
+			var dead_status := _describe_status({"exit_code": 1, "output": [
+					"Perforce client error:\n\tConnect to server failed; check $P4PORT.\n"]})
+			_log("[selftest] describe: pending=%s renamed=%s gone=%s dead=%s"
+					% [p_status, r_status, gone_status, dead_status])
+			var describe_ok: bool = p_status.status == "pending" and p_status.change == "3148" \
+					and r_status.status == "submitted" and r_status.change == "3150" \
+					and gone_status.status == "missing" and dead_status.status == "unknown"
+
+			# The submit's own output. Trigger chatter follows the line that
+			# matters, and a failed submit also contains the word "Change".
+			var ok_out := {"exit_code": 0, "output": ["Submitting change 3148.\nLocking 1 files ...\n" \
+					+ "add //d/proj/a.txt#1\nChange 3148 submitted.\n/usr/bin/python3.9\n"]}
+			var renamed_out := {"exit_code": 0, "output": ["Submitting change 3148.\n" \
+					+ "Change 3148 renamed change 3150 and submitted.\nCalled subprocess with PID: 4\n"]}
+			var refused_out := {"exit_code": 1, "output": ["Submitting change 3148.\n" \
+					+ "//d/proj/a.txt - must sync/resolve #5 before submitting\n" \
+					+ "Out of date files must be resolved or reverted.\n" \
+					+ "Submit failed -- fix problems above then use 'p4 submit -c 3148'.\n"]}
+			var dropped_out := {"exit_code": 1, "output": ["Submitting change 3148.\n" \
+					+ "Perforce client error:\n\tTCP receive exceeded maximum configured duration of 600 seconds.\n"]}
+			var silent_out := {"exit_code": 1, "output": [""]}
+			var parse_ok: bool = _submitted_change_in(ok_out) == "3148" \
+					and _submitted_change_in(renamed_out) == "3150" \
+					and _submitted_change_in(refused_out) == "" \
+					and _submitted_change_in(dropped_out) == ""
+			# Only a refusal the server itself wrote counts as an answer. Text
+			# nobody anticipated, an SSL failure, and a refusal line followed by
+			# a network error all have to be treated as "may have been lost".
+			var odd_out := {"exit_code": 1, "output": ["Perforce client error:\n\tsomething new\n"]}
+			var ssl_out := {"exit_code": 1, "output": ["SSL receive failed.\n"]}
+			var both_out := {"exit_code": 1, "output": ["Submit failed -- fix problems above.\n" \
+					+ "TCP send failed.\n"]}
+			var lost_ok: bool = not _submit_connection_lost(refused_out) \
+					and _submit_connection_lost(dropped_out) \
+					and _submit_connection_lost(silent_out) \
+					and _submit_connection_lost(odd_out) \
+					and _submit_connection_lost(ssl_out) \
+					and _submit_connection_lost(both_out)
+			# `change -i` can create the changelist and still exit non-zero.
+			var created_ok: bool = _created_change_in({"exit_code": 1, "output": [
+					"Change 3151 created with 1 open file(s).\nsome trigger said no\n"]}) == "3151" \
+					and _created_change_in({"exit_code": 1, "output": [
+					"Error in change specification.\nChange 12 unknown.\n"]}) == ""
+			lost_ok = lost_ok and created_ok
+			_log("[selftest] submitted-as: ok=%s renamed=%s refused='%s' dropped='%s'; lost: refused=%s dropped=%s silent=%s"
+					% [_submitted_change_in(ok_out), _submitted_change_in(renamed_out),
+					_submitted_change_in(refused_out), _submitted_change_in(dropped_out),
+					_submit_connection_lost(refused_out), _submit_connection_lost(dropped_out),
+					_submit_connection_lost(silent_out)])
+
+			# `monitor show`: a working answer always lists our own `monitor`
+			# command, so "no records" must read as can't-tell, never as "no
+			# submit running" - that reading turns an unknown into "not sent".
+			var mon_idle := {"exit_code": 0, "output": [
+					"... id 41474\n... status R\n... user jase\n... time 00:00:00\n... command monitor\n\n"]}
+			var mon_busy := {"exit_code": 0, "output": [
+					"... id 41470\n... status R\n... user jase\n... time 00:01:10\n... command submit\n\n" \
+					+ "... id 41474\n... status R\n... user jase\n... time 00:00:00\n... command monitor\n\n"]}
+			var mon_other := {"exit_code": 0, "output": [
+					"... id 41470\n... status R\n... user bob\n... time 00:01:10\n... command submit\n\n" \
+					+ "... id 41474\n... status R\n... user jase\n... time 00:00:00\n... command monitor\n\n"]}
+			var mon_off := {"exit_code": 1, "output": ["Monitor not currently enabled.\n"]}
+			var mon_empty := {"exit_code": 0, "output": [""]}
+			var monitor_ok: bool = _monitor_submit_running(mon_idle, "jase") == 0 \
+					and _monitor_submit_running(mon_busy, "jase") == 1 \
+					and _monitor_submit_running(mon_other, "jase") == 0 \
+					and _monitor_submit_running({"exit_code": 0, "output": [
+					"... id 7\n... status R\n... user jase\n... time 00:00:09\n... command dm-CommitSubmit\n\n"]},
+					"jase") == 1 \
+					and _monitor_submit_running(mon_off, "jase") == -1 \
+					and _monitor_submit_running(mon_empty, "jase") == -1
+			_log("[selftest] monitor: idle=%d busy=%d other-user=%d off=%d empty=%d"
+					% [_monitor_submit_running(mon_idle, "jase"), _monitor_submit_running(mon_busy, "jase"),
+					_monitor_submit_running(mon_other, "jase"), _monitor_submit_running(mon_off, "jase"),
+					_monitor_submit_running(mon_empty, "jase")])
+
+			# What the user reads. Only a checked "not submitted" may say
+			# nothing was sent; "unknown" must not, and must say not to resubmit.
+			var t_sub := _submit_outcome_text("submitted", "3148", "3150", "TCP receive failed", true)
+			var t_not := _submit_outcome_text("not_submitted", "3148", "", "must sync/resolve", false)
+			var t_not_lost := _submit_outcome_text("not_submitted", "3148", "", "TCP receive failed", true)
+			var t_unk := _submit_outcome_text("unknown", "3148", "", "TCP receive failed", true)
+			_log("[selftest] unknown text: %s" % t_unk.replace("\n", " | "))
+			var text_ok: bool = t_sub.contains("submitted as change 3150") \
+					and t_not.contains("Nothing was sent") and t_not.contains("changelist 3148") \
+					and t_not.contains("must sync/resolve") \
+					and t_not_lost.contains("nothing was sent") and t_not_lost.contains("dropped") \
+					and not t_unk.to_lower().contains("nothing was sent") \
+					and t_unk.contains("can't tell") and t_unk.contains("Don't submit again") \
+					and t_unk.contains("empty panel") and not t_unk.contains("never arrived") \
+					and t_unk.contains("3148")
+
+			if describe_ok and parse_ok and lost_ok and monitor_ok and text_ok:
+				_log("[selftest] PASS: submit-verdict")
+			elif not describe_ok:
+				_log("[selftest] FAIL: submit-verdict - misread a changelist's status")
+			elif not parse_ok:
+				_log("[selftest] FAIL: submit-verdict - misread the submit's own output")
+			elif not lost_ok:
+				_log("[selftest] FAIL: submit-verdict - a refusal and a dropped connection were confused")
+			elif not monitor_ok:
+				_log("[selftest] FAIL: submit-verdict - misread what the server is running")
+			else:
+				_log("[selftest] FAIL: submit-verdict - the outcome text claims more than was checked")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-connection-dialogs":
+			# Server-independent: run the connection dialogs' code. Nothing here
+			# can see how a dialog looks; it proves the dialogs open, answer and
+			# close without a script error, that the third button is told apart
+			# from OK and Cancel, and the one rule with consequences: pressing
+			# Connect without editing must not turn inherited Perforce settings
+			# into stored per-project ones.
+			_selftest_auto_answer = "confirm"
+			var conn: Dictionary = await _show_connection_dialog("ssl:example:1666", "ana")
+			var opt_ok: Dictionary = await _show_option_dialog("t", "m",
+					PackedStringArray(["one", "two"]), 1, "OK", CHANGE_SERVER_TEXT)
+			var before := [_override_port, _override_user, _override_client]
+			var untouched: Dictionary = await _edit_connection()
+			var after_edit := [_override_port, _override_user, _override_client]
+			_selftest_auto_answer = "extra"
+			var opt_extra: Dictionary = await _show_option_dialog("t", "m",
+					PackedStringArray(["one", "two"]), 0, "OK", CHANGE_SERVER_TEXT)
+			var in_extra: Dictionary = await _show_input_dialog("t", "m", "", false, "OK",
+					false, CHANGE_SERVER_TEXT)
+			# No third button on this one, so "extra" has nothing to press: cancel.
+			var in_plain: Dictionary = await _show_input_dialog("t", "m", "", false, "OK")
+			_selftest_auto_answer = "cancel"
+			var conn_cancel: Dictionary = await _show_connection_dialog("ssl:example:1666", "ana")
+			var cancelled_edit: Dictionary = await _edit_connection()
+			var picked_nothing: bool = not await _pick_client()
+			_log("[selftest] connection=%s option-ok=%s option-extra=%s input-extra=%s edit-unchanged=%s"
+					% [conn, opt_ok, opt_extra, in_extra, untouched])
+			var dialogs_ok: bool = conn.ok and conn.port == "ssl:example:1666" and conn.user == "ana" \
+					and opt_ok.ok and opt_ok.index == 1 and not opt_ok.extra \
+					and opt_extra.extra and not opt_extra.ok \
+					and in_extra.extra and not in_extra.ok \
+					and not in_plain.extra and not in_plain.ok \
+					and not conn_cancel.ok
+			var edit_ok: bool = untouched.ok and not untouched.changed and before == after_edit \
+					and not cancelled_edit.ok and not cancelled_edit.changed and picked_nothing
+			if dialogs_ok and edit_ok:
+				_log("[selftest] PASS: connection-dialogs")
+			elif not dialogs_ok:
+				_log("[selftest] FAIL: connection-dialogs - a dialog reported the wrong button")
+			else:
+				_log("[selftest] FAIL: connection-dialogs - an unedited Connect changed the stored settings")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-submit-verdict-live":
+			# Live and DESTRUCTIVE (two real submits). Asks a real server what
+			# became of a changelist in the two cases a dropped connection leaves
+			# behind: submitted under a NEW number, and still pending.
+			# Staging a renumber: a changelist is renumbered on submit when a
+			# higher-numbered one exists, so an empty one is created after it.
+			# Refuses to run unless nothing is opened.
+			_selftest_auto_answer = "confirm"
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: submit-verdict-live - files already opened; needs a clean workspace")
+				get_tree().quit()
+				return
+			var v_res := "res://p4godot_verdict_test.txt"
+			var v_g := ProjectSettings.globalize_path(v_res)
+			var vf := FileAccess.open(v_g, FileAccess.WRITE)
+			vf.store_string("P4Godot verdict selftest %d\n" % Time.get_unix_time_from_system())
+			vf.close()
+			await _p4_exec_logged(["add", v_g])
+			var v_opened := _parse_ztag(await _p4_exec(["-ztag", "opened", v_g]))
+			var v_depot := "" if v_opened.is_empty() else String(v_opened[0].get("depotFile", ""))
+			var first := _parse_change_number(await _p4_exec_spec(["change", "-i"],
+					"Change: new\n\nDescription:\n\tP4Godot selftest: verdict (add)\n\nFiles:\n\t%s\n" % v_depot))
+			var blocker := await _create_changelist("P4Godot selftest: forces a renumber - safe to delete")
+			_log("[selftest] staged: file in change %s, empty change %s after it" % [first, blocker])
+
+			# Still pending, and no submit of ours running: whether or not the
+			# connection was lost, that is "not submitted".
+			var v_pending: Dictionary = await _submit_verdict(first, true)
+			var v_pending_answered: Dictionary = await _submit_verdict(first, false)
+			_log("[selftest] verdict while pending: lost=%s answered=%s" % [v_pending, v_pending_answered])
+
+			await _submit_changelist(first, [])
+			# Asked about under its OLD number, as after a lost connection.
+			var v_done: Dictionary = await _submit_verdict(first, true)
+			var by_file := _parse_ztag(await _p4_exec(["-ztag", "changes", "-m1", "-s", "submitted", v_g]))
+			var landed := "" if by_file.is_empty() else String(by_file[0].get("change", ""))
+			_log("[selftest] verdict after submit: %s; the file's newest change is %s" % [v_done, landed])
+
+			await _p4_exec_logged(["change", "-d", blocker])
+			await _p4_exec_logged(["delete", v_g])
+			await _submit_changelist("default", [], "P4Godot selftest: cleanup of p4godot_verdict_test.txt")
+			var v_left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			var v_ok: bool = not first.is_empty() and not blocker.is_empty() \
+					and v_pending.outcome == "not_submitted" \
+					and v_pending_answered.outcome == "not_submitted" \
+					and v_done.outcome == "submitted" and v_done.change == landed \
+					and landed != first and not landed.is_empty() and v_left == 0
+			_log("[selftest] renumbered %s -> %s, opened-after=%d" % [first, landed, v_left])
+			_log("[selftest] %s: submit-verdict-live" % ("PASS" if v_ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-create-changelist":
