@@ -1,0 +1,87 @@
+name: CI
+
+# Every push and pull request runs the checks that need no Perforce server.
+# Pushing a tag like v0.15.0 runs them too, then publishes a GitHub release
+# with the p4godot-v0.15.0.zip the README tells people to download.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GODOT_VERSION: 4.7-stable
+  P4_RELEASE: r25.2
+
+jobs:
+  selftests:
+    # Windows, because that is where the plugin has been verified by hand.
+    name: Self-tests (Windows, Godot 4.7)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Godot and the p4 command line
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_win64.exe.zip"
+          unzip -q godot.zip
+          curl -fsSL -o p4.exe "https://ftp.perforce.com/perforce/${P4_RELEASE}/bin.ntx64/p4.exe"
+          ./p4.exe -V
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+
+      - name: Run the self-tests against a clean install
+        run: sh tools/run-selftests.sh "$RUNNER_TEMP/tools/Godot_v${GODOT_VERSION}_win64_console.exe"
+
+  release:
+    name: Publish the release zip
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: selftests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches plugin.cfg
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^version=\"${version}\"" addons/p4godot/plugin.cfg; then
+            echo "Tag ${GITHUB_REF_NAME} does not match plugin.cfg:"
+            grep "^version=" addons/p4godot/plugin.cfg
+            exit 1
+          fi
+
+      - name: Build the zip
+        # .gitattributes strips everything but addons/, so the zip unpacks to
+        # an addons folder that drops straight into a project.
+        run: |
+          git archive --format=zip -o "p4godot-${GITHUB_REF_NAME}.zip" HEAD
+          unzip -l "p4godot-${GITHUB_REF_NAME}.zip"
+
+      - name: Take the release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## / { on = ($2 == v); next } on' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md has no '## ${version}' section."
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "p4godot-${GITHUB_REF_NAME}.zip" \
+            --verify-tag \
+            --title "P4Godot ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md

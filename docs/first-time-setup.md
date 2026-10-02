@@ -1,164 +1,175 @@
 # Putting a Godot project into Perforce for the first time
 
-One person does this once, for the whole team. Everyone else just connects to
-the server and starts working — that's the [quick start](../README.md#quick-start).
+One person does this once, for the whole team. Everyone else follows the
+[quick start](../README.md#quick-start).
 
-This part happens in **P4V**, the desktop app that comes with Perforce, not in
-Godot. P4Godot doesn't set projects up, and neither do the Unity and Unreal
-integrations: getting a project into version control in the first place is a
-one-time job, and P4V is already good at it.
+Almost all of it happens in **P4V**, Perforce's desktop app. Each step below
+says where you do it. One step, the fourth, uses a terminal, and you can skip
+it if you work alone.
 
 New to any of these words? The [glossary](glossary.md) covers them.
 
-**Do these steps in order.** The ignore file and the typemap only affect files
-added *after* them, so submitting first means redoing work.
+## What you need
 
-## Before you start
+- **P4V installed.** [Download it here.](https://www.perforce.com/downloads/helix-visual-client-p4v)
+  On Windows, leave every box ticked in the installer.
+- **A Perforce server, and an account on it that's allowed to create depots.**
+  If you set the server up yourself, your account is. If someone else runs
+  it, ask them to do step 1 for you. No server yet? Perforce is
+  [free for up to five users](https://www.perforce.com/products/helix-core),
+  and its [getting-started guide](https://help.perforce.com/helix-core/quickstart/current/Content/quickstart/admin-reference.html)
+  walks you through installing one.
+- **Your Godot project in a folder on your computer.**
 
-- **Perforce installed, including P4V.** Get it from
-  [perforce.com](https://www.perforce.com/downloads/helix-visual-client-p4v).
-- **A server and an account on it.** Ask whoever runs it for the server
-  address (something like `ssl:perforce.example.com:1666`), your user name,
-  and your password. No server yet? Perforce is
-  [free for up to five users](https://www.perforce.com/products/helix-core).
-- **Your Godot project on disk**, not yet in Perforce.
+**Do the steps in order.** Steps 3 and 4 only affect files added after them,
+so adding your project first means redoing work.
 
-## 1. Make a workspace
+## 1. In P4V: make a home for the project on the server
 
-A *workspace* is Perforce's link between the server and one folder on your
-computer. That folder is the workspace's *root*, and everything inside it is
-what this workspace can send to the server.
+Perforce keeps each project in a **depot**, and inside the depot a **stream**
+holds the files. You make one of each.
 
-In P4V: **Connection → New Workspace**. Name it, and set the root to a folder
-that holds your Godot project — or that will hold it.
+Make the depot:
 
-Your project folder has to be the root or sit inside it. If it isn't there
-yet, move it now, before anything is submitted.
+1. In P4V, choose **Tools → Administration**. A second window opens, called
+   P4 Admin.
+2. In P4 Admin, choose **File → New → Depot**.
+3. Type a name with no spaces, such as your game's name, and click **OK**.
+   You can't rename a depot later.
+4. Make sure **Depot type** is **stream**, and click **OK**.
 
-## 2. Tell the `p4` command line who you are
+Close P4 Admin. Back in P4V, make the stream:
 
-The rest of this page uses `p4` in a terminal, and so does P4Godot. P4V keeps
-its connection settings to itself, so setting it up in step 1 taught the
-terminal nothing. Give `p4` the same details, once:
+1. Choose **File → New → Stream**.
+2. **Stream name**: `main`.
+3. **Stream type**: **mainline**.
+4. **Depot**: click **Browse** and pick the depot you just made.
+5. Untick **Create a new workspace to use with this stream** and **Populate
+   the mainline stream after it is created**. You do both yourself in the
+   next steps, so that you choose where things go.
+6. Click **OK**.
+
+## 2. In P4V: make your workspace
+
+A **workspace** links a folder on your computer to the stream.
+
+Choose **Connection → New Workspace** and fill in three things:
+
+- **Workspace name**: the suggested name is fine.
+- **Workspace root**: your Godot project folder, the one with `project.godot`
+  in it.
+- **Stream**: click **Browse** and pick the `main` stream from step 1.
+
+Confirm. Nothing is uploaded yet.
+
+## 3. Add an ignore file
+
+You do this one in any text editor.
+
+Godot keeps a `.godot/` folder inside your project. It's a cache that every
+computer rebuilds for itself, and nobody else wants yours. An ignore file
+tells Perforce to leave it alone.
+
+Save this as a file named `.p4ignore` in your project folder, next to
+`project.godot`:
 
 ```
-p4 set P4PORT=ssl:perforce.example.com:1666
-p4 set P4USER=yourname
-p4 set P4CLIENT=the-workspace-you-just-made
-p4 set P4IGNORE=.p4ignore
-p4 login
-```
-
-Check it worked with `p4 info` — it should print your user name, your
-workspace, and the server address. If instead you get
-`Connect to server failed`, the address is wrong; if you get
-`Perforce password (P4PASSWD) invalid or unset`, run `p4 login` again.
-
-`P4IGNORE` is the one people miss. It tells `p4` what your ignore file is
-called, and without it the next step does nothing at all.
-
-## 3. Tell Perforce to ignore Godot's cache
-
-Godot keeps a `.godot/` folder next to your project file. It's a cache and
-your personal editor state: every machine rebuilds it, and nobody else wants
-yours. Submitting it means thousands of files and a stream of pointless
-conflicts.
-
-Save this as a file called `.p4ignore` in your project folder:
-
-```
-# Godot's local cache and per-user editor state
+# Godot's cache and your personal editor state
 .godot/
-# Temporary files from interrupted saves
+# Leftovers from interrupted saves
 *.tmp
 ```
 
-Everything else belongs in Perforce, including the `*.import` and `*.uid`
-files. They hold import settings and resource IDs, and your teammates' copies
-of the project break without them.
+Everything else belongs in Perforce, including the `.import` and `.uid` files
+Godot writes next to your assets. Your teammates' copies of the project break
+without them.
 
-Now check Perforce is really reading the file. In a terminal, in your project
-folder:
+If your team also works in Blender, Photoshop, or a code editor, the
+[universal game-project ignore file](https://gist.github.com/jase-perf/1c24138a68498f7117052b046ca5a215)
+covers those tools too. Use it in place of the four lines above.
 
-```
-p4 ignores -i -v .godot/x
-```
+## 4. In a terminal: lock art files
 
-There's no file called `x`. You're asking a hypothetical: *if one existed
-there, would you ignore it?* The answer is either `ignored by ...`, which
-names the rule that did it, or `not ignored`. If you get `not ignored`, run
-`p4 set P4IGNORE=.p4ignore` — that tells Perforce what your ignore file is
-called — and ask again.
+*Working alone? Skip to step 5.* This is the only step that uses a terminal,
+and it needs an admin account on the server.
 
-## 4. Set filetypes for art and `project.godot`
+Two people can't both change the same image: there's no way to combine their
+edits, so one person's work is lost. Perforce prevents that with *exclusive
+checkout*, where only one person can have a file checked out at a time. The
+**typemap** is the server's list of which files get that treatment.
 
-A file's *filetype* is how Perforce handles it: as text, as binary, as
-always-writable. That's a different question from "PNG or WAV". The *typemap*
-is a table on the server that picks a filetype for each new file from its
-name.
+1. In P4V, right-click your project folder in the **Workspace** tab and
+   choose **Open Command Window Here** (Windows) or **Open Terminal Here**
+   (macOS, Linux). The terminal that opens is already connected to your
+   server.
+2. Type `p4 typemap` and press Enter. A text file opens.
+3. Add these lines at the end, each starting with a tab:
 
-**This step needs admin rights on the server.** On a small team that's
-probably you. If it isn't, send this section to whoever runs the server.
+   ```
+   TypeMap:
+   	binary+l //....png
+   	binary+l //....psd
+   	binary+l //....blend
+   	binary+l //....glb
+   	binary+l //....wav
+   	text+w //....godot
+   ```
 
-Run `p4 typemap`, add lines like these under `TypeMap:`, and save. (This also
-opens a form in a terminal text editor, usually `vi` on macOS and Linux. If
-that's unfamiliar, ask your admin to do it.)
+   If the file already has a `TypeMap:` line, add only the lines under it.
+4. Save the file and close the editor. The terminal answers `Typemap saved.`
 
-```
-TypeMap:
-	binary+l //....png
-	binary+l //....psd
-	binary+l //....blend
-	binary+l //....glb
-	binary+l //....wav
-	text+w //....godot
-```
+`+l` is exclusive checkout. Add a line for every kind of art file your
+project uses. `+w` on the last line keeps `project.godot` writable, because
+Godot rewrites that file on its own. Perforce's guide has a
+[fuller typemap for game projects](https://help.perforce.com/helix-core/quickstart/current/Content/quickstart/admin-create-typemap.html).
 
-- `+l` means **exclusive checkout**: only one person can have the file
-  checked out at a time. Two people's edits to the same `.png` can't be
-  combined, so this stops the problem instead of discovering it later. Adjust
-  the list to the file types your project actually uses.
-- `+w` keeps a file **always writable**. Godot rewrites `project.godot` at
-  startup, and without this that write fails.
-- `.tscn`, `.tres`, `.gd`, and `.import` files are text, and Perforce's
-  defaults already suit them.
+## 5. In P4V: add the project and submit it
 
-**Don't do step 5 until the typemap is actually on the server.** If you submit
-first, every art file lands as ordinary text with no exclusive checkout, and
-you fix them one at a time afterwards with `p4 edit -t binary+l <file>` plus a
-submit. If you had to hand this step to an admin, wait for them.
+1. In the **Workspace** tab on the left, right-click your project folder and
+   choose **Mark for Add**, then click **OK**.
+2. Open **View → Pending Changelists** and expand the **default** changelist.
+   It lists every file about to be uploaded. **Check that nothing under
+   `.godot/` is in the list.** If something is, the ignore file from step 3
+   isn't being read: check its name and location, then see
+   [the note on older versions](#if-perforce-ignores-your-ignore-file).
+3. Right-click the default changelist and choose **Submit**. Type a
+   description such as "First import of the project", and click **Submit**.
 
-## 5. Submit the project
+Your project is in Perforce. From now on its files are **read-only** until
+you check them out. That is Perforce asking you to claim a file before you
+change it, and it's the part P4Godot handles for you inside Godot.
 
-In P4V, right-click your project folder and choose **Mark for Add**. Before
-you submit, read the file list and check that **nothing under `.godot/` is in
-it**. If some is, step 3 didn't take — fix it and try again, because taking
-files back out afterwards is more work.
+## 6. In Godot: install P4Godot
 
-Then submit, with a description like "initial import of the project".
+Go to the [quick start](../README.md#quick-start) and begin at step 3. You
+already have a workspace, so steps 1 and 2 are done.
 
-Your project is in Perforce. Two things follow from that:
+Your teammates follow the whole quick start, using the stream you made here.
 
-- Your files are now **read-only** until you check them out. That's Perforce
-  telling you to claim a file before changing it, and it's the thing P4Godot
-  handles for you inside Godot.
-- Your teammates can get the project by making their own workspace (step 1)
-  and running **Get Latest Revision** on it in P4V.
+## If something isn't right
 
-## 6. Install P4Godot
+### If Perforce ignores your ignore file
 
-Now go back to the [quick start](../README.md#quick-start) and add the plugin.
-Everyone on the team follows that page, including you.
-
-## If `.godot/` is already in the depot
-
-Someone submitted it before the ignore rule existed. Ignore rules only stop
-files being *added*, so the rule alone won't remove it.
+Perforce reads a file named `.p4ignore` by itself from version 2023.2 on.
+That needs a 2023.2 or later server, and P4V 2023.4 or later. On anything
+older, each person runs this once in a terminal:
 
 ```
-p4 delete -k .godot/...
+p4 set P4IGNORE=.p4ignore
 ```
 
-then submit. The `-k` keeps your local copies while removing them from the
-server — without it you'd delete your own cache too, which Godot would just
-spend a few minutes rebuilding.
+### If `.godot/` is already in the depot
+
+Someone submitted it before the ignore file existed. An ignore file only
+stops files being *added*, so it won't remove what's already there.
+
+In P4V's **Depot** tab, right-click the `.godot` folder and choose **Mark for
+Delete**, then submit. This also deletes the folder from your disk. Godot
+rebuilds it the next time you open the project, which takes a few minutes on
+a large project.
+
+### If you skipped step 4 and Godot can't write `project.godot`
+
+In P4V, right-click `project.godot` → **Check Out**, then right-click it
+again → **Change Filetype**, tick the **+w** option (always writable), click
+**OK**, and submit.
