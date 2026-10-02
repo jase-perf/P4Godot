@@ -101,10 +101,143 @@ class P4Request extends RefCounted:
 	var exit_code: int = -1
 	var output: Array = []
 	var completed: bool = false
+	# A streamed request (see _p4_exec_streamed) is read through pipes while p4
+	# runs. `lines` carries p4's progress and tracking lines to the main thread
+	# as they arrive. `cancel` and `detach` are set by the main thread and read
+	# by the worker: cancel kills p4, detach stops watching it and leaves it
+	# running (the editor is closing).
+	signal lines(batch: PackedStringArray)
+	var streamed: bool = false
+	var cancel: bool = false
+	var detach: bool = false
+	var killed: bool = false
 
 	func _finish() -> void:
 		completed = true
 		done.emit()
+
+	func _emit_lines(batch: PackedStringArray) -> void:
+		lines.emit(batch)
+
+
+## Running totals for a submit or sync, fed the lines `p4 --progress=debug`
+## prints while it works:
+##   progress (total|update|done): <local path> (type T units U) - <pos> of <n>
+## Unlike `p4 -I`, that mode keeps reporting when the server runs the transfer
+## in parallel threads (measured on a 2025.2 client and server; the mode has
+## been in Perforce's client source since 2021.1 and isn't in `p4 help usage`).
+##
+## Units matter. 3 is kilobytes. A file sent by Delta Transfer (`binary+F`,
+## only the changed parts travel) reports 5, "deltas", such as "17 of 22" -
+## still a usable fraction, but not a size. And a Delta Transfer SYNC reports
+## nothing at all for the file. So a file's size comes from what the caller
+## knew up front where it can, its position is always pos/n, and finish()
+## fills in whatever was never reported.
+class P4Progress extends RefCounted:
+	const UNIT_KBYTES := 3
+	const UNIT_MBYTES := 4
+	const UNIT_DELTAS := 5
+
+	## What the caller knew before starting: how many files will transfer, their
+	## total size, and each one's size by _path_key(local path). All optional.
+	var total_files: int = 0
+	var total_bytes: int = 0
+	var sizes: Dictionary = {}
+
+	var files_done: int = 0
+	var delta_files: int = 0
+	## The file most recently reported on, for display.
+	var current: String = ""
+	## True once any progress line has been read.
+	var reporting: bool = false
+	## Megabytes the server's tracking output says crossed the network
+	## (`-Ztrack`); -1 until a tracking line with a size is seen.
+	var network_mb: int = -1
+
+	var _files: Dictionary = {} # key -> {"bytes": int, "frac": float, "done": bool}
+	var _bytes_done: float = 0.0
+	var _seen_bytes: int = 0
+	var _line_re := RegEx.create_from_string(
+			"^progress \\((total|update|done)\\): (.*) \\(type (\\d+) units (\\d+)\\) - (-?\\d+) of (-?\\d+)$")
+	var _rpc_re := RegEx.create_from_string(
+			"^--- rpc msgs/size in\\+out \\d+\\+\\d+/(\\d+)mb\\+(\\d+)mb")
+
+	static func key_of(path: String) -> String:
+		return path.replace("\\", "/").to_lower()
+
+	## Feed one line of p4 output. Returns true if it was a progress or
+	## tracking line (and so isn't part of the command's own answer).
+	func feed(line: String) -> bool:
+		if line.begins_with("--- "):
+			var rpc := _rpc_re.search(line)
+			if rpc:
+				# One line per connection phase; the larger direction is the
+				# file content (in for a submit, out for a sync).
+				var mb: int = maxi(int(rpc.get_string(1)), int(rpc.get_string(2)))
+				network_mb = maxi(network_mb, 0) + mb
+			return true
+		var m := _line_re.search(line)
+		if m == null:
+			return line.begins_with("progress (")
+		reporting = true
+		var kind := m.get_string(1)
+		var path := m.get_string(2)
+		var transfer := int(m.get_string(3))
+		var units := int(m.get_string(4))
+		var pos := float(m.get_string(5))
+		var out_of := float(m.get_string(6))
+		if transfer != 1 and transfer != 2:
+			return true # not a file being sent (1) or received (2)
+		current = path
+		var key := key_of(path)
+		var f: Dictionary = _files.get(key, {})
+		if f.is_empty():
+			var size := int(sizes.get(key, -1))
+			if size < 0:
+				size = int(out_of * 1024.0) if units == UNIT_KBYTES \
+						else (int(out_of * 1048576.0) if units == UNIT_MBYTES else 0)
+			f = {"bytes": size, "frac": 0.0, "done": false}
+			_files[key] = f
+			_seen_bytes += size
+			if units == UNIT_DELTAS:
+				delta_files += 1
+		if f.done:
+			return true
+		var frac := 1.0 if kind == "done" \
+				else (clampf(pos / out_of, 0.0, 1.0) if out_of > 0.0 else 0.0)
+		_bytes_done += float(f.bytes) * (frac - float(f.frac))
+		f.frac = frac
+		if kind == "done":
+			f.done = true
+			files_done += 1
+		return true
+
+	func is_done(path: String) -> bool:
+		var f: Dictionary = _files.get(key_of(path), {})
+		return not f.is_empty() and bool(f.done)
+
+	## The command ended successfully: everything expected has arrived,
+	## including files p4 never reported on.
+	func finish() -> void:
+		files_done = maxi(files_done, expected_files())
+		_bytes_done = float(expected_bytes())
+
+	func expected_files() -> int:
+		return maxi(total_files, _files.size())
+
+	func expected_bytes() -> int:
+		return maxi(total_bytes, _seen_bytes)
+
+	func bytes_done() -> int:
+		return int(clampf(_bytes_done, 0.0, float(expected_bytes())))
+
+	## 0..1, by bytes when sizes are known and by file count otherwise.
+	func fraction() -> float:
+		var bytes := expected_bytes()
+		if bytes > 0:
+			return clampf(_bytes_done / float(bytes), 0.0, 1.0)
+		var files := expected_files()
+		return clampf(float(files_done) / float(files), 0.0, 1.0) if files > 0 else 0.0
 
 
 ## Right-click Perforce actions on files in the editor's FileSystem dock. This is
@@ -251,6 +384,8 @@ var _p4_port: String = ""
 # only through the copy each P4Request carries.
 var _p4_bin: String = ""
 const P4_PATH_SETTING := "perforce/executable_path"
+# That executable's release as a number (2025.2), from `p4 -V`; 0.0 if unknown.
+var _p4_version: float = 0.0
 # The last connection probe's p4 output, for setup prompts that quote it.
 var _last_probe_text: String = ""
 
@@ -371,11 +506,8 @@ var _fstat_failed: Dictionary = {}
 # Network limits and the circuit breaker (see _with_connection_flags).
 const NET_MAXWAIT_SEC := 120     # background commands: bound a hung server
 const NET_MAXWAIT_SAVE_SEC := 30 # the blocking calls right before a save
-# `p4 submit` alone: a server-side submit trigger can legitimately say nothing
-# for minutes, and giving up on the read mid-submit doesn't stop the server
-# finishing it (see _submit_verdict). Still bounded, because nothing can cancel
-# a running p4 and a hung one would block every later command and editor exit.
-const NET_MAXWAIT_SUBMIT_SEC := 600
+# Submit and whole-project sync have no limit at all: they run streamed, with
+# a progress window and a Cancel button (see _p4_exec_streamed).
 const UNREACHABLE_BACKOFF_MSEC := 60000
 var _unreachable_until_msec: int = 0
 
@@ -462,6 +594,11 @@ func _exit_tree() -> void:
 		_p4_thread_exit = true
 		_p4_queue_mutex.unlock()
 		_p4_queue_semaphore.post()
+		# A submit or sync still transferring: stop watching it and let p4
+		# finish on its own, so closing the editor doesn't cut it off.
+		if _streamed_req != null:
+			_streamed_req.detach = true
+			_log("Leaving the running Perforce transfer to finish in the background.")
 		# Blocks until any p4 command already running finishes - a hung server
 		# can delay plugin unload, but a Thread must be joined before freeing.
 		_p4_thread.wait_to_finish()
@@ -595,10 +732,18 @@ func _resolve_p4_bin() -> String:
 				and not out.is_empty() and String(out[0]).contains("Perforce"):
 			if c != "p4":
 				_log("Using p4 at %s." % c)
+			_p4_version = _p4_version_in(String(out[0]))
 			return c
 	if not configured.is_empty():
 		_log("The %s editor setting ('%s') isn't a working p4." % [P4_PATH_SETTING, configured])
 	return ""
+
+
+## The client release in `p4 -V` output, as a number: the line
+## "Rev. P4/NTX64/2025.2/2907753 (2026/03/09)." gives 2025.2. 0.0 if absent.
+static func _p4_version_in(version_text: String) -> float:
+	var m := RegEx.create_from_string("Rev\\. P4/[^/]+/(\\d{4})\\.(\\d+)/").search(version_text)
+	return float("%s.%s" % [m.get_string(1), m.get_string(2)]) if m else 0.0
 
 
 ## Whether the project directory lives under `client_root` (case-insensitive,
@@ -906,7 +1051,10 @@ func _maybe_offer_login(result: Dictionary) -> void:
 ## duration"). It can't shorten the OS's TCP connect timeout (~21 s on
 ## Windows) for an unreachable host - the circuit breaker covers that.
 func _with_connection_flags(args: PackedStringArray, maxwait_sec: int = NET_MAXWAIT_SEC) -> PackedStringArray:
-	var flags := PackedStringArray(["-vnet.maxwait=%d" % maxwait_sec])
+	# maxwait_sec <= 0: no read limit at all (see _p4_exec_streamed).
+	var flags := PackedStringArray()
+	if maxwait_sec > 0:
+		flags.append("-vnet.maxwait=%d" % maxwait_sec)
 	if not _override_port.is_empty():
 		flags.append_array(["-p", _override_port])
 	if not _override_user.is_empty():
@@ -2374,6 +2522,15 @@ func _build_dock() -> void:
 
 	_toolbar_right = HBoxContainer.new()
 	_toolbar_top.add_child(_toolbar_right)
+	# Shown only while a submit or download is running with its progress
+	# window closed: the window holds the only Cancel, so there has to be a
+	# way back to it.
+	_progress_show_button = Button.new()
+	_progress_show_button.text = "Transfer running..."
+	_progress_show_button.tooltip_text = "A submit or download is still running. Click to show its progress and the Cancel button."
+	_progress_show_button.visible = false
+	_progress_show_button.pressed.connect(_on_progress_show_pressed)
+	_toolbar_right.add_child(_progress_show_button)
 	conn_status_button = Button.new()
 	conn_status_button.flat = true
 	conn_status_button.pressed.connect(_on_conn_status_pressed)
@@ -2677,6 +2834,250 @@ func _on_toggle_log_pressed() -> void:
 
 func _on_log_window_close_requested() -> void:
 	log_window.hide()
+
+
+# ---------------------------------------------------------------------------
+# Transfer progress window
+#
+# Shown while a submit or a whole-project sync runs. It is not modal: the
+# editor stays usable, and closing the window hides it without stopping the
+# transfer. It answers the two things a long transfer leaves a person
+# wondering - is it still working, and how far along is it - and it is the
+# only place a running p4 can be stopped from.
+# ---------------------------------------------------------------------------
+
+## How long with no progress line before the window says so. Not a failure:
+## a server-side check or one very large file can be quiet for longer.
+const PROGRESS_QUIET_SEC := 60
+
+var _progress_window: Window
+var _progress_headline: Label
+var _progress_bar: ProgressBar
+var _progress_detail: Label
+var _progress_file: Label
+var _progress_quiet: Label
+var _progress_cancel_button: Button
+var _progress_show_button: Button
+var _progress_timer: Timer
+# True from _progress_begin to _progress_end. One transfer at a time: the
+# window, the tracker and the Cancel button all belong to a single p4, and a
+# second one started alongside would run with nobody able to see or stop it.
+var _transfer_running: bool = false
+var _progress_tracker: P4Progress = null
+var _progress_started_msec: int = 0
+var _progress_last_activity_msec: int = 0
+# Set by _progress_note: the transfer is over and something else is going on
+# (asking the server what became of a submit), so there is nothing to count.
+var _progress_note_text: String = ""
+
+
+func _build_progress_window() -> void:
+	_progress_window = Window.new()
+	_progress_window.title = "Perforce"
+	_progress_window.size = Vector2i(560, 200)
+	_progress_window.visible = false
+	_progress_window.unresizable = false
+	# Closing HIDES it. The transfer carries on, and the Log says so.
+	_progress_window.close_requested.connect(_on_progress_window_close_requested)
+
+	var margin := MarginContainer.new()
+	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
+	for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		margin.add_theme_constant_override(side, 12)
+	_progress_window.add_child(margin)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 8)
+	margin.add_child(box)
+
+	_progress_headline = Label.new()
+	box.add_child(_progress_headline)
+	_progress_bar = ProgressBar.new()
+	_progress_bar.min_value = 0.0
+	_progress_bar.max_value = 100.0
+	_progress_bar.custom_minimum_size = Vector2(0, 22)
+	box.add_child(_progress_bar)
+	_progress_detail = Label.new()
+	box.add_child(_progress_detail)
+	_progress_file = Label.new()
+	_progress_file.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	_progress_file.clip_text = true
+	_progress_file.add_theme_color_override("font_color", _dim_color())
+	box.add_child(_progress_file)
+	_progress_quiet = Label.new()
+	_progress_quiet.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_progress_quiet.visible = false
+	box.add_child(_progress_quiet)
+
+	var buttons := HBoxContainer.new()
+	buttons.alignment = BoxContainer.ALIGNMENT_END
+	box.add_child(buttons)
+	_progress_cancel_button = Button.new()
+	_progress_cancel_button.text = "Cancel"
+	_progress_cancel_button.pressed.connect(_on_progress_cancel_pressed)
+	buttons.add_child(_progress_cancel_button)
+
+	_progress_timer = Timer.new()
+	_progress_timer.wait_time = 0.25
+	_progress_timer.timeout.connect(_progress_refresh)
+	_progress_window.add_child(_progress_timer)
+	# Child of dock, so dock.queue_free() in _exit_tree() cascades to it.
+	dock.add_child(_progress_window)
+
+
+## Open the window for a transfer `tracker` will be fed the progress of.
+func _progress_begin(title: String, headline: String, tracker: P4Progress) -> void:
+	if _progress_window == null:
+		_build_progress_window()
+	_transfer_running = true
+	_progress_show_button.visible = false
+	_progress_tracker = tracker
+	_progress_note_text = ""
+	_progress_started_msec = Time.get_ticks_msec()
+	_progress_last_activity_msec = _progress_started_msec
+	_progress_window.title = title
+	_progress_headline.text = headline
+	_progress_cancel_button.disabled = false
+	_progress_cancel_button.text = "Cancel"
+	_progress_cancel_button.visible = true
+	_progress_refresh()
+	_progress_timer.start()
+	if DisplayServer.get_name() != "headless":
+		_progress_window.popup_centered()
+
+
+## The transfer is over but the work isn't (the server is being asked what
+## became of a submit): keep the window up, with `text` and a bar that only
+## shows activity. Cancel is hidden, because there is no p4 left to stop.
+func _progress_note(text: String) -> void:
+	if _shutting_down or not is_instance_valid(_progress_window):
+		return
+	_progress_note_text = text
+	_progress_cancel_button.visible = false
+	_progress_refresh()
+
+
+func _progress_end() -> void:
+	_transfer_running = false
+	if _shutting_down or not is_instance_valid(_progress_window):
+		return
+	_progress_timer.stop()
+	_progress_tracker = null
+	_progress_show_button.visible = false
+	_progress_window.hide()
+
+
+## The gate every transfer goes through before it starts. False, with an
+## explanation, if another one is still running.
+func _transfer_slot_free() -> bool:
+	if not _transfer_running:
+		return true
+	_on_progress_show_pressed()
+	await _show_alert("A submit or download is already running. Wait for it to finish, " +
+			"or cancel it from its progress window, then try again.")
+	return false
+
+
+func _on_progress_window_close_requested() -> void:
+	_progress_window.hide()
+	_progress_show_button.visible = _transfer_running
+	_log("Progress window closed - the transfer is still running. \"Transfer running...\" in the P4G toolbar brings the window back.")
+
+
+func _on_progress_show_pressed() -> void:
+	if is_instance_valid(_progress_window) and _transfer_running \
+			and DisplayServer.get_name() != "headless":
+		_progress_show_button.visible = false
+		_progress_window.popup_centered()
+
+
+func _on_progress_cancel_pressed() -> void:
+	# Nothing to stop between p4 runs (a retry pass, or the questions asked of
+	# the server afterwards): leave the button as it is.
+	if _streamed_req == null:
+		return
+	_progress_cancel_button.disabled = true
+	_progress_cancel_button.text = "Cancelling..."
+	_log("Cancel requested - stopping p4.")
+	_cancel_streamed()
+
+
+## Redraw from the tracker. Runs on a timer, not on each progress line: a sync
+## of thousands of small files reports thousands of lines a second.
+func _progress_refresh() -> void:
+	if _shutting_down or not is_instance_valid(_progress_window) or _progress_tracker == null:
+		return
+	var now := Time.get_ticks_msec()
+	var elapsed := (now - _progress_started_msec) / 1000.0
+	if not _progress_note_text.is_empty():
+		_progress_bar.indeterminate = true
+		_progress_detail.text = _progress_note_text
+		_progress_file.text = ""
+		_progress_quiet.visible = false
+		return
+	var t := _progress_tracker
+	# Until p4 reports something there is nothing to measure: the server is
+	# locking files, or this p4 is too old to report. Show activity, not 0%.
+	_progress_bar.indeterminate = not t.reporting
+	_progress_bar.value = t.fraction() * 100.0
+	_progress_detail.text = _progress_detail_text(t, elapsed)
+	_progress_file.text = t.current.get_file() if not t.current.is_empty() else ""
+	var quiet_sec := (now - _progress_last_activity_msec) / 1000.0
+	_progress_quiet.visible = quiet_sec >= PROGRESS_QUIET_SEC
+	if _progress_quiet.visible:
+		_progress_quiet.text = ("Nothing has been reported for %s. That isn't a failure: the " +
+				"server may be running a check, or working through one large file. Cancel " +
+				"stops it if you'd rather not wait.") % _duration_text(quiet_sec)
+
+
+## "37 of 212 files  -  410 MB of 1.9 GB  -  1:23". Pure, so a self-test can
+## pin what the user is shown.
+static func _progress_detail_text(t: P4Progress, elapsed_sec: float) -> String:
+	var parts := PackedStringArray()
+	if not t.reporting:
+		parts.append("Working...")
+	else:
+		var files := t.expected_files()
+		if files > 0:
+			parts.append("%d of %d file%s" % [mini(t.files_done, files), files,
+					"" if files == 1 else "s"])
+		var bytes := t.expected_bytes()
+		if bytes > 0:
+			parts.append("%s of %s" % [_human_bytes(t.bytes_done()), _human_bytes(bytes)])
+	parts.append(_duration_text(elapsed_sec))
+	return "  -  ".join(parts)
+
+
+## "0:07", "1:23", "1:02:05".
+static func _duration_text(seconds: float) -> String:
+	var s := int(seconds)
+	@warning_ignore("integer_division")
+	var h := s / 3600
+	@warning_ignore("integer_division")
+	var m := (s % 3600) / 60
+	if h > 0:
+		return "%d:%02d:%02d" % [h, m, s % 60]
+	return "%d:%02d" % [m, s % 60]
+
+
+## One sentence on what a finished transfer moved, for the Log and the final
+## report. The network figure comes from the server's tracking output and is
+## only shown when it says something: it reads 0 for a parallel transfer, and
+## it is in whole megabytes. When it is well under the size of the files, say
+## why - that difference is Delta Transfer (or compression) doing its job.
+static func _transfer_summary(t: P4Progress) -> String:
+	var files := t.expected_files()
+	var bytes := t.expected_bytes()
+	if files <= 0:
+		return ""
+	var text := "%d file%s, %s." % [files, "" if files == 1 else "s", _human_bytes(bytes)]
+	if t.network_mb > 0:
+		text += " About %d MB crossed the network." % t.network_mb
+		var mb := bytes / 1048576.0
+		if mb >= 4.0 and float(t.network_mb) <= mb * 0.6:
+			text += (" That is less than the files' size because Perforce compressed them " +
+					"or sent only the parts that changed%s.") \
+					% (" (Delta Transfer)" if t.delta_files > 0 else "")
+	return text
 
 
 # ---------------------------------------------------------------------------
@@ -4262,6 +4663,10 @@ const MODIFIED_MESSAGE := " - can't update modified file "
 ## (measured 2026-10-02).
 const EXISTING_MESSAGE := " - can't overwrite existing file "
 
+## p4's plain-text line for a file a sync handled normally (see _sync_notes).
+var _sync_success_re := RegEx.create_from_string(
+		"^//.*#\\d+ - (added as|updating|refreshing|replacing|deleted as) ")
+
 ## Above this, the confirmation warns that the download will take a while.
 const BIG_DOWNLOAD_BYTES := 50 * 1024 * 1024
 
@@ -4294,8 +4699,11 @@ func _get_latest_body() -> String:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return ""
+	if not await _transfer_slot_free():
+		return ""
 	var preview: Dictionary = await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])
-	var found := _summarize_sync(_parse_ztag(preview))
+	var preview_records := _parse_ztag(preview)
+	var found := _summarize_sync(preview_records)
 	var notes := _sync_notes(preview)
 	var kept_only: bool = not (notes.modified.is_empty() and notes.existing.is_empty())
 	if bool(notes.nothing_in_depot) and found.names.is_empty() and not kept_only:
@@ -4332,10 +4740,33 @@ func _get_latest_body() -> String:
 	if not await _confirm_get_latest(found, notes):
 		_log("Get Latest cancelled.")
 		return ""
+	if not await _transfer_slot_free():
+		return "" # a submit was started while the confirmation sat open
 	_log("Get Latest: %d file(s), %s..." % [found.names.size(), _human_bytes(int(found.bytes))])
-	var synced: Dictionary = await _safe_sync([_project_scope()])
+	var tracker := P4Progress.new()
+	tracker.total_files = int(found.adds) + int(found.updates)
+	tracker.total_bytes = int(found.bytes)
+	tracker.sizes = found.sizes
+	# Which of the files about to be added are ALREADY on disk. Needed if the
+	# sync is cancelled: only a file that appeared during it may be cleaned up.
+	var preexisting := {}
+	for local in found.added_locals:
+		if FileAccess.file_exists(String(local)):
+			preexisting[_path_key(String(local))] = true
+	var started_unix := int(Time.get_unix_time_from_system())
+	_progress_begin("Get Latest", "Downloading %d file(s) from Perforce" % tracker.total_files,
+			tracker)
+	var synced: Dictionary = await _safe_sync([_project_scope()], tracker)
 	if _shutting_down:
 		return ""
+	var cancelled: bool = bool(synced.get("cancelled", false))
+	var cleaned := 0
+	if cancelled:
+		_progress_note("Tidying up after the cancelled download...")
+		cleaned = await _cleanup_cancelled_sync(found, preexisting, tracker, started_unix)
+	elif int(synced.exit_code) == 0:
+		tracker.finish()
+	_progress_end()
 	var after: Dictionary = synced.notes
 	# Everything below is driven by what the sync ITSELF reported, never by the
 	# preview. Two reasons: p4 prints a normal-looking record for a file it
@@ -4343,15 +4774,142 @@ func _get_latest_body() -> String:
 	# confirmation sat open is in this output and was never in the preview - its
 	# open tab needs reloading just as much.
 	var done: Dictionary = synced.done
+	var remaining := -1
+	if cancelled:
+		# A killed p4 printed few records or none (a parallel sync prints them
+		# all at the end), and its progress lines miss whatever it deleted or
+		# sent by Delta Transfer. So ask again what is still behind: every file
+		# the first preview listed that this one doesn't has arrived, been
+		# replaced, or been removed - and needs the same reload, and the same
+		# warnings, as after a sync that ran to the end.
+		var again: Dictionary = await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])
+		var still := {}
+		for rec in _parse_ztag(again):
+			still[_path_key(String(rec.get("clientFile", "")))] = true
+		var again_notes := _sync_notes(again)
+		var asked: bool = int(again.get("exit_code", -1)) == 0 or not still.is_empty()
+		var kept_names := {}
+		for held in again_notes.modified + again_notes.existing:
+			kept_names[String(held)] = true
+		var arrived: Array = []
+		for rec in preview_records:
+			var local := String(rec.get("clientFile", ""))
+			var res := _local_to_res(local)
+			if still.has(_path_key(local)) or kept_names.has(res if not res.is_empty() else local):
+				continue
+			# Without an answer, fall back to what p4 itself reported done.
+			if asked or tracker.is_done(local):
+				arrived.append(rec)
+		done = _summarize_sync(arrived)
+		if asked:
+			remaining = still.size()
+			after = again_notes
 	_request_refresh()
 	EditorInterface.get_resource_filesystem().scan()
 	var reload := await _reload_after_sync(done, after.clobbered)
 	# The resolve list only means anything after the sync: the sync is what
 	# moves the have revision and schedules the merge.
 	var to_resolve: Array = await _resolve_preview_names()
-	var report := _get_latest_report(done, after, reload, to_resolve, int(synced.exit_code))
+	var report := _get_latest_report(done, after, reload, to_resolve,
+			0 if cancelled else int(synced.exit_code))
+	if cancelled:
+		var head := "Get Latest was cancelled before it finished."
+		if cleaned > 0:
+			head += " %d unfinished file(s) were removed from the project folder." % cleaned
+		var tail := "Press \"Get Latest...\" again to fetch the rest."
+		if remaining == 0:
+			tail = "As it turns out, everything had already arrived."
+		elif remaining > 0:
+			tail = "%d file(s) are still to download. Press \"Get Latest...\" again to fetch them." \
+					% remaining
+		report = "%s\n\n%s\n\n%s" % [head, report, tail]
+	else:
+		var moved := _transfer_summary(tracker)
+		if not moved.is_empty() and tracker.network_mb > 0:
+			report += "\n\n" + moved
 	await _show_alert(report)
 	return report
+
+
+## After a cancelled sync, remove what the killed p4 left half-written.
+## Measured (2025.2, parallel sync killed mid-way):
+##   - a file being ADDED is created under its final name before its content
+##     arrives, so the kill leaves an empty or partial file there - and every
+##     later `sync -s` then refuses it ("can't overwrite existing file"),
+##     because the server never recorded it as delivered;
+##   - a file being REPLACED is written to `t<n>t<n>t<n>.tmp` beside the
+##     target, which is left behind; the target itself is untouched.
+## The server only records a file as delivered after it is complete, so it
+## never believes the workspace has something it doesn't.
+##
+## A file is removed only if the preview said it would be added, it was NOT on
+## disk before the sync started, p4 never reported it done, AND the server
+## confirms it has no record of delivering it. Returns how many were removed.
+## `known_delivered` lets a self-test supply that last answer.
+func _cleanup_cancelled_sync(found: Dictionary, preexisting: Dictionary, tracker: P4Progress,
+		started_unix: int, known_delivered: Variant = null) -> int:
+	var removed: Array = []
+	var dirs := {}
+	for local_any in found.locals:
+		dirs[String(local_any).get_base_dir()] = true
+	var candidates: Array = []
+	for local_any in found.added_locals:
+		var local := String(local_any)
+		if preexisting.has(_path_key(local)) or tracker.is_done(local):
+			continue
+		if FileAccess.file_exists(local):
+			candidates.append(local)
+	# The tracker alone is not enough to delete on: an old p4 reports no
+	# progress at all, so "never reported done" would cover every file that
+	# arrived. Ask the server which of these it has recorded as delivered, and
+	# keep those. No answer, no deleting.
+	var delivered := {}
+	var answered := true
+	if known_delivered != null:
+		delivered = known_delivered # a self-test standing in for the server
+	else:
+		for start in range(0, candidates.size(), 100):
+			var ask := PackedStringArray(["-ztag", "have"])
+			for i in range(start, mini(start + 100, candidates.size())):
+				ask.append(String(candidates[i]))
+			var have: Dictionary = await _p4_exec(ask, false)
+			var said := "" if have.output.is_empty() else String(have.output[0])
+			if int(have.get("exit_code", -1)) != 0 and not said.contains("not on client"):
+				answered = false
+				break
+			for rec in _parse_ztag(have):
+				delivered[_path_key(String(rec.get("path", "")))] = true
+	if not answered:
+		_log("Couldn't ask the server which files had arrived, so nothing was removed. " +
+				"If the next Get Latest lists files it would not download, delete those " +
+				"files from the project folder and run it again.")
+		candidates.clear()
+	for local_any in candidates:
+		var local := String(local_any)
+		if delivered.has(_path_key(local)):
+			continue
+		_set_file_writable(local, true)
+		if DirAccess.remove_absolute(local) == OK:
+			removed.append(local)
+	var temp_re := RegEx.create_from_string("^t\\d+t\\d+t\\d+\\.tmp$")
+	for dir_path in dirs.keys():
+		var dir := DirAccess.open(String(dir_path))
+		if dir == null:
+			continue
+		for name_any in dir.get_files():
+			var file_name := String(name_any)
+			if temp_re.search(file_name) == null:
+				continue
+			var full := String(dir_path).path_join(file_name)
+			# Only p4's own leftovers from THIS sync: its naming pattern, and
+			# written since the sync began.
+			if int(FileAccess.get_modified_time(full)) + 2 < started_unix:
+				continue
+			_set_file_writable(full, true)
+			DirAccess.remove_absolute(full)
+	if not removed.is_empty():
+		_log("Removed %d unfinished file(s) left by the cancelled download." % removed.size())
+	return removed.size()
 
 
 ## Every sync P4Godot runs goes through here, as `p4 sync -s` ("safe sync").
@@ -4377,16 +4935,26 @@ func _get_latest_body() -> String:
 ## records folded by _summarize_sync, _sync_notes with the retry folded in
 ## (`clobbered` holds only what is STILL refused), and an exit code that
 ## forgets a clobber failure the retry fixed.
-func _safe_sync(targets: PackedStringArray) -> Dictionary:
+##
+## With a `tracker`, the sync is streamed (_p4_exec_streamed) so a progress
+## window can follow it and Cancel can stop it; the result then also carries
+## `cancelled`.
+func _safe_sync(targets: PackedStringArray, tracker: P4Progress = null) -> Dictionary:
 	var args := PackedStringArray(["-ztag", "sync", "-s"])
 	args.append_array(targets)
-	var result: Dictionary = await _p4_exec_logged(args)
+	var result: Dictionary
+	if tracker != null:
+		result = await _p4_exec_streamed(args, tracker)
+	else:
+		result = await _p4_exec_logged(args)
+	var cancelled: bool = bool(result.get("cancelled", false))
 	var notes := _sync_notes(result)
 	var done := _summarize_sync(_parse_ztag(result))
 	var exit_code := int(result.get("exit_code", 0))
 	var stuck: Array = notes.clobbered_locals
-	if stuck.is_empty() or _shutting_down:
-		return {"result": result, "done": done, "notes": notes, "exit_code": exit_code}
+	if stuck.is_empty() or _shutting_down or cancelled:
+		return {"result": result, "done": done, "notes": notes, "exit_code": exit_code,
+				"cancelled": cancelled}
 	_log("Retrying %d unlocked but unchanged file(s) as read-only..." % stuck.size())
 	var names: Array = notes.clobbered # parallel to `stuck`
 	var still: Array = []
@@ -4420,7 +4988,8 @@ func _safe_sync(targets: PackedStringArray) -> Dictionary:
 	notes.clobbered = still
 	if not retry_failed and still.is_empty() and notes.problems.is_empty():
 		exit_code = 0
-	return {"result": result, "done": done, "notes": notes, "exit_code": exit_code}
+	return {"result": result, "done": done, "notes": notes, "exit_code": exit_code,
+			"cancelled": false}
 
 
 ## A local path in a form two spellings of it compare equal in: p4 prints
@@ -4469,6 +5038,8 @@ func _summarize_sync(records: Array) -> Dictionary:
 	var total := 0
 	var malformed := 0
 	var deleted_names: Array = []
+	var sizes := {} # _path_key(local) -> bytes, for the progress tracker
+	var added_locals: Array = []
 	for rec in records:
 		var local := String(rec.get("clientFile", ""))
 		var action := String(rec.get("action", ""))
@@ -4487,9 +5058,11 @@ func _summarize_sync(records: Array) -> Dictionary:
 			deleted_names.append(shown)
 		elif action.contains("add"):
 			adds += 1
+			added_locals.append(local)
 		else:
 			updates += 1
 		total += int(rec.get("fileSize", 0))
+		sizes[_path_key(local)] = int(rec.get("fileSize", 0))
 		rows.append({"local": local, "name": shown})
 	rows.sort_custom(func(a, b): return String(a.name) < String(b.name))
 	var locals: Array = []
@@ -4500,7 +5073,7 @@ func _summarize_sync(records: Array) -> Dictionary:
 	deleted_names.sort()
 	return {"locals": locals, "names": names, "updates": updates, "adds": adds,
 			"deletes": deletes, "bytes": total, "malformed": malformed,
-			"deleted_names": deleted_names}
+			"deleted_names": deleted_names, "sizes": sizes, "added_locals": added_locals}
 
 
 ## What a sync's output says that its records don't:
@@ -4560,6 +5133,13 @@ func _sync_notes(result: Dictionary) -> Dictionary:
 			nothing_in_depot = true
 		elif line.contains("must resolve") or line.contains("up-to-date"):
 			pass # reported from `resolve -n`, or simply nothing to act on
+		elif _sync_success_re.search(line) != null:
+			# A file p4 reports in words even under -ztag. Seen after a
+			# cancelled sync: a file that had fully arrived, but that the
+			# server hadn't recorded yet, is taken as it stands on the next
+			# sync and announced as "<depot>#1 - added as <local>" with no
+			# record. It is a success, not something to warn about.
+			pass
 		else:
 			problems.append(line)
 	modified.sort()
@@ -4979,6 +5559,8 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
+	if not await _transfer_slot_free():
+		return
 	# The dock's file list can be stale; confirm (and submit) what's opened now.
 	files = await _submit_file_list(change, files)
 	if files.is_empty():
@@ -5017,6 +5599,8 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	if not proceed:
 		_log("Submit cancelled.")
 		return
+	if not await _transfer_slot_free():
+		return # a download was started while the confirmation sat open
 
 	var number := change
 	if change == "default":
@@ -5039,31 +5623,46 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			_request_refresh()
 			return
 
-	var result: Dictionary = await _p4_exec(["submit", "-c", number], true,
-			NET_MAXWAIT_SUBMIT_SEC)
+	var tracker := _submit_tracker(files)
+	_progress_begin("Submitting to Perforce", "Submitting changelist %s" % number, tracker)
+	var result: Dictionary = await _p4_exec_streamed(["submit", "-c", number], tracker)
+	var cancelled: bool = bool(result.get("cancelled", false))
 	# What p4 printed and how it exited are not the outcome. A submit whose
-	# answer never arrived may still have gone through, so on anything short of
-	# an explicit "submitted", ask the server what became of the changelist.
+	# answer never arrived may still have gone through - and a cancelled one
+	# may have been past the point of no return - so on anything short of an
+	# explicit "submitted", ask the server what became of the changelist.
 	var final := _submitted_change_in(result)
 	var outcome := "submitted"
 	var said := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
 	if final.is_empty():
-		var lost := _submit_connection_lost(result)
+		var lost: bool = cancelled or _submit_connection_lost(result)
 		if lost:
 			_log("The submit didn't end with a clear answer - asking the server what became of it...")
-		var verdict: Dictionary = await _submit_verdict(number, lost)
+			_progress_note(("Cancelled here. Asking the server to stop its side and checking " +
+					"what became of the submit - this can take up to a minute...") \
+					if cancelled else "Asking the server what became of the submit...")
+		var verdict: Dictionary = await _submit_verdict(number, lost, cancelled)
 		outcome = String(verdict.outcome)
 		final = String(verdict.change)
-		await _show_alert(_submit_outcome_text(outcome, number, final, said, lost))
+		_progress_end()
+		await _show_alert(_submit_outcome_text(outcome, number, final, said, lost, cancelled))
 	elif int(result.exit_code) != 0:
+		_progress_end()
 		# The server said "submitted" and then something failed - a check that
 		# runs after the submit, say. The files are in; the complaint still
 		# has to reach the user.
 		await _show_alert(("Your files were submitted as change %s, but Perforce reported a " +
 				"problem afterwards:\n\n%s") % [final, said])
+	else:
+		tracker.finish()
+		_progress_end()
 
+	_last_submit_outcome = outcome
 	if outcome == "submitted":
 		_log("Submit complete." if final.is_empty() else "Submitted as change %s." % final)
+		var moved := _transfer_summary(tracker)
+		if not moved.is_empty():
+			_log("  " + moved)
 		# Submitted files are no longer opened. The cache is keyed by res://
 		# path, which files missing from the last refresh don't have here - so
 		# drop it all; the refresh below re-adds whatever is still opened.
@@ -5074,6 +5673,90 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 		_log("Submit of changelist %s: %s." % [number,
 				"not submitted" if outcome == "not_submitted" else "outcome unknown"])
 	_request_refresh()
+
+
+## After Cancel killed our p4, tell the server to stop its side of the submit.
+##
+## Killing the client isn't enough. Measured on a 2025.2 server: with a
+## parallel submit stopped mid-upload, the server's `submit` command was still
+## listed as running two minutes later, holding the changelist, so the outcome
+## could only be reported as unknown. `p4 monitor terminate <id>` ended it in
+## about four seconds and left the changelist pending. A user may terminate
+## their own commands (`p4 help monitor`).
+##
+## Only a command still called `submit` is touched - the upload phase. Once the
+## server has the files it runs the commit under another name, and that is left
+## to finish: _submit_verdict then reports it as submitted.
+##
+## Returns 1 once the server has accepted the request or there is nothing of
+## ours left to stop; 0 to be asked again (the server refuses to terminate a
+## command younger than ten seconds - "can't terminate, runtime < 10 seconds" -
+## so a quick Cancel has to wait and retry); -1 when it can't be done here, and
+## the caller should stop expecting it.
+##
+## Which command is ours: the detailed listing names the workspace and the
+## changelist, but needs operator or super access. Everyone else gets the
+## plain listing - user and command only - and there the command is terminated
+## only if it is the single `submit` this user has running. With two, nothing
+## says which is which, and the other one may be a submit from P4V.
+## (The plain-listing path has not been run as an ordinary user.)
+func _terminate_own_submit(number: String) -> int:
+	var listing: Dictionary = await _p4_exec(["-ztag", "monitor", "show", "-a", "-l", "-e"], false)
+	var records := _parse_ztag(listing) if int(listing.get("exit_code", -1)) == 0 else []
+	var precise := not records.is_empty()
+	if not precise:
+		listing = await _p4_exec(["-ztag", "monitor", "show"], false)
+		records = _parse_ztag(listing) if int(listing.get("exit_code", -1)) == 0 else []
+		if records.is_empty():
+			return -1 # monitoring is off, or we may not look
+	var mine: Array = []
+	for rec in records:
+		if String(rec.get("command", "")) != "submit" or String(rec.get("user", "")) != _p4_user:
+			continue
+		if precise and (String(rec.get("client", "")) != _p4_client \
+				or not (" %s " % String(rec.get("args", ""))).contains(" -c %s " % number)):
+			continue
+		mine.append(rec)
+	if mine.is_empty():
+		return 1
+	if not precise and mine.size() != 1:
+		_log("More than one of your submits is running on the server, so P4Godot can't tell which one to stop.")
+		return -1
+	var id := String(mine[0].get("id", ""))
+	if not id.is_valid_int():
+		return -1
+	if String(mine[0].get("status", "")) == "T":
+		return 1 # already marked
+	var asked: Dictionary = await _p4_exec(["monitor", "terminate", id], false)
+	var answer := "" if asked.output.is_empty() else String(asked.output[0])
+	if answer.contains("marked for termination"):
+		_log("Told the server to stop the cancelled submit (process %s)." % id)
+		return 1
+	return 0 if answer.contains("can't terminate") else -1
+
+
+## What a submit of `files` (entries from _submit_file_list) will transfer:
+## every file except the ones being deleted, with the size of each one whose
+## local path is known. Files outside the Godot project have no local path
+## here; the tracker takes their sizes from p4's own progress lines.
+func _submit_tracker(files: Array) -> P4Progress:
+	var tracker := P4Progress.new()
+	for f in files:
+		if String(f.action).contains("delete"):
+			continue
+		tracker.total_files += 1
+		var label := String(f.label)
+		if not label.begins_with("res://"):
+			continue
+		var local := ProjectSettings.globalize_path(label)
+		var handle := FileAccess.open(local, FileAccess.READ)
+		if handle == null:
+			continue
+		var size := int(handle.get_length())
+		handle.close()
+		tracker.sizes[P4Progress.key_of(local)] = size
+		tracker.total_bytes += size
+	return tracker
 
 
 ## The number a submit landed as, read from p4's own "submitted" line - or ""
@@ -5159,9 +5842,9 @@ func _monitor_submit_running(result: Dictionary, user: String) -> int:
 	var records := _parse_ztag(result)
 	if records.is_empty():
 		return -1
-	# Matched loosely on purpose. What a submit is called while the server is
-	# committing it has not been measured (it may be an internal name such as
-	# "dm-CommitSubmit"), and a miss here reads as "nothing running", which
+	# Matched loosely on purpose. A submit is listed as `submit` while it
+	# uploads and as `dm-CommitSubmit` while the server commits it (both seen
+	# on a 2025.2 server), and a miss here reads as "nothing running", which
 	# turns a submit in progress into "not submitted".
 	for rec in records:
 		if String(rec.get("user", "")) == user \
@@ -5190,15 +5873,32 @@ const SUBMIT_VERDICT_POLL_SEC := 2.0
 ## closes, the honest answer is "unknown". The window is a deadline and not a
 ## number of tries because one try against an unreachable server already costs
 ## the operating system's connect timeout.
-func _submit_verdict(number: String, connection_lost: bool) -> Dictionary:
-	var deadline := Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC
+##
+## `stop_ours` is for a submit the user cancelled: the server's side of it is
+## told to stop (see _terminate_own_submit), and asked again on each pass until
+## it agrees, so "still running" turns into "not submitted" in seconds rather
+## than staying unknown.
+func _submit_verdict(number: String, connection_lost: bool, stop_ours: bool = false) -> Dictionary:
+	# A cancelled submit gets twice the window: the server won't take the stop
+	# request for the first ten seconds of the command, and then needs a few
+	# more to act on it (about 30 s in all when measured).
+	var deadline := Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC * (2 if stop_ours else 1)
 	var attempt := 0
+	var stopping := false
 	while not _shutting_down:
 		if attempt > 0:
 			if not connection_lost or Time.get_ticks_msec() >= deadline:
 				break
 			await get_tree().create_timer(SUBMIT_VERDICT_POLL_SEC).timeout
 		attempt += 1
+		if stop_ours and not stopping:
+			var asked: int = await _terminate_own_submit(number)
+			stopping = asked == 1
+			if asked == -1:
+				# Can't stop it from here. Don't keep the user waiting twice as
+				# long for something that isn't going to happen.
+				stop_ours = false
+				deadline = mini(deadline, Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC)
 		# Ask what is running BEFORE asking for the status. In the other order a
 		# submit that finishes between the two questions reads as "pending,
 		# nothing running" - not submitted - when it just was.
@@ -5227,13 +5927,23 @@ func _submit_verdict(number: String, connection_lost: bool) -> Dictionary:
 ## apart from the dialog so a self-test can assert on it: this is the text that
 ## used to say "nothing was sent" without anyone having checked.
 func _submit_outcome_text(outcome: String, number: String, final: String, said: String,
-		connection_lost: bool) -> String:
+		connection_lost: bool, cancelled: bool = false) -> String:
 	match outcome:
 		"submitted":
+			if cancelled:
+				return ("Too late to cancel: your files were submitted as change %s.\n\n" +
+						"The server had already received them when the submit was stopped, " +
+						"and it finished the job. P4Godot checked with the server afterwards.") \
+						% (final if not final.is_empty() else number)
 			return ("Your files were submitted as change %s.\n\nThe server's answer didn't " +
 					"reach Godot, so P4Godot asked it afterwards - the submit went through.") \
 					% (final if not final.is_empty() else number)
 		"not_submitted":
+			if cancelled:
+				return ("Submit cancelled.\n\nP4Godot checked with the server afterwards: " +
+						"nothing was submitted, and your work is untouched. Your files are in " +
+						"changelist %s in the P4G panel - submit it from there when you're " +
+						"ready.") % number
 			if connection_lost:
 				return ("The connection to the Perforce server dropped before your files " +
 						"were submitted:\n\n%s\n\nP4Godot checked with the server afterwards: " +
@@ -5832,6 +6542,88 @@ func _p4_exec_logged_sync(args: PackedStringArray) -> Dictionary:
 	return _p4_exec_sync(args)
 
 
+## The oldest p4 client that understands `--progress=debug`. An older one
+## rejects the whole command line, so the flag is only passed from here up.
+const P4_PROGRESS_MIN_VERSION := 2021.1
+
+## Self-tests only (see the lambda in _p4_exec_streamed).
+var _selftest_cancel_on_progress: bool = false
+## How the last _submit_changelist ended: "submitted", "not_submitted" or
+## "unknown" ("" before any submit). For self-tests; nothing else reads it.
+var _last_submit_outcome: String = ""
+
+## The request _p4_exec_streamed is waiting on, so Cancel and editor shutdown
+## can reach it. Only one runs at a time (the worker queue is serial).
+var _streamed_req: P4Request = null
+
+
+## Async `p4 <args>` for a transfer that can run long: a submit or a sync.
+## Same queue and same result shape as _p4_exec, plus:
+##   - `tracker` is fed p4's progress lines while the command runs, so a
+##     progress window can show files and bytes as they move;
+##   - the result carries `cancelled`, true if _cancel_streamed() stopped it;
+##   - there is NO read time limit (`net.maxwait`). A transfer that is moving
+##     can take as long as it takes, and one that isn't is the user's to stop:
+##     the progress window says when nothing has moved and offers Cancel.
+##
+## `-Ztrack` asks the server for its tracking output, whose "rpc size" line is
+## the only measure of what really crossed the network (it is what shows a
+## Delta Transfer sending 6 MB of a 24 MB file). It reads 0 for a parallel
+## transfer, whose traffic runs on other connections.
+func _p4_exec_streamed(args: PackedStringArray, tracker: P4Progress) -> Dictionary:
+	if _shutting_down:
+		return {"exit_code": -1, "output": [""], "cancelled": false}
+	var flags := PackedStringArray(["-Ztrack"])
+	if _p4_version >= P4_PROGRESS_MIN_VERSION:
+		flags.append("--progress=debug")
+	var plain := _escape_path_args(args)
+	if _p4_thread == null:
+		var blocking := _p4_exec_sync(args)
+		blocking["cancelled"] = false
+		return blocking
+	var loud := _should_log_cmd(args)
+	var full := _with_connection_flags(flags + plain, 0)
+	if loud:
+		_log_p4_cmd(full)
+	var req := P4Request.new()
+	req.bin = _p4_cmd()
+	req.args = full
+	req.streamed = true
+	req.lines.connect(func(batch: PackedStringArray) -> void:
+		for line in batch:
+			tracker.feed(line)
+		_progress_last_activity_msec = Time.get_ticks_msec()
+		# Self-tests only: press Cancel the moment the transfer is under way.
+		if _selftest_cancel_on_progress and tracker.reporting:
+			_selftest_cancel_on_progress = false
+			_cancel_streamed())
+	_streamed_req = req
+	_p4_inflight += 1
+	_p4_queue_mutex.lock()
+	_p4_queue.push_back(req)
+	_p4_queue_mutex.unlock()
+	_p4_queue_semaphore.post()
+	if not req.completed:
+		await req.done
+	_p4_inflight -= 1
+	if _streamed_req == req:
+		_streamed_req = null
+	var result := {"exit_code": req.exit_code, "output": req.output, "cancelled": req.killed}
+	_finish_p4_log(full, result, loud)
+	if not req.killed:
+		_note_connectivity(result)
+		_maybe_offer_login(result)
+	return result
+
+
+## Stop the transfer _p4_exec_streamed is running. p4 is killed, so whatever
+## it was doing is left half-done: the caller decides what that means (see
+## _submit_verdict and _cleanup_cancelled_sync).
+func _cancel_streamed() -> void:
+	if _streamed_req != null:
+		_streamed_req.cancel = true
+
+
 ## Log a p4 invocation's command line (truncated if enormous, e.g. a `where`
 ## over the whole opened set).
 func _log_p4_cmd(args: PackedStringArray) -> void:
@@ -6032,12 +6824,117 @@ func _p4_worker_loop() -> void:
 		var req: P4Request = _p4_queue.pop_front()
 		_p4_queue_mutex.unlock()
 		var output := []
-		if req.stdin_path.is_empty():
+		if req.streamed:
+			_p4_run_streamed(req, output)
+		elif req.stdin_path.is_empty():
 			req.exit_code = OS.execute(req.bin, _os_args(req.args), output, true)
 		else:
 			req.exit_code = _p4_execute_with_stdin(req.bin, req.args, req.stdin_path, output)
 		req.output = output
 		req.call_deferred("_finish")
+
+
+## Runs on the worker thread: p4 with its output read through pipes while it
+## works, instead of collected at the end. Static - it touches only OS and the
+## request - so it is thread-safe.
+##
+## Progress lines ("progress (...") and the server's tracking lines ("--- ...")
+## are handed to the main thread as they arrive and kept OUT of the result.
+## Everything else is collected into one text blob, the same shape OS.execute
+## returns, so the callers' parsers don't need to know which way p4 was run.
+##
+## Arguments go to the process as they are. Godot starts it with CreateProcess
+## on Windows and fork/execvp elsewhere - no shell - so the escaping _os_args
+## does for OS.execute would corrupt them here.
+static func _p4_run_streamed(req: P4Request, output: Array) -> void:
+	var started: Dictionary = OS.execute_with_pipe(req.bin, req.args, false)
+	if started.is_empty():
+		req.exit_code = 127
+		output.append("Couldn't start '%s'.\n" % req.bin)
+		return
+	var pipes: Array = [started["stdio"], started["stderr"]]
+	var pid: int = started["pid"]
+	var pending: Array = [PackedByteArray(), PackedByteArray()]
+	# stdout and stderr are kept apart and joined at the end, stdout first. p4
+	# writes its records to stdout and its messages (and progress) to stderr;
+	# read through two pipes their true order is lost, and a message dropped
+	# into the middle of a tagged record would corrupt it.
+	var kept: Array = [[], []]
+	var idle_polls := 0
+	while true:
+		# Sample "still running" BEFORE reading, so output written just before
+		# p4 exits is still collected on this pass.
+		var running := OS.is_process_running(pid)
+		var batch := PackedStringArray()
+		var got_data := false
+		for i in 2:
+			var pipe: FileAccess = pipes[i]
+			var chunk: PackedByteArray = pipe.get_buffer(65536)
+			if chunk.is_empty():
+				continue
+			got_data = true
+			var buf: PackedByteArray = pending[i]
+			buf.append_array(chunk)
+			# Whole lines only: a chunk can end mid-line, or mid-character.
+			var start := 0
+			while true:
+				var nl := buf.find(10, start)
+				if nl == -1:
+					break
+				var line := _decode_p4_bytes(buf.slice(start, nl)).rstrip("\r")
+				start = nl + 1
+				if line.begins_with("progress (") or line.begins_with("--- "):
+					batch.append(line)
+				else:
+					kept[i].append(line)
+			pending[i] = buf.slice(start)
+		if not batch.is_empty():
+			req.call_deferred("_emit_lines", batch)
+		if req.detach:
+			# The editor is closing. Leave p4 running: a submit or download
+			# that finishes by itself beats one cut off half-way.
+			req.exit_code = -1
+			break
+		# Only a p4 that is still running can be cancelled. One that finished
+		# in the same instant completed, and must be reported as completed.
+		if req.cancel and not req.killed and running:
+			req.killed = true
+			OS.kill(pid)
+		if not running and not got_data:
+			# One more empty pass after exit, in case the pipe was still
+			# filling when the first one looked.
+			idle_polls += 1
+			if idle_polls >= 2:
+				break
+			OS.delay_msec(10)
+		elif not got_data:
+			OS.delay_msec(30)
+		else:
+			idle_polls = 0
+	var joined := PackedStringArray()
+	for i in 2:
+		var rest: PackedByteArray = pending[i]
+		if not rest.is_empty():
+			kept[i].append(_decode_p4_bytes(rest).rstrip("\r"))
+		for line in kept[i]:
+			joined.append(String(line))
+	if not req.detach:
+		req.exit_code = OS.get_process_exit_code(pid)
+	output.append("\n".join(joined) + ("\n" if not joined.is_empty() else ""))
+
+
+## p4's output bytes as text, decoded the way OS.execute decodes them, so a
+## file name reads the same whichever way p4 was run. On Windows that is the
+## system's ANSI code page first, UTF-8 if that fails (Godot's own order, in
+## os_windows.cpp); elsewhere UTF-8.
+static func _decode_p4_bytes(bytes: PackedByteArray) -> String:
+	if bytes.is_empty():
+		return ""
+	if OS.get_name() == "Windows":
+		var text := bytes.get_string_from_multibyte_char()
+		if not text.is_empty():
+			return text
+	return bytes.get_string_from_utf8()
 
 
 # ---------------------------------------------------------------------------
@@ -7287,7 +8184,16 @@ func _run_cli_self_test_if_requested() -> void:
 					"//d/proj/notes.md#1 - can't overwrite existing file C:\\ws\\proj\\notes.md\n"]})
 			var ereport := _get_latest_report(_summarize_sync([]), enotes, no_reload, [], 0)
 			_log("[selftest] existing-file report: %s" % ereport.replace("\n", " | "))
-			var existing_ok: bool = enotes.existing.size() == 1 and enotes.problems.is_empty() \
+			# A success p4 reports in words in the middle of tagged output must not
+			# be listed under "Perforce also said" (seen after a cancelled sync).
+			var wordy := _sync_notes({"exit_code": 0, "output": [
+					"... depotFile //d/proj/a.png\n... clientFile C:\\ws\\proj\\a.png\n... rev 2\n" \
+					+ "... action added\n... fileSize 9\n\n" \
+					+ "//d/proj/a.png.import#1 - added as C:\\ws\\proj\\a.png.import\n" \
+					+ "//d/proj/odd.txt#1 - some message nobody anticipated\n"]})
+			var existing_ok: bool = wordy.problems.size() == 1 \
+					and String(wordy.problems[0]).contains("nobody anticipated") \
+					and enotes.existing.size() == 1 and enotes.problems.is_empty() \
 					and enotes.modified.is_empty() \
 					and ereport.contains("C:\\ws\\proj\\notes.md") \
 					and ereport.contains("Move or rename") and not ereport.contains("Reconcile")
@@ -8034,6 +8940,184 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] FAIL: submit-verdict - the outcome text claims more than was checked")
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-progress":
+			# Server-independent: the progress tracker against lines copied from a
+			# 2025.2 client and server (2026-10-02), and the cleanup after a
+			# cancelled sync against real files in a scratch folder.
+			#
+			# (a) A parallel submit: kilobyte units, two files interleaved, one of
+			# them reporting "done" with no "update" before it.
+			var t := P4Progress.new()
+			t.total_files = 2
+			t.total_bytes = 3000000
+			t.sizes = {"c:/ws/a.bin": 1500000, "c:/ws/b.bin": 1500000}
+			var answer_line := not t.feed("Change 3171 submitted.")
+			t.feed("progress (total): C:\\ws\\a.bin (type 1 units 3) - 0 of 1464")
+			t.feed("progress (total): C:\\ws\\b.bin (type 1 units 3) - 0 of 1464")
+			t.feed("progress (update): C:\\ws\\b.bin (type 1 units 3) - 732 of 1464")
+			var half_b := t.bytes_done()
+			var mid_text := _progress_detail_text(t, 83.0)
+			t.feed("progress (done): C:\\ws\\a.bin (type 1 units 3) - 1464 of 1464")
+			var after_a := t.files_done
+			# A repeated "done" must not count twice.
+			t.feed("progress (done): C:\\ws\\a.bin (type 1 units 3) - 1464 of 1464")
+			_log("[selftest] kb: half-b=%d bytes, files after a=%d (repeat: %d), fraction=%.3f, text=%s"
+					% [half_b, after_a, t.files_done, t.fraction(), mid_text])
+			var kb_ok: bool = answer_line and half_b == 750000 and after_a == 1 \
+					and t.files_done == 1 and absf(t.fraction() - 0.75) < 0.001 \
+					and t.is_done("C:/ws/a.bin") and not t.is_done("C:\\ws\\b.bin") \
+					and mid_text == "0 of 2 files  -  732 KB of 2.9 MB  -  1:23"
+
+			# (b) Delta Transfer on submit: units 5 ("deltas"), "17 of 22". The
+			# position is a fraction of the file, the size is what we knew.
+			var d := P4Progress.new()
+			d.total_files = 1
+			d.total_bytes = 24000000
+			d.sizes = {"c:/ws/big.bin": 24000000}
+			d.feed("progress (total): C:\\ws\\big.bin (type 1 units 5) - 0 of 22")
+			d.feed("progress (update): C:\\ws\\big.bin (type 1 units 5) - 11 of 22")
+			var delta_half := d.bytes_done()
+			d.feed("--- rpc msgs/size in+out 2+2/0mb+0mb himarks 318788/64836 snd/rcv .000s/.011s")
+			d.feed("--- rpc msgs/size in+out 28+9/6mb+0mb himarks 318788/64836 snd/rcv .000s/.899s")
+			d.feed("---   locks read/write 0/1 rows get+pos+scan put+del 0+0+0 1+0")
+			d.feed("progress (done): C:\\ws\\big.bin (type 1 units 5) - 22 of 22")
+			var delta_summary := _transfer_summary(d)
+			_log("[selftest] delta: half=%d, delta files=%d, network=%d MB, summary=%s"
+					% [delta_half, d.delta_files, d.network_mb, delta_summary])
+			var delta_ok: bool = delta_half == 12000000 and d.delta_files == 1 \
+					and d.network_mb == 6 and d.files_done == 1 \
+					and delta_summary.contains("About 6 MB crossed the network") \
+					and delta_summary.contains("Delta Transfer")
+
+			# (c) A Delta Transfer SYNC reports nothing for the file. Without
+			# finish() the bar would stop short of the end for good.
+			var s := P4Progress.new()
+			s.total_files = 2
+			s.total_bytes = 25000000
+			s.feed("progress (total): C:\\ws\\small.gd (type 2 units 3) - 0 of 976")
+			s.feed("progress (done): C:\\ws\\small.gd (type 2 units 3) - 976 of 976")
+			var before_finish := s.fraction()
+			var idle_text := _progress_detail_text(P4Progress.new(), 7.0)
+			s.finish()
+			# A parallel transfer's tracking line reads 0 MB: say nothing about
+			# the network instead of "0 MB crossed".
+			s.feed("--- rpc msgs/size in+out 3+811/0mb+0mb himarks 318788/64836 snd/rcv .022s/7.68s")
+			var quiet_summary := _transfer_summary(s)
+			# Paths with spaces and brackets, and a line that isn't a transfer
+			# (type 4, a computation), must not confuse the count.
+			var odd := P4Progress.new()
+			odd.feed("progress (total): C:\\my ws\\art (final)\\a b.png (type 2 units 3) - 0 of 10")
+			odd.feed("progress (done): C:\\my ws\\art (final)\\a b.png (type 2 units 3) - 10 of 10")
+			odd.feed("progress (update): digest (type 4 units 6) - 3 of 9")
+			_log("[selftest] silent sync: %.3f before finish, %.3f after, %d files; idle text=%s; summary=%s; odd path done=%s files=%d"
+					% [before_finish, s.fraction(), s.files_done, idle_text, quiet_summary,
+					odd.is_done("C:/my ws/art (final)/a b.png"), odd.expected_files()])
+			var finish_ok: bool = before_finish < 0.1 and s.fraction() == 1.0 and s.files_done == 2 \
+					and idle_text == "Working...  -  0:07" \
+					and not quiet_summary.contains("crossed the network") \
+					and odd.is_done("C:/my ws/art (final)/a b.png") and odd.expected_files() == 1
+
+			# (d) Small pure pieces.
+			var misc_ok: bool = _duration_text(3725.0) == "1:02:05" and _duration_text(7.9) == "0:07" \
+					and absf(_p4_version_in("Rev. P4/NTX64/2025.2/2907753 (2026/03/09).") - 2025.2) < 0.001 \
+					and _p4_version_in("Rev. P4/LINUX26X86_64/2020.2/2075706 (2021/01/12).") < P4_PROGRESS_MIN_VERSION \
+					and _p4_version_in("nonsense") == 0.0 \
+					and _submit_outcome_text("not_submitted", "12", "", "", true, true).contains("Submit cancelled") \
+					and _submit_outcome_text("submitted", "12", "14", "", true, true).contains("Too late to cancel") \
+					and _submit_outcome_text("submitted", "12", "14", "", true, true).contains("change 14")
+
+			# (e) Cleanup after a cancelled sync. Four files the preview said
+			# would be added: one p4 reported done (keep), one that was already
+			# on disk before the sync (keep - it is the user's), one left empty
+			# by the kill (remove), one that never appeared (nothing to do). Plus
+			# a p4 temp file (remove) and a stranger's .tmp (keep).
+			var scratch := _p4godot_cache_dir().path_join("selftest_cancel_%d" % Time.get_ticks_usec())
+			DirAccess.make_dir_recursive_absolute(scratch)
+			var paths := {}
+			# And "recorded.bin": p4 never reported it done (an old p4 reports
+			# nothing), but the server says it was delivered - it must stay.
+			for n in ["done.bin", "mine.txt", "partial.bin", "never.bin", "t123t456t7.tmp", "notes.tmp", "kept.gd", "recorded.bin"]:
+				paths[n] = scratch.path_join(n)
+			for n in ["done.bin", "mine.txt", "partial.bin", "t123t456t7.tmp", "notes.tmp", "kept.gd", "recorded.bin"]:
+				var wf := FileAccess.open(paths[n], FileAccess.WRITE)
+				wf.store_string("" if n == "partial.bin" else "content")
+				wf.close()
+			_set_file_writable(paths["done.bin"], false)
+			var ct := P4Progress.new()
+			ct.feed("progress (total): %s (type 2 units 3) - 0 of 1" % paths["done.bin"])
+			ct.feed("progress (done): %s (type 2 units 3) - 1 of 1" % paths["done.bin"])
+			var fake_found := {"locals": [paths["done.bin"], paths["mine.txt"], paths["partial.bin"],
+					paths["never.bin"], paths["kept.gd"]],
+					"added_locals": [paths["done.bin"], paths["mine.txt"], paths["partial.bin"],
+					paths["never.bin"], paths["recorded.bin"]]}
+			# First with no server to ask (this test has none): nothing at all
+			# may be deleted on the tracker's word alone.
+			var blind_count: int = await _cleanup_cancelled_sync(fake_found,
+					{_path_key(paths["mine.txt"]): true}, ct,
+					int(Time.get_unix_time_from_system()) + 3600)
+			var blind_kept: bool = blind_count == 0 and FileAccess.file_exists(paths["partial.bin"])
+			# Then with the server's answer supplied.
+			var removed_count: int = await _cleanup_cancelled_sync(fake_found,
+					{_path_key(paths["mine.txt"]): true}, ct,
+					int(Time.get_unix_time_from_system()) - 5,
+					{_path_key(paths["recorded.bin"]): true})
+			var left := {}
+			for n in paths:
+				left[n] = FileAccess.file_exists(paths[n])
+			_log("[selftest] cleanup with no answer removed %d; with one removed %d; left on disk: %s"
+					% [blind_count, removed_count, left])
+			var cleanup_ok: bool = blind_kept and removed_count == 1 and left["done.bin"] \
+					and left["mine.txt"] and left["recorded.bin"] \
+					and not left["partial.bin"] and not left["t123t456t7.tmp"] \
+					and left["notes.tmp"] and left["kept.gd"]
+			for n in paths:
+				_set_file_writable(paths[n], true)
+				DirAccess.remove_absolute(paths[n])
+			DirAccess.remove_absolute(scratch)
+
+			if kb_ok and delta_ok and finish_ok and misc_ok and cleanup_ok:
+				_log("[selftest] PASS: progress")
+			elif not kb_ok:
+				_log("[selftest] FAIL: progress - wrong totals from kilobyte progress lines")
+			elif not delta_ok:
+				_log("[selftest] FAIL: progress - Delta Transfer lines or the network total misread")
+			elif not finish_ok:
+				_log("[selftest] FAIL: progress - a file p4 never reported left the bar short, or an odd line broke the count")
+			elif not misc_ok:
+				_log("[selftest] FAIL: progress - duration, version or cancel text")
+			else:
+				_log("[selftest] FAIL: progress - cleanup after a cancelled sync removed the wrong files")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-streamed-exec":
+			# Needs a local p4 binary, no server. Runs p4 through the piped,
+			# streamed path: output must come back in the same shape OS.execute
+			# gives, and a command stuck connecting to an address that never
+			# answers must be stopped by Cancel in about a second, not after the
+			# operating system's connect timeout.
+			var st := P4Progress.new()
+			var ver: Dictionary = await _p4_exec_streamed(["-V"], st)
+			var ver_text := "" if ver.output.is_empty() else String(ver.output[0])
+			_log("[selftest] streamed -V: exit=%d cancelled=%s, %d chars, version parsed=%.1f"
+					% [ver.exit_code, ver.cancelled, ver_text.length(), _p4_version_in(ver_text)])
+			var ver_ok: bool = int(ver.exit_code) == 0 and not ver.cancelled \
+					and ver_text.contains("Perforce") and _p4_version_in(ver_text) > 2000.0
+			get_tree().create_timer(0.6).timeout.connect(_cancel_streamed)
+			var began := Time.get_ticks_msec()
+			var stuck: Dictionary = await _p4_exec_streamed(["-p", "10.255.255.1:1666", "info"], st)
+			var took := Time.get_ticks_msec() - began
+			_log("[selftest] cancelled a stuck connect after %d ms: exit=%d cancelled=%s breaker tripped=%s"
+					% [took, stuck.exit_code, stuck.cancelled, _server_unreachable()])
+			var cancel_ok: bool = bool(stuck.cancelled) and took < 5000 and int(stuck.exit_code) != 0 \
+					and _streamed_req == null
+			if ver_ok and cancel_ok:
+				_log("[selftest] PASS: streamed-exec")
+			elif not ver_ok:
+				_log("[selftest] FAIL: streamed-exec - a streamed command's output didn't come back intact")
+			else:
+				_log("[selftest] FAIL: streamed-exec - Cancel didn't stop a running p4")
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-connection-dialogs":
 			# Server-independent: run the connection dialogs' code. Nothing here
 			# can see how a dialog looks; it proves the dialogs open, answer and
@@ -8075,6 +9159,109 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] FAIL: connection-dialogs - a dialog reported the wrong button")
 			else:
 				_log("[selftest] FAIL: connection-dialogs - an unedited Connect changed the stored settings")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-submit-cancel":
+			# Live and DESTRUCTIVE: uploads part (or all) of a 24 MB file.
+			# Cancels a submit the moment p4 reports the transfer under way, then
+			# checks that what the user is told matches the server. Either answer
+			# is legitimate - cancelled in time, or too late - but it must be the
+			# TRUE one, and the workspace must be left usable. Needs a clean
+			# workspace.
+			_selftest_auto_answer = "confirm"
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: submit-cancel - files already opened; needs a clean workspace")
+				get_tree().quit()
+				return
+			var c_res := "res://p4godot_cancel_test.bin"
+			var c_g := ProjectSettings.globalize_path(c_res)
+			var cf := FileAccess.open(c_g, FileAccess.WRITE)
+			var block := PackedByteArray()
+			block.resize(1048576)
+			for mb in 24:
+				for i in range(0, block.size(), 8):
+					block.encode_s64(i, randi() << 32 | randi())
+				cf.store_buffer(block)
+			cf.close()
+			await _p4_exec_logged(["add", "-t", "binary", c_g])
+			_selftest_cancel_on_progress = true
+			var c_began := Time.get_ticks_msec()
+			await _submit_changelist("default", [], "P4Godot selftest: cancelled submit (add)")
+			var c_took := Time.get_ticks_msec() - c_began
+			var c_outcome := _last_submit_outcome
+			var c_head := _parse_ztag(await _p4_exec(["-ztag", "files", c_g]))
+			var in_depot: bool = not c_head.is_empty() \
+					and String(c_head[0].get("action", "")) != "delete"
+			var c_opened := _parse_ztag(await _p4_exec(["-ztag", "opened", c_g]))
+			var still_change := "" if c_opened.is_empty() else String(c_opened[0].get("change", ""))
+			_log("[selftest] cancelled after %d ms: outcome=%s; in depot=%s; still opened in change '%s'"
+					% [c_took, c_outcome, in_depot, still_change])
+			# The claim has to match the server, whichever way it went.
+			var truthful: bool = (c_outcome == "submitted" and in_depot and c_opened.is_empty()) \
+					or (c_outcome == "not_submitted" and not in_depot and not still_change.is_empty())
+			# Clean up, through the same code a user would use next.
+			var c_clean := false
+			if c_outcome == "not_submitted":
+				# The promise was "submit it again from the panel": do exactly that.
+				await _submit_changelist(still_change, [])
+				c_clean = _last_submit_outcome == "submitted"
+			if _last_submit_outcome == "submitted":
+				await _p4_exec_logged(["delete", c_g])
+				await _submit_changelist("default", [], "P4Godot selftest: cleanup of p4godot_cancel_test.bin")
+				c_clean = c_clean or c_outcome == "submitted"
+			var c_left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] resubmit-after-cancel ok=%s, opened-after=%d" % [c_clean, c_left])
+			if truthful and c_clean and c_left == 0:
+				_log("[selftest] PASS: submit-cancel (%s)" % c_outcome)
+			elif not truthful:
+				_log("[selftest] FAIL: submit-cancel - the outcome reported doesn't match the server")
+			else:
+				_log("[selftest] FAIL: submit-cancel - the workspace wasn't usable after the cancel")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-get-latest-cancel":
+			# Live. Stage it outside Godot first: make the project several files
+			# and at least ~20 MB behind (`p4 sync <path>#none` on some of it), so
+			# the download lasts long enough to be stopped part-way.
+			# Cancels Get Latest the moment the transfer is under way, then checks
+			# the two things a killed sync gets wrong on its own: it leaves
+			# half-written files that every later sync refuses to overwrite, and
+			# it says nothing useful. A second Get Latest must then finish the job.
+			_selftest_auto_answer = "confirm"
+			var gl_before := _summarize_sync(_parse_ztag(
+					await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])))
+			_selftest_cancel_on_progress = true
+			var gl_report := await _get_latest_flow()
+			await _selftest_drain_frames()
+			_log("[selftest] report: %s" % gl_report.replace("\n", " | "))
+			var gl_mid: Dictionary = await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])
+			var gl_mid_sum := _summarize_sync(_parse_ztag(gl_mid))
+			var gl_mid_notes := _sync_notes(gl_mid)
+			_log("[selftest] staged %d behind; after cancel %d still behind, %d refused as existing, %d as modified"
+					% [gl_before.names.size(), gl_mid_sum.names.size(), gl_mid_notes.existing.size(),
+					gl_mid_notes.modified.size()])
+			var gl_second := await _get_latest_flow()
+			await _selftest_drain_frames()
+			var gl_after := _summarize_sync(_parse_ztag(
+					await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])))
+			_log("[selftest] second run: %s | still behind afterwards: %d"
+					% [gl_second.replace("\n", " | ").left(160), gl_after.names.size()])
+			var was_cancelled: bool = gl_report.contains("was cancelled")
+			var no_wreckage: bool = gl_mid_notes.existing.is_empty() and gl_mid_notes.modified.is_empty()
+			var recovered: bool = gl_after.names.is_empty() and not gl_second.contains("would not overwrite") \
+					and not gl_second.contains("were not downloaded")
+			if gl_before.names.size() < 2:
+				_log("[selftest] FAIL: get-latest-cancel - stage the project behind head first (see the source comment)")
+			elif not was_cancelled:
+				_log("[selftest] FAIL: get-latest-cancel - the sync finished before Cancel landed; stage a bigger download")
+			elif not gl_mid_sum.names.size() > 0:
+				_log("[selftest] FAIL: get-latest-cancel - nothing was left to download, so Cancel stopped nothing")
+			elif not no_wreckage:
+				_log("[selftest] FAIL: get-latest-cancel - half-written files were left behind")
+			elif not recovered:
+				_log("[selftest] FAIL: get-latest-cancel - a second Get Latest didn't finish the job")
+			else:
+				_log("[selftest] PASS: get-latest-cancel")
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-submit-verdict-live":

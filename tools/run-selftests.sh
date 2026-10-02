@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.." || exit 1
 GODOT="${1:-${GODOT:-godot}}"
 TESTS="parse-ztag sync-report submit-verdict save-guards prewrite unchanged-save exec-quoting
 diff-align dismiss-dialog build-change-spec fs-menu fstat-summary delete-action
-connection-store connection-dialogs breaker"
+connection-store connection-dialogs progress streamed-exec breaker"
 
 if ! "$GODOT" --version >/dev/null 2>&1; then
 	echo "FAIL: can't run Godot at '$GODOT'. Pass its path as the first argument."

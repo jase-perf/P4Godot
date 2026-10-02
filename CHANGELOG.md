@@ -4,6 +4,40 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **Submit and Get Latest show their progress, and can be cancelled.** A
+  window shows how many files and how much data have moved, the file in
+  hand, and the time taken. It isn't modal: the editor stays usable, and
+  closing the window leaves the transfer running.
+  - It works when the server transfers files in parallel, which is where
+    `p4`'s documented progress option goes silent. P4Godot uses the same
+    progress reporting P4V does (`p4 --progress=debug`, in clients from 2021.1
+    on); with an older `p4` the bar shows activity without a percentage.
+  - **No more time limit on a transfer.** `p4` used to be given up on after
+    2 minutes of silence (10 for a submit). A long submit or download now runs
+    as long as it needs. If nothing has been reported for a minute the window
+    says so, says that isn't a failure, and leaves the choice to you.
+  - **Cancel on a submit** stops `p4`, tells the server to stop its side, and
+    then reports what the server says happened: cancelled in time, or too late
+    and already submitted. Stopping takes up to about half a minute, because
+    the server won't end a command in its first ten seconds. Without the
+    second step the server kept the changelist busy for minutes (measured).
+  - **Cancel on Get Latest** stops the download and removes the unfinished
+    files it leaves behind. Left alone, those empty files made every later
+    download refuse them. Files that had finished are kept and reloaded.
+  - Files sent by Delta Transfer (`binary+F`, where only the changed parts
+    travel) report in different units, or not at all on a download; the bar
+    handles both and fills in at the end.
+  - When the server reports it, the Log (for a submit) or the final report
+    (for Get Latest) says how much data crossed the network, and notes when
+    that is well under the size of the files. The server doesn't report it
+    for parallel transfers.
+  - Closing the editor during a transfer leaves `p4` running to finish, where
+    it used to wait for it.
+  - If you close the progress window, a **Transfer running...** button in the
+    P4G toolbar brings it back, since the window holds the only Cancel.
+  - One transfer at a time: starting a submit while a download runs (or the
+    reverse) is refused with an explanation.
+
 - **Get Latest and Sync This File can no longer overwrite an edit Perforce
   doesn't know about.** They ran a plain `p4 sync`, which replaces any
   read-only file without looking at it. A file can be changed and still
@@ -33,8 +67,8 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
     description, because the number is what makes the question askable. After
     a refused submit your files are in that changelist, which the message
     names.
-  - `p4 submit` waits up to 10 minutes for a silent server instead of 2, so a
-    slow server-side check isn't cut off.
+  - `p4 submit` no longer has a time limit, so a slow server-side check
+    isn't cut off (see the progress entry above).
 
 - **You can change the server, user, or workspace after setup.** The gear menu
   has a new **Connection settings...** item, and the workspace picker shows
