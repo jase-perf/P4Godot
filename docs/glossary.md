@@ -15,7 +15,12 @@ most version control doesn't.
 **Depot** — the storage on the server. The master copy of the project that
 everyone shares.
 
-**Workspace** — the link between the depot and a folder on your computer. Its
+**Stream** — one line of work inside a depot: a full copy of the project's
+files that the team shares. Most projects start with a single stream called
+`main`. Bigger teams add more, so that risky work can happen away from
+everyone else.
+
+**Workspace** — the link between a stream and a folder on your computer. Its
 *root* is that folder. Your Godot project has to live inside it.
 
 **`p4`** — a small program you run by typing commands in a terminal. It's how
@@ -89,8 +94,10 @@ server-wide table that picks a filetype for each new file from its name.
 
 ## Configuration
 
-**`.p4ignore`** — a list of files Perforce should never add: caches, build
-output. **P4IGNORE** is the setting that tells `p4` what that file is called.
+**`.p4ignore`** — a file in your project folder listing what Perforce should
+never add: caches, build output. Perforce 2023.2 and later reads it by
+itself. On older versions, **P4IGNORE** is the setting that tells `p4` what
+the file is called.
 
 **`p4 set`** — saves Perforce settings for your user account. A **P4CONFIG**
 file does the same thing for one folder, so different projects can use
