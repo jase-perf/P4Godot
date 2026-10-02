@@ -40,7 +40,17 @@ and run it again.
 
 **Server-independent** tests run anywhere, including a throwaway project:
 `save-guards`, `prewrite`, `unchanged-save`, `exec-quoting`, `parse-ztag`,
-`sync-report`, `diff-align`, `dismiss-dialog`, `breaker`.
+`sync-report`, `diff-align`, `dismiss-dialog`, `breaker`, and a few more.
+One command runs all of them, plus the warnings check below:
+
+```
+tools/run-selftests.sh <path-to-godot>
+```
+
+It unpacks the addon from `git archive HEAD` into a throwaway project, so it
+tests what a release zip would ship — your last commit, not uncommitted
+edits — and it retries the deadlocked runs for you. CI runs the same script
+on every push and pull request (`.github/workflows/ci.yml`).
 
 **Live** tests need a real workspace. Read-only ones — `probe`, `list-opened`,
 `reconcile-report`, `reconcile-preview` — are safe to run against a workspace
@@ -85,3 +95,15 @@ because no headless test can see a dialog's layout or a tooltip.
   test fails**. A test that passes either way is worse than no test: it looks
   like evidence. Several tests here were rewritten after that check showed
   they proved nothing.
+
+## Releasing
+
+1. Set `version` in `addons/p4godot/plugin.cfg` and add a `## <version>`
+   section to `CHANGELOG.md`.
+2. Run `tools/sync-addon-readme.sh` if the README changed, and commit.
+3. Tag the commit `v<version>` and push the tag.
+
+CI does the rest: it runs the self-tests, refuses a tag that doesn't match
+`plugin.cfg`, builds `p4godot-v<version>.zip` with `git archive`, and
+publishes a GitHub release with that zip and the changelog section as its
+notes. The README's install step points at that zip.
