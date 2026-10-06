@@ -216,6 +216,14 @@ class P4Progress extends RefCounted:
 		var f: Dictionary = _files.get(key_of(path), {})
 		return not f.is_empty() and bool(f.done)
 
+	## How many files p4 has started on and not reported done.
+	func in_flight() -> int:
+		var n := 0
+		for f: Dictionary in _files.values():
+			if not bool(f.done):
+				n += 1
+		return n
+
 	## The command ended successfully: everything expected has arrived,
 	## including files p4 never reported on.
 	func finish() -> void:
@@ -5624,7 +5632,6 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			return
 
 	var tracker := _submit_tracker(files)
-	var submit_started_msec := Time.get_ticks_msec()
 	_progress_begin("Submitting to Perforce", "Submitting changelist %s" % number, tracker)
 	var result: Dictionary = await _p4_exec_streamed(["submit", "-c", number], tracker)
 	var cancelled: bool = bool(result.get("cancelled", false))
@@ -5639,11 +5646,19 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 		var lost: bool = cancelled or _submit_connection_lost(result)
 		if lost:
 			_log("The submit didn't end with a clear answer - asking the server what became of it...")
-			_progress_note(("Cancelled here. Asking the server to stop its side and checking " +
-					"what became of the submit - this can take up to a minute...") \
-					if cancelled else "Asking the server what became of the submit...")
+			_progress_note("Asking the server what became of the submit...")
+		# A file that was part-way up when p4 stopped never fully arrived, so
+		# the server cannot go on to commit this changelist: if it reads as
+		# pending, it was not submitted, and that can be said within seconds.
+		# Measured as an ordinary user on a 2025.2 server: after a cancel the
+		# server went on listing its `submit` as running for minutes, yet the
+		# same changelist resubmitted in seconds - the entry holds nothing.
+		# Waiting on it only turned a known answer into "unknown".
+		# With no file in flight (stopped between files, or the connection
+		# lost after the last one) the server may have everything, so it is
+		# asked repeatedly, as for any lost connection.
 		var verdict: Dictionary = await _submit_verdict(number, lost,
-				submit_started_msec if cancelled else -1)
+				lost and tracker.in_flight() > 0)
 		outcome = String(verdict.outcome)
 		final = String(verdict.change)
 		_progress_end()
@@ -5675,96 +5690,6 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 		_log("Submit of changelist %s: %s." % [number,
 				"not submitted" if outcome == "not_submitted" else "outcome unknown"])
 	_request_refresh()
-
-
-## After Cancel killed our p4, tell the server to stop its side of the submit.
-##
-## Killing the client isn't enough. Measured on a 2025.2 server: with a
-## parallel submit stopped mid-upload, the server's `submit` command was still
-## listed as running two minutes later, holding the changelist, so the outcome
-## could only be reported as unknown. `p4 monitor terminate <id>` ended it in
-## about four seconds and left the changelist pending. A user may terminate
-## their own commands (`p4 help monitor`).
-##
-## Only a command still called `submit` is touched - the upload phase. Once the
-## server has the files it runs the commit under another name, and that is left
-## to finish: _submit_verdict then reports it as submitted.
-##
-## Returns 1 once the server has accepted the request or there is nothing of
-## ours left to stop; 0 to be asked again (the server refuses to terminate a
-## command younger than ten seconds - "can't terminate, runtime < 10 seconds" -
-## so a quick Cancel has to wait and retry); -1 when it can't be done here, and
-## the caller should stop expecting it.
-##
-## Nothing here needs more than an ordinary user's access. The listing is the
-## plain `p4 monitor show`, which gives each command's id, status, user,
-## elapsed time and name. (The flags that add the workspace and arguments, -a
-## -l -e, are for operators and super users only, so they are not used: the
-## plugin must behave the same for everyone.)
-##
-## Which command is ours, then, has to be worked out from the user, the name
-## `submit` and the elapsed time. One `submit` by this user: that is it. More
-## than one - a second editor, or P4V submitting alongside - and it is the one
-## whose elapsed time matches how long ago ours started, if exactly one does.
-## Otherwise nothing is terminated: stopping the wrong submit is worse than
-## reporting this one's outcome as unknown.
-func _terminate_own_submit(started_msec: int) -> int:
-	var listing: Dictionary = await _p4_exec(["-ztag", "monitor", "show"], false)
-	var records := _parse_ztag(listing) if int(listing.get("exit_code", -1)) == 0 else []
-	if records.is_empty():
-		return -1 # monitoring is off on this server, or we may not look
-	var mine: Array = []
-	for rec in records:
-		if String(rec.get("command", "")) == "submit" and String(rec.get("user", "")) == _p4_user:
-			mine.append(rec)
-	if mine.is_empty():
-		return 1
-	var chosen := _pick_own_submit(mine, (Time.get_ticks_msec() - started_msec) / 1000.0)
-	if chosen.is_empty():
-		_log("More than one of your submits is running on the server, and P4Godot can't tell which one to stop.")
-		return -1
-	var id := String(chosen.get("id", ""))
-	if not id.is_valid_int():
-		return -1
-	if String(chosen.get("status", "")) == "T":
-		return 1 # already marked
-	var asked: Dictionary = await _p4_exec(["monitor", "terminate", id], false)
-	var answer := "" if asked.output.is_empty() else String(asked.output[0])
-	if answer.contains("marked for termination"):
-		_log("Told the server to stop the cancelled submit (process %s)." % id)
-		return 1
-	return 0 if answer.contains("can't terminate") else -1
-
-
-## How far a listed command's elapsed time may sit from our own count of how
-## long the submit has run and still be taken as the same command. The two
-## clocks start a connection apart, and the listing is a moment old.
-const OWN_SUBMIT_TIME_SLACK_SEC := 6.0
-
-
-## Of this user's running `submit` records (from `p4 -ztag monitor show`),
-## the one that is ours, or {} if that can't be told. Pure, so a self-test
-## can pin it. `running_sec` is how long ago our submit was started.
-static func _pick_own_submit(mine: Array, running_sec: float) -> Dictionary:
-	if mine.size() == 1:
-		return mine[0]
-	var matches: Array = []
-	for rec in mine:
-		if absf(_monitor_time_sec(String(rec.get("time", ""))) - running_sec) \
-				<= OWN_SUBMIT_TIME_SLACK_SEC:
-			matches.append(rec)
-	return matches[0] if matches.size() == 1 else {}
-
-
-## `monitor show`'s elapsed time, "HH:MM:SS", in seconds; -1 if unreadable.
-static func _monitor_time_sec(text: String) -> float:
-	var parts := text.strip_edges().split(":")
-	if parts.size() != 3:
-		return -1.0
-	for p in parts:
-		if not String(p).is_valid_int():
-			return -1.0
-	return float(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
 
 
 ## What a submit of `files` (entries from _submit_file_list) will transfer:
@@ -5868,7 +5793,7 @@ func _describe_status(result: Dictionary) -> Dictionary:
 ## 1 yes, 0 no, -1 can't tell (monitoring is off, or we aren't allowed to look).
 ## A working answer always lists at least our own `monitor` command, so an
 ## answer with no records at all is "can't tell", never "no".
-func _monitor_submit_running(result: Dictionary, user: String) -> int:
+func _monitor_submit_running(result: Dictionary, user: String, commit_only: bool = false) -> int:
 	if int(result.get("exit_code", 0)) != 0:
 		return -1
 	var records := _parse_ztag(result)
@@ -5880,7 +5805,7 @@ func _monitor_submit_running(result: Dictionary, user: String) -> int:
 	# turns a submit in progress into "not submitted".
 	for rec in records:
 		if String(rec.get("user", "")) == user \
-				and String(rec.get("command", "")).to_lower().contains("submit"):
+				and String(rec.get("command", "")).to_lower().contains("commit" if commit_only else "submit"):
 			return 1
 	return 0
 
@@ -5906,40 +5831,35 @@ const SUBMIT_VERDICT_POLL_SEC := 2.0
 ## number of tries because one try against an unreachable server already costs
 ## the operating system's connect timeout.
 ##
-## `stop_started_msec` (when the submit was started, or -1) is for a submit the
-## user cancelled: the server's side of it is told to stop (see
-## _terminate_own_submit), and asked again on each pass until
-## it agrees, so "still running" turns into "not submitted" in seconds rather
-## than staying unknown.
-func _submit_verdict(number: String, connection_lost: bool, stop_started_msec: int = -1) -> Dictionary:
-	var stop_ours := stop_started_msec >= 0
-	# A cancelled submit gets twice the window: the server won't take the stop
-	# request for the first ten seconds of the command, and then needs a few
-	# more to act on it (about 30 s in all when measured).
-	var deadline := Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC * (2 if stop_ours else 1)
+##
+## Everything asked here is open to an ordinary user: `describe` and the plain
+## `monitor show`. Nothing is terminated on the server. (An earlier version
+## did, with `p4 monitor terminate`; an ordinary account is refused that even
+## for its own command, and it turned out not to be needed - see the caller.)
+##
+## `upload_cut` says p4 stopped with a file part-way up (the caller knows from
+## the progress lines). The server then can't have the whole changelist, and a
+## lingering `submit` in its process list means nothing. The one way that
+## could be wrong is a file that finished in the instant before p4 stopped,
+## with its "done" line unprinted - and then the server moves on to the commit
+## within moments. So: look twice, a poll apart, and call it not submitted
+## unless the changelist has gone or a commit is running.
+func _submit_verdict(number: String, connection_lost: bool, upload_cut: bool = false) -> Dictionary:
+	var deadline := Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC
 	var attempt := 0
-	var stopping := false
 	while not _shutting_down:
 		if attempt > 0:
 			if not connection_lost or Time.get_ticks_msec() >= deadline:
 				break
 			await get_tree().create_timer(SUBMIT_VERDICT_POLL_SEC).timeout
 		attempt += 1
-		if stop_ours and not stopping:
-			var asked: int = await _terminate_own_submit(stop_started_msec)
-			stopping = asked == 1
-			if asked == -1:
-				# Can't stop it from here. Don't keep the user waiting twice as
-				# long for something that isn't going to happen.
-				stop_ours = false
-				deadline = mini(deadline, Time.get_ticks_msec() + SUBMIT_VERDICT_WINDOW_MSEC)
 		# Ask what is running BEFORE asking for the status. In the other order a
 		# submit that finishes between the two questions reads as "pending,
 		# nothing running" - not submitted - when it just was.
 		var running := -1
 		if connection_lost:
 			running = _monitor_submit_running(
-					await _p4_exec(["-ztag", "monitor", "show"], false), _p4_user)
+					await _p4_exec(["-ztag", "monitor", "show"], false), _p4_user, upload_cut)
 		var seen := _describe_status(await _p4_exec(["-ztag", "describe", "-s", number], false))
 		if seen.status == "missing":
 			# Gone under its own number: either renumbered on submit, which
@@ -5950,7 +5870,15 @@ func _submit_verdict(number: String, connection_lost: bool, stop_started_msec: i
 			"submitted":
 				return {"outcome": "submitted", "change": String(seen.change)}
 			"pending":
-				if not connection_lost or running == 0:
+				if not connection_lost:
+					return {"outcome": "not_submitted", "change": ""}
+				if upload_cut:
+					# `running` here means "a commit is running" only. The
+					# second look is what covers the file that finished just
+					# before p4 stopped.
+					if attempt >= 2 and running != 1:
+						return {"outcome": "not_submitted", "change": ""}
+				elif running == 0:
 					return {"outcome": "not_submitted", "change": ""}
 			_:
 				pass # can't reach the server, or it has no such changelist: ask again
@@ -8944,26 +8872,27 @@ func _run_cli_self_test_if_requested() -> void:
 					_monitor_submit_running(mon_other, "jase"), _monitor_submit_running(mon_off, "jase"),
 					_monitor_submit_running(mon_empty, "jase")])
 
-			# Which running submit is ours, from what an ordinary user's
-			# `monitor show` gives: no workspace, no arguments, only the user,
-			# the name and the elapsed time. One submit: that one. Two: only the
-			# one whose elapsed time matches ours - and if both match, neither,
-			# because stopping someone's other submit is worse than not knowing.
-			var one := [{"id": "7", "time": "00:00:41", "command": "submit", "user": "jase"}]
-			var two := [{"id": "7", "time": "00:00:12", "command": "submit", "user": "jase"},
-					{"id": "9", "time": "00:05:30", "command": "submit", "user": "jase"}]
-			var twins := [{"id": "7", "time": "00:00:12", "command": "submit", "user": "jase"},
-					{"id": "9", "time": "00:00:14", "command": "submit", "user": "jase"}]
-			var own_ok: bool = _pick_own_submit(one, 3.0).get("id", "") == "7" \
-					and _pick_own_submit(two, 13.5).get("id", "") == "7" \
-					and _pick_own_submit(two, 331.0).get("id", "") == "9" \
-					and _pick_own_submit(two, 90.0).is_empty() \
-					and _pick_own_submit(twins, 13.0).is_empty() \
-					and _monitor_time_sec("01:02:05") == 3725.0 and _monitor_time_sec("soon") == -1.0
-			_log("[selftest] own submit: one=%s two@13s=%s two@90s=%s twins=%s"
-					% [_pick_own_submit(one, 3.0).get("id", "-"), _pick_own_submit(two, 13.5).get("id", "-"),
-					_pick_own_submit(two, 90.0).get("id", "-"), _pick_own_submit(twins, 13.0).get("id", "-")])
-			monitor_ok = monitor_ok and own_ok
+			# A submit stopped while a file was part-way up cannot be finished by
+			# the server, whatever its process list goes on showing. That is what
+			# lets a cancel be reported at once, with no special access. Stopped
+			# BETWEEN files it proves nothing: the server may hold everything.
+			var cut := P4Progress.new()
+			cut.feed("progress (total): C:\\ws\\a.bin (type 1 units 3) - 0 of 100")
+			cut.feed("progress (done): C:\\ws\\a.bin (type 1 units 3) - 100 of 100")
+			var between_files := cut.in_flight()
+			cut.feed("progress (total): C:\\ws\\b.bin (type 1 units 3) - 0 of 100")
+			cut.feed("progress (update): C:\\ws\\b.bin (type 1 units 3) - 40 of 100")
+			var mid_file := cut.in_flight()
+			_log("[selftest] in flight: between files=%d, mid-file=%d, nothing reported=%d"
+					% [between_files, mid_file, P4Progress.new().in_flight()])
+			# After a cut upload only a COMMIT counts as the server still working;
+			# its leftover `submit` entry does not.
+			var committing := {"exit_code": 0, "output": [
+					"... id 7\n... status R\n... user jase\n... time 00:00:09\n... command dm-CommitSubmit\n\n"]}
+			monitor_ok = monitor_ok and between_files == 0 and mid_file == 1 \
+					and P4Progress.new().in_flight() == 0 \
+					and _monitor_submit_running(mon_busy, "jase", true) == 0 \
+					and _monitor_submit_running(committing, "jase", true) == 1
 
 			# What the user reads. Only a checked "not submitted" may say
 			# nothing was sent; "unknown" must not, and must say not to resubmit.

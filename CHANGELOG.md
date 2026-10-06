@@ -16,11 +16,10 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
     2 minutes of silence (10 for a submit). A long submit or download now runs
     as long as it needs. If nothing has been reported for a minute the window
     says so, says that isn't a failure, and leaves the choice to you.
-  - **Cancel on a submit** stops `p4`, tells the server to stop its side, and
-    then reports what the server says happened: cancelled in time, or too late
-    and already submitted. Stopping takes up to about half a minute, because
-    the server won't end a command in its first ten seconds. Without the
-    second step the server kept the changelist busy for minutes (measured).
+  - **Cancel on a submit** stops `p4`, then reports what the server says
+    happened: cancelled in time, or too late and already submitted. When a
+    file was part-way up, that takes a few seconds. It needs no special
+    access on the server; all of this was tested as an ordinary user.
   - **Cancel on Get Latest** stops the download and removes the unfinished
     files it leaves behind. Left alone, those empty files made every later
     download refuse them. Files that had finished are kept and reloaded.

@@ -321,8 +321,8 @@ While a submit or **Get Latest** runs, a progress window shows how many files
 and how much data have moved, and how long it has taken. You can keep working,
 or close the window; the transfer carries on. **Cancel** stops it. A cancelled
 download keeps the files that had finished and removes the unfinished ones. A
-cancelled submit is checked with the server, which can take up to a minute,
-and you're told whether it stopped in time.
+cancelled submit is checked with the server, and you're told whether it
+stopped in time.
 
 If a submit doesn't finish cleanly, P4Godot asks the server what happened
 before telling you. A dropped connection can leave a submit that went through
