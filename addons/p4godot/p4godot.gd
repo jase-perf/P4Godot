@@ -5624,6 +5624,7 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			return
 
 	var tracker := _submit_tracker(files)
+	var submit_started_msec := Time.get_ticks_msec()
 	_progress_begin("Submitting to Perforce", "Submitting changelist %s" % number, tracker)
 	var result: Dictionary = await _p4_exec_streamed(["submit", "-c", number], tracker)
 	var cancelled: bool = bool(result.get("cancelled", false))
@@ -5641,7 +5642,8 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			_progress_note(("Cancelled here. Asking the server to stop its side and checking " +
 					"what became of the submit - this can take up to a minute...") \
 					if cancelled else "Asking the server what became of the submit...")
-		var verdict: Dictionary = await _submit_verdict(number, lost, cancelled)
+		var verdict: Dictionary = await _submit_verdict(number, lost,
+				submit_started_msec if cancelled else -1)
 		outcome = String(verdict.outcome)
 		final = String(verdict.change)
 		_progress_end()
@@ -5694,38 +5696,37 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 ## so a quick Cancel has to wait and retry); -1 when it can't be done here, and
 ## the caller should stop expecting it.
 ##
-## Which command is ours: the detailed listing names the workspace and the
-## changelist, but needs operator or super access. Everyone else gets the
-## plain listing - user and command only - and there the command is terminated
-## only if it is the single `submit` this user has running. With two, nothing
-## says which is which, and the other one may be a submit from P4V.
-## (The plain-listing path has not been run as an ordinary user.)
-func _terminate_own_submit(number: String) -> int:
-	var listing: Dictionary = await _p4_exec(["-ztag", "monitor", "show", "-a", "-l", "-e"], false)
+## Nothing here needs more than an ordinary user's access. The listing is the
+## plain `p4 monitor show`, which gives each command's id, status, user,
+## elapsed time and name. (The flags that add the workspace and arguments, -a
+## -l -e, are for operators and super users only, so they are not used: the
+## plugin must behave the same for everyone.)
+##
+## Which command is ours, then, has to be worked out from the user, the name
+## `submit` and the elapsed time. One `submit` by this user: that is it. More
+## than one - a second editor, or P4V submitting alongside - and it is the one
+## whose elapsed time matches how long ago ours started, if exactly one does.
+## Otherwise nothing is terminated: stopping the wrong submit is worse than
+## reporting this one's outcome as unknown.
+func _terminate_own_submit(started_msec: int) -> int:
+	var listing: Dictionary = await _p4_exec(["-ztag", "monitor", "show"], false)
 	var records := _parse_ztag(listing) if int(listing.get("exit_code", -1)) == 0 else []
-	var precise := not records.is_empty()
-	if not precise:
-		listing = await _p4_exec(["-ztag", "monitor", "show"], false)
-		records = _parse_ztag(listing) if int(listing.get("exit_code", -1)) == 0 else []
-		if records.is_empty():
-			return -1 # monitoring is off, or we may not look
+	if records.is_empty():
+		return -1 # monitoring is off on this server, or we may not look
 	var mine: Array = []
 	for rec in records:
-		if String(rec.get("command", "")) != "submit" or String(rec.get("user", "")) != _p4_user:
-			continue
-		if precise and (String(rec.get("client", "")) != _p4_client \
-				or not (" %s " % String(rec.get("args", ""))).contains(" -c %s " % number)):
-			continue
-		mine.append(rec)
+		if String(rec.get("command", "")) == "submit" and String(rec.get("user", "")) == _p4_user:
+			mine.append(rec)
 	if mine.is_empty():
 		return 1
-	if not precise and mine.size() != 1:
-		_log("More than one of your submits is running on the server, so P4Godot can't tell which one to stop.")
+	var chosen := _pick_own_submit(mine, (Time.get_ticks_msec() - started_msec) / 1000.0)
+	if chosen.is_empty():
+		_log("More than one of your submits is running on the server, and P4Godot can't tell which one to stop.")
 		return -1
-	var id := String(mine[0].get("id", ""))
+	var id := String(chosen.get("id", ""))
 	if not id.is_valid_int():
 		return -1
-	if String(mine[0].get("status", "")) == "T":
+	if String(chosen.get("status", "")) == "T":
 		return 1 # already marked
 	var asked: Dictionary = await _p4_exec(["monitor", "terminate", id], false)
 	var answer := "" if asked.output.is_empty() else String(asked.output[0])
@@ -5733,6 +5734,37 @@ func _terminate_own_submit(number: String) -> int:
 		_log("Told the server to stop the cancelled submit (process %s)." % id)
 		return 1
 	return 0 if answer.contains("can't terminate") else -1
+
+
+## How far a listed command's elapsed time may sit from our own count of how
+## long the submit has run and still be taken as the same command. The two
+## clocks start a connection apart, and the listing is a moment old.
+const OWN_SUBMIT_TIME_SLACK_SEC := 6.0
+
+
+## Of this user's running `submit` records (from `p4 -ztag monitor show`),
+## the one that is ours, or {} if that can't be told. Pure, so a self-test
+## can pin it. `running_sec` is how long ago our submit was started.
+static func _pick_own_submit(mine: Array, running_sec: float) -> Dictionary:
+	if mine.size() == 1:
+		return mine[0]
+	var matches: Array = []
+	for rec in mine:
+		if absf(_monitor_time_sec(String(rec.get("time", ""))) - running_sec) \
+				<= OWN_SUBMIT_TIME_SLACK_SEC:
+			matches.append(rec)
+	return matches[0] if matches.size() == 1 else {}
+
+
+## `monitor show`'s elapsed time, "HH:MM:SS", in seconds; -1 if unreadable.
+static func _monitor_time_sec(text: String) -> float:
+	var parts := text.strip_edges().split(":")
+	if parts.size() != 3:
+		return -1.0
+	for p in parts:
+		if not String(p).is_valid_int():
+			return -1.0
+	return float(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
 
 
 ## What a submit of `files` (entries from _submit_file_list) will transfer:
@@ -5874,11 +5906,13 @@ const SUBMIT_VERDICT_POLL_SEC := 2.0
 ## number of tries because one try against an unreachable server already costs
 ## the operating system's connect timeout.
 ##
-## `stop_ours` is for a submit the user cancelled: the server's side of it is
-## told to stop (see _terminate_own_submit), and asked again on each pass until
+## `stop_started_msec` (when the submit was started, or -1) is for a submit the
+## user cancelled: the server's side of it is told to stop (see
+## _terminate_own_submit), and asked again on each pass until
 ## it agrees, so "still running" turns into "not submitted" in seconds rather
 ## than staying unknown.
-func _submit_verdict(number: String, connection_lost: bool, stop_ours: bool = false) -> Dictionary:
+func _submit_verdict(number: String, connection_lost: bool, stop_started_msec: int = -1) -> Dictionary:
+	var stop_ours := stop_started_msec >= 0
 	# A cancelled submit gets twice the window: the server won't take the stop
 	# request for the first ten seconds of the command, and then needs a few
 	# more to act on it (about 30 s in all when measured).
@@ -5892,7 +5926,7 @@ func _submit_verdict(number: String, connection_lost: bool, stop_ours: bool = fa
 			await get_tree().create_timer(SUBMIT_VERDICT_POLL_SEC).timeout
 		attempt += 1
 		if stop_ours and not stopping:
-			var asked: int = await _terminate_own_submit(number)
+			var asked: int = await _terminate_own_submit(stop_started_msec)
 			stopping = asked == 1
 			if asked == -1:
 				# Can't stop it from here. Don't keep the user waiting twice as
@@ -8909,6 +8943,27 @@ func _run_cli_self_test_if_requested() -> void:
 					% [_monitor_submit_running(mon_idle, "jase"), _monitor_submit_running(mon_busy, "jase"),
 					_monitor_submit_running(mon_other, "jase"), _monitor_submit_running(mon_off, "jase"),
 					_monitor_submit_running(mon_empty, "jase")])
+
+			# Which running submit is ours, from what an ordinary user's
+			# `monitor show` gives: no workspace, no arguments, only the user,
+			# the name and the elapsed time. One submit: that one. Two: only the
+			# one whose elapsed time matches ours - and if both match, neither,
+			# because stopping someone's other submit is worse than not knowing.
+			var one := [{"id": "7", "time": "00:00:41", "command": "submit", "user": "jase"}]
+			var two := [{"id": "7", "time": "00:00:12", "command": "submit", "user": "jase"},
+					{"id": "9", "time": "00:05:30", "command": "submit", "user": "jase"}]
+			var twins := [{"id": "7", "time": "00:00:12", "command": "submit", "user": "jase"},
+					{"id": "9", "time": "00:00:14", "command": "submit", "user": "jase"}]
+			var own_ok: bool = _pick_own_submit(one, 3.0).get("id", "") == "7" \
+					and _pick_own_submit(two, 13.5).get("id", "") == "7" \
+					and _pick_own_submit(two, 331.0).get("id", "") == "9" \
+					and _pick_own_submit(two, 90.0).is_empty() \
+					and _pick_own_submit(twins, 13.0).is_empty() \
+					and _monitor_time_sec("01:02:05") == 3725.0 and _monitor_time_sec("soon") == -1.0
+			_log("[selftest] own submit: one=%s two@13s=%s two@90s=%s twins=%s"
+					% [_pick_own_submit(one, 3.0).get("id", "-"), _pick_own_submit(two, 13.5).get("id", "-"),
+					_pick_own_submit(two, 90.0).get("id", "-"), _pick_own_submit(twins, 13.0).get("id", "-")])
+			monitor_ok = monitor_ok and own_ok
 
 			# What the user reads. Only a checked "not submitted" may say
 			# nothing was sent; "unknown" must not, and must say not to resubmit.
