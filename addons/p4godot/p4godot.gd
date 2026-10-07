@@ -4216,11 +4216,31 @@ func _revert_path(res_path: String) -> void:
 	# (move/add). p4 undoes both when asked to revert the new path, and refuses
 	# the old one alone with "has been moved, not reverted" and exit 0. So a
 	# move is always reverted through its new path.
-	var rec := await _fetch_fstat_record(res_path)
+	if not await _ensure_identity():
+		await _show_alert(NOT_CONNECTED_MESSAGE)
+		return
+	var looked: Dictionary = await _p4_exec(["-ztag", "fstat", ProjectSettings.globalize_path(res_path)])
+	var looked_recs := _parse_ztag(looked)
+	var rec: Dictionary = looked_recs[0] if not looked_recs.is_empty() else {}
+	if not rec.has("depotFile") and (int(looked.exit_code) != 0 or _server_unreachable()):
+		# No answer is not "this file isn't in Perforce".
+		await _show_alert(("Godot couldn't ask Perforce about '%s', so nothing was reverted. " +
+				"Press \"Log\" in the P4G panel to see what went wrong.") % res_path)
+		return
 	var action := String(rec.get("action", ""))
 	if action.is_empty():
 		await _revert_unopened(res_path, rec)
 		return
+	# A moved .import / .uid row: undo the move of the file it belongs to,
+	# which takes this one with it. Alone, it would leave the pair split.
+	if action.begins_with("move/"):
+		for suffix: String in [".import", ".uid"]:
+			if res_path.ends_with(suffix):
+				var owner_res := res_path.trim_suffix(suffix)
+				var owner_action := String((await _fetch_fstat_record(owner_res)).get("action", ""))
+				if owner_action == action:
+					await _revert_path(owner_res)
+					return
 	var targets := PackedStringArray([ProjectSettings.globalize_path(res_path)])
 	var old_res := ""
 	var new_res := ""
@@ -4265,6 +4285,14 @@ func _revert_path(res_path: String) -> void:
 				"anything unsaved in the editor - and this can't be undone.") % [old_res, new_res]
 	if not companions.is_empty():
 		question += "\n\nThe same goes for %s, which Godot keeps beside it." % " and ".join(companions)
+	if not old_res.is_empty() and old_res.begins_with("res://") \
+			and FileAccess.file_exists(ProjectSettings.globalize_path(old_res)):
+		# Measured: p4 writes the old file back over whatever is there, without
+		# its usual refusal to overwrite a writable file.
+		await _show_alert(("There is a file at '%s' now, where the moved file used to be. " +
+				"Undoing the move would overwrite it, so nothing was changed. Move or delete " +
+				"that file first, then revert again.") % old_res)
+		return
 	var proceed: bool = await _show_confirm_dialog(question,
 			"Undo Move" if not new_res.is_empty() else "Throw Away My Changes", "Cancel")
 	if not proceed:
@@ -4664,6 +4692,19 @@ func _ignore_file_names(set_output: String, windows: bool) -> PackedStringArray:
 	return names
 
 
+## Whether `p4 -ztag where <path>` says the path is part of this workspace: a
+## record with a depot path and no `unmap` marker. A path left out by the
+## view or the stream, or outside the workspace, has none; neither has a
+## command that failed.
+func _where_maps(result: Dictionary) -> bool:
+	if int(result.get("exit_code", 1)) != 0:
+		return false
+	for rec in _parse_ztag(result):
+		if not String(rec.get("depotFile", "")).is_empty() and not rec.has("unmap"):
+			return true
+	return false
+
+
 ## Once per start: make sure Perforce skips Godot's `.godot` folder, and offer
 ## to add the rule when it doesn't. That folder is thousands of files rebuilt
 ## on every machine, plus the user's own editor state; without a rule,
@@ -4680,11 +4721,22 @@ func _check_godot_cache_ignored(forced: bool = false) -> String:
 	var probe := ProjectSettings.globalize_path("res://.godot/editor/p4godot_ignore_probe")
 	if await _p4_path_ignored(probe):
 		return "ignored"
+	# `p4 ignores` only reads ignore files on this computer. A stream or a
+	# workspace view can leave the folder out too, and then there is nothing
+	# to fix: ask the server whether the path maps to the depot at all.
+	if not _where_maps(await _p4_exec(["-ztag", "where", probe], false)):
+		return "ignored"
 	var set_result: Dictionary = await _p4_exec(["set", "-q", "P4IGNORE"])
 	var names := _ignore_file_names(
 			"" if set_result.output.is_empty() else String(set_result.output[0]),
 			OS.get_name() == "Windows")
+	# The rule goes into an ignore file this project already has, if any.
 	var name := names[0]
+	for candidate in names:
+		if not candidate.contains("/") and not candidate.contains("\\") \
+				and FileAccess.file_exists(ProjectSettings.globalize_path("res://" + candidate)):
+			name = candidate
+			break
 	if name.is_absolute_path() or name.contains("/") or name.contains("\\"):
 		# One shared file somewhere else on this computer; not ours to edit.
 		await _show_alert(("Perforce isn't set to skip Godot's `.godot` folder in this project. " +
@@ -6541,7 +6593,7 @@ func _submit_outcome_text(outcome: String, number: String, final: String, said: 
 ## Depot paths of the opened files in `fstat` records that the server would
 ## refuse in a submit: an older revision than the server's newest, or a
 ## merge still waiting (`unresolved`). A file being added has nothing older to
-## be behind.
+## be behind, and the server takes a plain delete whatever revision it was.
 func _out_of_date_in(records: Array) -> Array:
 	var behind: Array = []
 	for rec in records:
@@ -6551,7 +6603,9 @@ func _out_of_date_in(records: Array) -> Array:
 		if rec.has("unresolved"):
 			behind.append(depot)
 			continue
-		if String(rec.get("action", "")) in ["add", "move/add", "branch", "import"]:
+		# A delete of a file that moved on at the server is accepted as it is
+		# (measured); the old half of a move is not, and stays in the check.
+		if String(rec.get("action", "")) in ["add", "move/add", "branch", "import", "delete"]:
 			continue
 		var head := String(rec.get("headRev", ""))
 		var have := String(rec.get("haveRev", ""))
@@ -8466,6 +8520,16 @@ func _handle_fs_delete(res_path: String, is_folder: bool) -> void:
 				% [res_path, count], "Delete in Perforce", "Not Yet"):
 			_log("Left the deleted folder '%s' tracked in Perforce - run Reconcile to record it." % res_path)
 			return
+		# `reconcile -d` skips files opened for add or move/add (measured), and
+		# those then fail the submit: their content is gone. Settle them first.
+		for folder_rec in _parse_ztag(await _p4_exec(["-ztag", "fstat", scope])):
+			var folder_decision := _delete_action_for(folder_rec)
+			var folder_local := String(folder_rec.get("clientFile", ""))
+			if folder_decision in ["revert", "unmove"] and not folder_local.is_empty() \
+					and not FileAccess.file_exists(folder_local):
+				var folder_res := _local_to_res(folder_local)
+				if not folder_res.is_empty():
+					await _p4_open_for_delete(folder_res, folder_decision, folder_rec)
 		await _p4_exec_logged(["reconcile", "-d", scope])
 		_request_refresh()
 		return
@@ -8534,15 +8598,27 @@ func _handle_fs_move(old_res: String, new_res: String, is_folder: bool) -> void:
 		_log("Move of '%s' not recorded in Perforce - run Reconcile if you want it tracked." % old_res)
 		return
 	var result := await _p4_record_move(old_res, new_res, is_folder)
-	if int(result.moved) == 0:
-		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
-		await _show_alert(("Couldn't record the move of '%s' in Perforce:\n\n%s\n\nThe files are " +
-				"already moved on disk - use Reconcile to record it.") % [old_res, msg])
-	else:
+	var stuck: Array = result.not_moved
+	if int(result.moved) > 0:
 		_forget_path(old_res)
-		if not is_folder:
+		if not is_folder and stuck.is_empty():
 			_checked_out_this_session[new_res] = true
 	_request_refresh()
+	if int(result.moved) == 0 or not stuck.is_empty():
+		var text := ("Perforce didn't record the move of '%s'." % old_res) if int(result.moved) == 0 \
+				else ("Perforce recorded the move of %d file(s), but not of these:\n\n%s" \
+				% [int(result.moved), _file_listing(stuck, 10)])
+		text += ("\n\nOn your disk the move is done. For your team %s at the old place, so " +
+				"the project they get won't match yours. Moving %s back in Godot puts things " +
+				"right.") % ["the file stays" if is_folder == false and stuck.size() <= 1 else "those files stay",
+				"it" if is_folder == false and stuck.size() <= 1 else "them"]
+		var reasons: Array = result.reasons
+		if not reasons.is_empty():
+			text += "\n\nPerforce said:\n\n%s" % _file_listing(reasons, 6)
+			if "\n".join(reasons).contains("exclusive"):
+				text += ("\n\nA teammate has the file checked out with an exclusive lock, so " +
+						"nobody else can change or move it until they submit or revert.")
+		await _show_alert(text)
 
 
 ## A rename that changes nothing but upper and lower case, on a server that
@@ -8582,7 +8658,12 @@ func _p4_open_for_delete(res_path: String, decision: String, rec: Dictionary = {
 			var old_depot := String(rec.get("movedFile", ""))
 			await _p4_exec_logged(["revert", "-k", global_path])
 			if not old_depot.is_empty():
-				await _p4_exec_logged(["delete", "-k", old_depot])
+				# In the changelist the move was in, not the default one.
+				var delete_args := PackedStringArray(["delete", "-k"])
+				if String(rec.get("change", "")).is_valid_int():
+					delete_args.append_array(["-c", String(rec.get("change", ""))])
+				delete_args.append(old_depot)
+				await _p4_exec_logged(delete_args)
 		"reconcile":
 			await _p4_exec_logged(["reconcile", "-d", global_path])
 
@@ -8591,12 +8672,15 @@ func _p4_open_for_delete(res_path: String, decision: String, rec: Dictionary = {
 ## `p4 edit <old>` then `p4 move -k <old> <new>` (-k: don't touch the files, they
 ## are already where they belong). A folder is one pair of "/..." paths; a
 ## file brings its .import / .uid sidecars. Returns {moved: <files recorded>,
-## exit_code, output}.
+## not_moved: <paths the server still has at the old place>, reasons: <what
+## p4 said about those>, exit_code, output}.
 ##
 ## Why not `reconcile -M`, which this used to be: that guesses the pairing from
 ## file content, and for a binary file that was moved and changed it guesses
 ## "delete + add" - the history is cut (measured). Naming both paths can't
-## miss. Reconcile stays as the fallback when nothing could be moved.
+## miss. There is no fallback to that guess: on a file a teammate holds an
+## exclusive lock on it opens the new name as an unrelated add and reports
+## success (measured), which is worse than saying the move wasn't recorded.
 ##
 ## Measured on 2025.2 and 2026.1, all relied on below:
 ## - `edit` of a file that has left its old path opens it and then exits 1 on
@@ -8617,28 +8701,62 @@ func _p4_record_move(old_res: String, new_res: String, is_folder: bool) -> Dicti
 			var new_side := ProjectSettings.globalize_path(_sidecars_of(new_res)[i])
 			if FileAccess.file_exists(new_side):
 				pairs.append([ProjectSettings.globalize_path(_sidecars_of(old_res)[i]), new_side])
-	var edit_args := PackedStringArray(["edit"])
+	var old_paths := PackedStringArray()
 	for pair in pairs:
-		edit_args.append(String(pair[0]))
-	await _p4_exec_logged(edit_args)
+		old_paths.append(String(pair[0]))
+	# What was open before, so an edit this opens can be told from the user's
+	# own, and so newly opened files join the changelist the file is already
+	# in instead of splitting the work across two.
+	var was_unopened := {}
+	var change := ""
+	for rec in _parse_ztag(await _p4_exec(PackedStringArray(["-ztag", "fstat"]) + old_paths)):
+		var depot := String(rec.get("depotFile", ""))
+		if depot.is_empty():
+			continue
+		if String(rec.get("action", "")).is_empty():
+			was_unopened[depot] = true
+		elif change.is_empty() and not is_folder and String(rec.get("change", "")).is_valid_int():
+			change = String(rec.get("change", ""))
+	var edit_args := PackedStringArray(["edit"])
+	if not change.is_empty():
+		edit_args.append_array(["-c", change])
+	var edit_result := await _p4_exec_logged(edit_args + old_paths)
+	var reasons: Array = _refusals(edit_result).lines
 	var moved := 0
 	var said: Array = []
 	for pair in pairs:
 		var result := await _p4_exec_logged(["-ztag", "move", "-k", String(pair[0]), String(pair[1])])
-		said.append("" if result.output.is_empty() else String(result.output[0]).strip_edges())
+		var text := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+		said.append(text)
+		for raw in text.split("\n"):
+			var line := String(raw).strip_edges()
+			if line.contains(" - can't ") or line.contains("use -f to force"):
+				reasons.append(line)
 		for local in _moved_paths_in(_parse_ztag(result)):
 			moved += 1
 			_set_file_writable(local, true)
-	if moved > 0:
-		return {"exit_code": 0, "output": ["\n".join(said)], "moved": moved}
-	_log("Perforce recorded no move for '%s'; trying Reconcile instead." % old_res)
-	var fallback_args := PackedStringArray(["reconcile", "-M"])
-	for pair in pairs:
-		fallback_args.append_array([String(pair[0]), String(pair[1])])
-	var fallback := await _p4_exec_logged(fallback_args)
-	var text := "" if fallback.output.is_empty() else String(fallback.output[0])
-	var opened: bool = int(fallback.exit_code) == 0 and text.contains(" - opened for ")
-	return {"exit_code": int(fallback.exit_code), "output": fallback.output, "moved": 1 if opened else 0}
+	# Ask the server what is left at the old place. A count of what moved says
+	# nothing about what didn't: one file locked by a teammate, or one whose
+	# new name is taken, stays behind without failing the command.
+	var not_moved: Array = []
+	var undo := PackedStringArray()
+	for rec in _parse_ztag(await _p4_exec(PackedStringArray(["-ztag", "fstat"]) + old_paths)):
+		var action := String(rec.get("action", ""))
+		if action == "move/delete" or _delete_action_for(rec) == "none":
+			continue
+		var local := String(rec.get("clientFile", ""))
+		if local.is_empty() or FileAccess.file_exists(local):
+			continue # still on disk at the old place: not part of this move
+		var res := _local_to_res(local)
+		not_moved.append(res if not res.is_empty() else local)
+		if action == "edit" and was_unopened.has(String(rec.get("depotFile", ""))):
+			undo.append(String(rec.get("depotFile", "")))
+	# An edit opened above for a file that then didn't move would sit in the
+	# changelist pointing at a path with nothing in it, and fail the submit.
+	for start in range(0, undo.size(), 50):
+		await _p4_exec_logged(PackedStringArray(["revert", "-k"]) + undo.slice(start, start + 50))
+	return {"exit_code": 0, "output": ["\n".join(said)], "moved": moved,
+			"not_moved": not_moved, "reasons": reasons}
 
 
 ## The local paths `p4 -ztag move -k` reports as recorded: one record per file,
@@ -9581,7 +9699,11 @@ func _run_cli_self_test_if_requested() -> void:
 					_ignore_rule_in("C:/ws\\x.log ignored by C:/ws\\.p4ignore:1:*.log\n") \
 						== "C:/ws\\.p4ignore:1:*.log" \
 					and _ignore_rule_in("C:/ws\\a.txt not ignored\n") == ""
-			var revert_ok: bool = \
+			var where_ok: bool = _where_maps({"exit_code": 0, "output": ["... depotFile //game/main/a\n... clientFile //ws/a\n... path C:/ws\\a\n\n"]}) \
+					and not _where_maps({"exit_code": 0, "output": ["... depotFile //game/main/.godot/x\n... clientFile //ws/.godot/x\n... path C:/ws\\.godot\\x\n... unmap \n\n"]}) \
+					and not _where_maps({"exit_code": 0, "output": ["C:/elsewhere/x - file(s) not in client view.\n"]}) \
+					and not _where_maps({"exit_code": 1, "output": ["... depotFile //game/main/a\n\n"]})
+			var revert_ok: bool = where_ok and \
 					_revert_did_something("//game/main/a.txt#1 - was edit, reverted\n", 0) \
 					and _revert_did_something("//game/main/q.txt#none - was add, abandoned\n", 0) \
 					and _revert_did_something("//game/main/b.txt#1 - was move/delete, reverted\n" \
@@ -9625,7 +9747,8 @@ func _run_cli_self_test_if_requested() -> void:
 						{"depotFile": "//d/moved", "headRev": "2", "haveRev": "1", "action": "move/add"},
 						{"depotFile": "//d/gone", "headRev": "5", "haveRev": "2", "action": "delete"},
 						{"desc": "try"}, {},
-					]) == ["//d/behind", "//d/merge", "//d/gone"] \
+						{"depotFile": "//d/moved-away", "headRev": "5", "haveRev": "2", "action": "move/delete"},
+					]) == ["//d/behind", "//d/merge", "//d/moved-away"] \
 					and _out_of_date_in([]).is_empty()
 			var all_added := _add_summary_text({"added": ["res://a", "res://b"], "ignored": [],
 					"tracked": [], "failed": []})
@@ -9847,6 +9970,24 @@ func _run_cli_self_test_if_requested() -> void:
 					and not FileAccess.file_exists(dir_g.path_join("pic2.dat.import"))
 			_log("[selftest] undo of a moved asset takes its .import back too: %s" % side_ok)
 			ok = ok and side_ok
+
+			# Undoing a move must not overwrite a new file at the old path.
+			DirAccess.rename_absolute(dir_g.path_join("moved.txt"), dir_g.path_join("moved4.txt"))
+			await _handle_fs_move(dir.path_join("moved.txt"), dir.path_join("moved4.txt"), false)
+			var squat := FileAccess.open(dir_g.path_join("moved.txt"), FileAccess.WRITE)
+			squat.store_string("a new file with the old name\n")
+			squat.close()
+			_selftest_shown.clear()
+			await _revert_path(dir.path_join("moved4.txt"))
+			var kept: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("Undoing the move would overwrite it") \
+					and FileAccess.get_file_as_string(dir_g.path_join("moved.txt")) == "a new file with the old name\n" \
+					and _parse_ztag(await _p4_exec(["-ztag", "opened"])).size() == 2
+			DirAccess.remove_absolute(dir_g.path_join("moved.txt"))
+			await _revert_path(dir.path_join("moved4.txt"))
+			kept = kept and _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty()
+			_log("[selftest] undo of a move refuses to overwrite a new file at the old path: %s" % kept)
+			ok = ok and kept
 
 			# Deleting a file that was moved: the old path ends up opened for
 			# delete and nothing comes back on disk.
@@ -10194,6 +10335,60 @@ func _run_cli_self_test_if_requested() -> void:
 					and not _selftest_is_read_only(dir_g.path_join("gfx/sub/deep.txt"))
 			_log("[selftest] folder: files move/add, earlier move chained to the original=%s" % folder_ok)
 			ok = ok and folder_ok
+
+			# 4b. A file a teammate holds an exclusive lock on can't be moved.
+			# Nothing may be left opened for it, and the user must be told.
+			var mate_ws := OS.get_environment("P4TEST_MATE_WS")
+			var lock_ok := true
+			if mate_ws.is_empty():
+				_log("[selftest] exclusive-lock move: SKIPPED (no P4TEST_MATE_WS; run through tools/run-live-tests.sh)")
+			else:
+				var lock_g := dir_g.path_join("locked.txt")
+				var fl := FileAccess.open(lock_g, FileAccess.WRITE)
+				fl.store_string("locked\n")
+				fl.close()
+				await _p4_exec_logged(["add", "-t", "text+l", lock_g])
+				var lock_change := await _create_selftest_change("P4Godot selftest: lock seed", lock_g)
+				await _p4_exec_logged(["submit", "-c", lock_change])
+				var as_mate := PackedStringArray(["-u", "mate", "-c", "mate-ws"])
+				var mate_lock := mate_ws.path_join("p4g_moves_test/locked.txt")
+				await _p4_exec(as_mate + PackedStringArray(["sync", "//mate-ws/..."]))
+				await _p4_exec(as_mate + PackedStringArray(["edit", mate_lock]))
+				var open_before := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+				DirAccess.rename_absolute(lock_g, dir_g.path_join("locked2.txt"))
+				_selftest_shown.clear()
+				await _handle_fs_move(dir.path_join("locked.txt"), dir.path_join("locked2.txt"), false)
+				var open_after := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+				lock_ok = open_before == open_after and _selftest_shown.size() == 2 \
+						and String(_selftest_shown[1]).begins_with("Perforce didn't record the move of") \
+						and String(_selftest_shown[1]).contains("exclusive lock")
+				DirAccess.rename_absolute(dir_g.path_join("locked2.txt"), lock_g)
+				await _p4_exec(as_mate + PackedStringArray(["revert", mate_lock]))
+				_log("[selftest] exclusively locked file: move refused, explained, nothing left opened=%s" % lock_ok)
+			ok = ok and lock_ok
+
+			# 4c. A file in a numbered changelist moves inside that changelist,
+			# and its unopened sidecar joins it there.
+			for n: String in ["num.dat", "num.dat.import"]:
+				var fn := FileAccess.open(dir_g.path_join(n), FileAccess.WRITE)
+				fn.store_string(n + "\n")
+				fn.close()
+			await _p4_exec_logged(["add", dir_g.path_join("num.dat"), dir_g.path_join("num.dat.import")])
+			var seed_change := await _create_selftest_change("P4Godot selftest: numbered seed", dir_g.path_join("num.dat"))
+			await _p4_exec_logged(["reopen", "-c", seed_change, dir_g.path_join("num.dat.import")])
+			await _p4_exec_logged(["submit", "-c", seed_change])
+			var work_change := await _create_selftest_change("P4Godot selftest: numbered work", "")
+			await _do_checkout(dir.path_join("num.dat"), work_change)
+			for n: String in ["num.dat", "num.dat.import"]:
+				DirAccess.rename_absolute(dir_g.path_join(n), dir_g.path_join(n.replace("num", "num2")))
+			await _handle_fs_move(dir.path_join("num.dat"), dir.path_join("num2.dat"), false)
+			var in_change := _parse_ztag(await _p4_exec(["-ztag", "opened", "-c", work_change]))
+			var numbered_ok: bool = in_change.size() == 4
+			_log("[selftest] move inside changelist %s: both halves of the file and of its sidecar stay there=%s (%d of 4)" \
+					% [work_change, numbered_ok, in_change.size()])
+			ok = ok and numbered_ok
+			await _p4_exec_logged(["reopen", "-c", "default", _as_recursive(dir_g)])
+			await _p4_exec_logged(["change", "-d", work_change])
 
 			# 5. A rename that only changes case is refused with an explanation.
 			var folds := _server_folds_case
@@ -11476,6 +11671,17 @@ func _selftest_is_read_only(global_path: String) -> bool:
 	if OS.get_name() == "Windows":
 		return FileAccess.get_read_only_attribute(global_path)
 	return FileAccess.get_unix_permissions(global_path) & FileAccess.UNIX_WRITE_OWNER == 0
+
+
+## Self-tests only: a new pending changelist holding `local_path` (or empty
+## when that is ""). Returns its number.
+func _create_selftest_change(description: String, local_path: String) -> String:
+	var spec := "Change: new\n\nDescription:\n\t%s\n" % description
+	if not local_path.is_empty():
+		var opened := _parse_ztag(await _p4_exec(["-ztag", "opened", local_path]))
+		if not opened.is_empty():
+			spec += "Files:\n\t%s\n" % String(opened[0].get("depotFile", ""))
+	return _created_change_in(await _p4_exec_spec(["change", "-i"], spec))
 
 
 func _selftest_menu_labels() -> String:

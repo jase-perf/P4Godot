@@ -27,7 +27,9 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
   are now recorded by naming both paths to Perforce (`p4 edit` +
   `p4 move -k`). Before, Perforce was left to match the old and new file by
   content, and for a binary file that had been moved and changed it recorded
-  a delete and an unrelated add.
+  a delete and an unrelated add. If Perforce can't record a move - a
+  teammate holds an exclusive lock on the file, or the new name is taken -
+  P4Godot now says which files stayed behind and why.
 - **A rename that only changes capital letters is explained.** A server
   that ignores case can't record `Hero.png` → `hero.png`; it refused without
   an error and the rename stayed on your disk only. P4Godot now says so, why
