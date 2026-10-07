@@ -579,8 +579,9 @@ func _enter_tree() -> void:
 	_detect_p4_identity()
 	_log("P4Godot loaded.")
 	_run_cli_self_test_if_requested()
-	# Also fire-and-forget; it waits on the identity itself.
+	# Also fire-and-forget; they wait on the identity themselves.
 	_check_plugin_tracked()
+	_check_godot_cache_ignored()
 
 
 func _exit_tree() -> void:
@@ -4617,6 +4618,110 @@ func _p4_path_ignored(global_path: String) -> bool:
 	return text.contains("ignored")
 
 
+## The file names Perforce reads ignore rules from on this computer, from
+## `p4 set -q P4IGNORE`'s answer ("P4IGNORE=<names>", or nothing when unset).
+## Unset means ".p4ignore". Setting it to anything else REPLACES that default
+## (measured), so a project's .p4ignore can be silently out of force.
+func _ignore_file_names(set_output: String, windows: bool) -> PackedStringArray:
+	var value := ""
+	for raw in set_output.split("\n"):
+		var line := String(raw).strip_edges()
+		if line.begins_with("P4IGNORE="):
+			value = line.substr("P4IGNORE=".length())
+			# "p4 set" without -q appends " (set)", " (config 'x')" and so on.
+			var note := value.rfind(" (")
+			if note >= 0 and value.ends_with(")"):
+				value = value.substr(0, note)
+	var names := PackedStringArray()
+	# ":" separates names too, except on Windows where it follows a drive letter.
+	var parts := value.split(";", false)
+	if not windows:
+		var split_more := PackedStringArray()
+		for part in parts:
+			split_more.append_array(part.split(":", false))
+		parts = split_more
+	for part in parts:
+		if not part.strip_edges().is_empty():
+			names.append(part.strip_edges())
+	if names.is_empty():
+		names.append(".p4ignore")
+	return names
+
+
+## Once per start: make sure Perforce skips Godot's `.godot` folder, and offer
+## to add the rule when it doesn't. That folder is thousands of files rebuilt
+## on every machine, plus the user's own editor state; without a rule,
+## Reconcile offers all of it for the server. Returns what happened, for the
+## self-test: "skipped", "ignored", "declined", "added" or "failed".
+func _check_godot_cache_ignored(forced: bool = false) -> String:
+	if _shutting_down or (_selftest_mode and not forced):
+		return "skipped"
+	var settings := EditorInterface.get_editor_settings()
+	if not forced and settings.get_project_metadata(SETTINGS_SECTION, "godot_cache_ignore_declined", false):
+		return "skipped"
+	if not await _ensure_identity():
+		return "skipped"
+	var probe := ProjectSettings.globalize_path("res://.godot/editor/p4godot_ignore_probe")
+	if await _p4_path_ignored(probe):
+		return "ignored"
+	var set_result: Dictionary = await _p4_exec(["set", "-q", "P4IGNORE"])
+	var names := _ignore_file_names(
+			"" if set_result.output.is_empty() else String(set_result.output[0]),
+			OS.get_name() == "Windows")
+	var name := names[0]
+	if name.is_absolute_path() or name.contains("/") or name.contains("\\"):
+		# One shared file somewhere else on this computer; not ours to edit.
+		await _show_alert(("Perforce isn't set to skip Godot's `.godot` folder in this project. " +
+				"That folder is Godot's own scratch space - every computer rebuilds it - and " +
+				"it shouldn't go to the server.\n\nThis computer reads its ignore rules from " +
+				"'%s'. Add a line reading `.godot/` to that file.") % name)
+		return "failed"
+	var res := "res://" + name
+	var global_path := ProjectSettings.globalize_path(res)
+	var question := ("Perforce isn't set to skip Godot's `.godot` folder in this project.\n\n" +
+			"That folder is Godot's own scratch space: every computer rebuilds it, and it " +
+			"holds your personal editor settings. Without a rule, Reconcile offers its " +
+			"thousands of files for the server.\n\nAdd the line `.godot/` to '%s' now? " +
+			"Submit that file afterwards so your team gets the rule too.") % name
+	if not ".p4ignore" in names and FileAccess.file_exists(ProjectSettings.globalize_path("res://.p4ignore")):
+		question += ("\n\nThis project has a .p4ignore file, but this computer is set to read " +
+				"ignore rules from '%s' instead (the P4IGNORE setting), so the rules in " +
+				".p4ignore aren't applied here.") % name
+	if not await _show_confirm_dialog(question, "Add the Rule", "Not Now"):
+		if not forced:
+			settings.set_project_metadata(SETTINGS_SECTION, "godot_cache_ignore_declined", true)
+		_log("Left `.godot/` without an ignore rule. Add `.godot/` to '%s' to keep it off the server." % name)
+		return "declined"
+	var existing := ""
+	var existed := FileAccess.file_exists(global_path)
+	if existed:
+		existing = FileAccess.get_file_as_string(global_path)
+		if await _needs_checkout(global_path):
+			var checkout: Dictionary = await _do_checkout(res)
+			if not checkout.ok:
+				await _show_alert(("Godot couldn't check out '%s' to add the rule:\n\n%s\n\n" +
+						"Add a line reading `.godot/` to it yourself.") % [name, checkout.reason])
+				return "failed"
+	if not existing.is_empty() and not existing.ends_with("\n"):
+		existing += "\n"
+	var out := FileAccess.open(global_path, FileAccess.WRITE)
+	if out == null:
+		await _show_alert(("Godot couldn't write '%s'. Add a line reading `.godot/` to it " +
+				"yourself.") % name)
+		return "failed"
+	out.store_string(existing + ("" if existed else "# Godot's per-computer cache and editor state\n") + ".godot/\n")
+	out.close()
+	if not existed:
+		await _add_path(res, false)
+	_request_refresh()
+	if not await _p4_path_ignored(probe):
+		await _show_alert(("Godot added `.godot/` to '%s', but Perforce still doesn't skip that " +
+				"folder. Press \"Log\" in the P4G panel to see what it said.") % name)
+		return "failed"
+	_log("Added `.godot/` to '%s'. Submit that file so your team gets the rule." % name)
+	return "added"
+
+
 func _check_plugin_tracked() -> void:
 	if _shutting_down or _selftest_mode:
 		return
@@ -4731,7 +4836,14 @@ func _scan_for_external_changes_inner(reason: String) -> void:
 		return
 	if _verbose_log:
 		_log("Scanning for changes made outside Godot (%s)..." % reason)
-	var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", _project_scope()])
+	# -m: only read a file's content when its modification time differs from
+	# the one Perforce recorded. Without it every file in the project is read
+	# and hashed on each scan (measured: twice as long on 450 MB from a warm
+	# disk cache, and the gap grows with the project). The cost: a file whose
+	# content changed while its time stayed exactly the same is missed here.
+	# An older or newer time is caught (measured), so an Explorer or Finder
+	# copy is. The Reconcile button still does the full comparison.
+	var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", "-m", _project_scope()])
 	await _offer_external_changes(_summarize_reconcile(_parse_ztag(result)), _refusals(result))
 
 
@@ -9321,10 +9433,18 @@ func _run_cli_self_test_if_requested() -> void:
 					and mixed.contains("ignore rules (1):\n    res://x.log") \
 					and mixed.contains("(2):\n    res://t1\n    res://t2") \
 					and not mixed.contains("Refused")
-			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s" \
-					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok])
+			var names_ok: bool = _ignore_file_names("", true) == PackedStringArray([".p4ignore"]) \
+					and _ignore_file_names("P4IGNORE=.p4ignore\n", true) == PackedStringArray([".p4ignore"]) \
+					and _ignore_file_names("P4IGNORE=p4ignore.txt;.p4ignore (set)\r\n", true) \
+						== PackedStringArray(["p4ignore.txt", ".p4ignore"]) \
+					and _ignore_file_names("P4IGNORE=C:\\Users\\me\\ignore.txt (config 'C:\\x\\.p4config')\n", true) \
+						== PackedStringArray(["C:\\Users\\me\\ignore.txt"]) \
+					and _ignore_file_names("P4IGNORE=.p4ignore:.gitignore\n", false) \
+						== PackedStringArray([".p4ignore", ".gitignore"])
+			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s ignore-names=%s" \
+					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok, names_ok])
 			_log("[selftest] %s: p4-answers" % ("PASS" if diff_ok and add_ok and rule_ok \
-					and revert_ok and pw_ok and move_ok and behind_ok and summary_ok else "FAIL"))
+					and revert_ok and pw_ok and move_ok and behind_ok and summary_ok and names_ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-file-actions-live":
@@ -9529,6 +9649,67 @@ func _run_cli_self_test_if_requested() -> void:
 			DirAccess.remove_absolute(dir_g)
 			_log("[selftest] opened-after=%d" % left)
 			_log("[selftest] %s: file-actions-live" % ("PASS" if ok and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-ignore-check-live":
+			# Live (no submits): the startup check that .godot/ is ignored.
+			# Needs a tracked res://.p4ignore holding the line ".godot/", the
+			# P4IGNORE environment variable set to .p4ignore, and nothing opened.
+			var ig_g := ProjectSettings.globalize_path("res://.p4ignore")
+			var original := FileAccess.get_file_as_string(ig_g)
+			if not original.contains(".godot/") or OS.get_environment("P4IGNORE") != ".p4ignore" \
+					or not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: ignore-check-live - needs '.godot/' in a tracked .p4ignore, P4IGNORE=.p4ignore, nothing opened")
+				get_tree().quit()
+				return
+			_selftest_shown.clear()
+			var fine: bool = await _check_godot_cache_ignored(true) == "ignored" and _selftest_shown.is_empty()
+
+			# The rule is missing: declined leaves the file alone, accepted adds it.
+			await _do_checkout("res://.p4ignore")
+			var stripped := FileAccess.open(ig_g, FileAccess.WRITE)
+			stripped.store_string(original.replace(".godot/", "# rule removed by the selftest"))
+			stripped.close()
+			await _p4_exec_logged(["revert", "-k", ig_g])
+			_set_file_writable(ig_g, false)
+			_selftest_auto_answer = "cancel"
+			var declined: bool = await _check_godot_cache_ignored(true) == "declined" \
+					and not FileAccess.get_file_as_string(ig_g).contains(".godot/\n") \
+					and _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty()
+			_selftest_auto_answer = "confirm"
+			_selftest_shown.clear()
+			var added: bool = await _check_godot_cache_ignored(true) == "added" \
+					and _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("Add the line " + char(96) + ".godot/" + char(96) + " to '.p4ignore' now?") \
+					and FileAccess.get_file_as_string(ig_g).ends_with(".godot/\n") \
+					and await _p4_path_ignored(ProjectSettings.globalize_path("res://.godot/editor/x"))
+			var opened_edit := _parse_ztag(await _p4_exec(["-ztag", "opened"]))
+			added = added and opened_edit.size() == 1 and String(opened_edit[0].get("action", "")) == "edit"
+			await _p4_exec_logged(["revert", ig_g])
+			_log("[selftest] rule present: quiet=%s; rule missing: declined leaves it=%s, accepted checks out and adds it=%s" \
+					% [fine, declined, added])
+
+			# P4IGNORE names another file: the project's .p4ignore is out of
+			# force, and the rule goes into the file that is read.
+			OS.set_environment("P4IGNORE", "p4g-other-ignore.txt")
+			var other_g := ProjectSettings.globalize_path("res://p4g-other-ignore.txt")
+			_selftest_shown.clear()
+			var replaced: bool = await _check_godot_cache_ignored(true) == "added" \
+					and _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("to 'p4g-other-ignore.txt' now?") \
+					and String(_selftest_shown[0]).contains("aren't applied here") \
+					and FileAccess.get_file_as_string(other_g).ends_with(".godot/\n")
+			var opened_add := _parse_ztag(await _p4_exec(["-ztag", "opened"]))
+			replaced = replaced and opened_add.size() == 1 and String(opened_add[0].get("action", "")) == "add"
+			await _p4_exec_logged(["revert", other_g])
+			DirAccess.remove_absolute(other_g)
+			OS.set_environment("P4IGNORE", ".p4ignore")
+			_log("[selftest] P4IGNORE names another file: said so and added the rule there=%s" % replaced)
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			var restored: bool = FileAccess.get_file_as_string(ig_g).replace("\r", "") == original.replace("\r", "")
+			_log("[selftest] opened-after=%d .p4ignore-restored=%s" % [left, restored])
+			_log("[selftest] %s: ignore-check-live" % ("PASS" if fine and declined and added \
+					and replaced and restored and left == 0 else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-submit-behind-live":

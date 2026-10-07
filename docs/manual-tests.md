@@ -71,6 +71,7 @@ by hand:
 | 30 | Change a tracked file outside Godot without checking it out, then right-click it → **P4: Revert**. | "...was changed on your computer without being checked out. Put back the version you downloaded?" After **Put It Back** the file has its old content. |
 | 31 | Move a tracked file, accept **Record Move**, then delete the moved file in the FileSystem dock and accept. | The panel shows the original path opened for delete. The file does not reappear under its old name. |
 | 32 | Select several files, some already tracked and one ignored, → **P4: Mark for Add**. | One message: "Marked N of M files for add", listing the ignored and the already-tracked ones. |
+| 33 | Check out `.p4ignore`, delete its `.godot/` line, save, revert the checkout with `p4 revert -k`, and restart Godot. | A question offers to add `.godot/` to '.p4ignore'. After **Add the Rule** the file is checked out with the line at its end, and Reconcile no longer lists files under `.godot/`. **Not Now** is remembered: no question at the next start. |
 
 ## Screenshots for the README
 

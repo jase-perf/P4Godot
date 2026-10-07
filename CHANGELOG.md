@@ -4,6 +4,15 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **P4Godot checks that Perforce skips Godot's `.godot` folder.** At
+  startup, if no ignore rule covers it, P4Godot offers to add `.godot/` to
+  the ignore file - checking the file out, or creating it. It also notices
+  when this computer's `P4IGNORE` setting names a different file, which
+  silently puts the project's `.p4ignore` out of force, and says so.
+- **The automatic check for changes made outside Godot is faster on large
+  projects.** It now reads a file's content only when its modification time
+  has changed, where it used to read every file each time. The
+  **Reconcile...** button still compares everything.
 - **A moved file keeps its history even when you also changed it.** Moves
   are now recorded by naming both paths to Perforce (`p4 edit` +
   `p4 move -k`). Before, Perforce was left to match the old and new file by

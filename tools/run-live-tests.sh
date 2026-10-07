@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 GODOT="${1:-${GODOT:-godot}}"
 [ $# -gt 0 ] && shift
-ALL="probe file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
+ALL="probe ignore-check-live file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
 special-names submit-behind-live submit-verdict-live submit-cancel submit-slow-trigger-live
 external-scan"
 TESTS="${*:-$ALL}"
