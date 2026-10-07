@@ -541,6 +541,8 @@ var _selftest_auto_answer: String = ""
 ## Self-tests only: text to type into the next input dialogs, first in first
 ## out, and every alert and confirmation shown so far.
 var _selftest_typed: Array = []
+## Self-tests only: which entry to choose in the next option dialogs.
+var _selftest_option_picks: Array = []
 var _selftest_shown: Array = []
 ## True while a --p4-selftest-* run is driving the plugin. Startup prompts and
 ## the focus-in scan stay out of the way so a test sees only its own actions.
@@ -3788,6 +3790,13 @@ func _rebuild_tree(model: Dictionary) -> void:
 			# more room for the paths themselves. Tooltip keeps the full story.
 			f_item.set_text(0, String(f.res_path).trim_prefix("res://"))
 			f_item.set_tooltip_text(0, "%s\n%s" % [f.res_path, f.depot_path])
+			if bool(f.get("unresolved", false)):
+				# A teammate's newer version is waiting to be combined with
+				# this one; the server refuses the submit until it is.
+				f_item.set_text(0, "%s  (needs resolve)" % String(f.res_path).trim_prefix("res://"))
+				f_item.set_custom_color(0, ACTION_DELETE_COLOR)
+				f_item.set_tooltip_text(0, ("%s\n%s\nA teammate changed this file too. Right-click " +
+						"and choose \"Resolve...\" to combine the two versions.") % [f.res_path, f.depot_path])
 			f_item.set_text(1, f.action)
 			f_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
 			f_item.set_custom_color(1, _action_color(f.action))
@@ -3796,7 +3805,8 @@ func _rebuild_tree(model: Dictionary) -> void:
 			if icon:
 				f_item.set_icon(0, icon)
 			f_item.set_metadata(0, {"type": "file", "res_path": f.res_path,
-					"depot_path": f.depot_path, "action": f.action, "change": f.change})
+					"depot_path": f.depot_path, "action": f.action, "change": f.change,
+					"unresolved": bool(f.get("unresolved", false))})
 
 
 ## An editor theme icon by name, or null if this build doesn't have it (so
@@ -3936,6 +3946,7 @@ enum {
 	CTX_SUBMIT,
 	CTX_DELETE_CL,
 	CTX_DIFF,
+	CTX_RESOLVE,
 }
 const CTX_MOVE_BASE := 1000
 
@@ -3968,6 +3979,8 @@ func _populate_context_menu(meta: Dictionary) -> void:
 	_move_targets.clear()
 	var kind: String = meta.get("type", "")
 	if kind == "file":
+		if bool(meta.get("unresolved", false)):
+			context_menu.add_item("Resolve...", CTX_RESOLVE)
 		context_menu.add_item("Open", CTX_OPEN)
 		context_menu.add_item("Diff vs Depot", CTX_DIFF)
 		context_menu.add_item("Revert This File", CTX_REVERT)
@@ -4026,6 +4039,9 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_DIFF:
 			if meta.has("res_path"):
 				await _diff_path(meta.res_path)
+		CTX_RESOLVE:
+			if meta.has("res_path"):
+				await _resolve_flow([meta.res_path])
 		CTX_REVERT:
 			if meta.has("res_path"):
 				await _revert_path(meta.res_path)
@@ -5225,6 +5241,8 @@ func _get_latest_body() -> String:
 		if not moved.is_empty() and tracker.network_mb > 0:
 			report += "\n\n" + moved
 	await _show_alert(report)
+	if not to_resolve.is_empty() and not cancelled:
+		await _resolve_flow(to_resolve)
 	return report
 
 
@@ -5686,6 +5704,166 @@ func _resolve_preview_names() -> Array:
 	return names
 
 
+## The files with a merge waiting, from `p4 -ztag resolve -n` records:
+## [{res_path, local, binary, special}], sorted by path, one entry per file.
+## `binary`: Perforce can't combine the two versions (contentResolveType is
+## not a text merge), so one of them has to win. `special`: the file also needs
+## a kind of resolve this plugin doesn't offer (a move, a delete, a filetype
+## change), which P4V handles.
+func _unresolved_in(records: Array) -> Array:
+	var by_local := {}
+	for rec in records:
+		var local := String(rec.get("clientFile", ""))
+		if local.is_empty():
+			continue
+		var res := _local_to_res(local)
+		var entry: Dictionary = by_local.get(local, {"res_path": res if not res.is_empty() else local,
+				"local": local, "binary": false, "special": false})
+		if String(rec.get("resolveType", "content")) != "content":
+			entry.special = true
+		elif not String(rec.get("contentResolveType", "")).contains("text"):
+			entry.binary = true
+		by_local[local] = entry
+	var out: Array = by_local.values()
+	out.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return String(a.res_path) < String(b.res_path))
+	return out
+
+
+## What `p4 resolve -am|-ay|-at <file>` did, from its answer: "combined",
+## "mine", "theirs", "skipped" (-am met lines both sides changed; p4 exits 0
+## and leaves the file unresolved), or "failed".
+func _resolve_outcome(text: String, exit_code: int) -> String:
+	if text.contains(" - resolve skipped"):
+		return "skipped"
+	if exit_code != 0:
+		return "failed"
+	if text.contains(" - merge from "):
+		return "combined"
+	if text.contains(" - copy from "):
+		return "theirs"
+	if text.contains(" - ignored "):
+		return "mine"
+	return "failed"
+
+
+## Godot's own text formats. Perforce merges them line by line like any text,
+## and a line-by-line merge of a scene can produce a file Godot can't load.
+func _is_godot_text_resource(res_path: String) -> bool:
+	return res_path.get_extension().to_lower() in ["tscn", "tres", "godot", "import", "cfg"]
+
+
+## Combine a teammate's newer version with yours, for every file that needs
+## it (or only the ones named). A file gets here when it was checked out here
+## and submitted by someone else: after the next sync the server holds their
+## version, the disk holds yours, and a submit is refused until one answer is
+## chosen per file. Returns how many files are still waiting.
+func _resolve_flow(only: Array = []) -> int:
+	if not await _ensure_identity():
+		await _show_alert(NOT_CONNECTED_MESSAGE)
+		return -1
+	var waiting := _unresolved_in(_parse_ztag(await _p4_exec(["-ztag", "resolve", "-n"])))
+	if not only.is_empty():
+		waiting = waiting.filter(func(w: Dictionary) -> bool: return String(w.res_path) in only)
+	if waiting.is_empty():
+		await _show_alert("Nothing is waiting to be combined with a teammate's version.")
+		_request_refresh()
+		return 0
+	var left := 0
+	var changed_on_disk: Array = []
+	for i in waiting.size():
+		var outcome := await _resolve_one(waiting[i], i + 1, waiting.size())
+		if outcome == "combined" or outcome == "theirs":
+			changed_on_disk.append(String(waiting[i].res_path))
+		elif outcome == "stop":
+			left += waiting.size() - i
+			break
+		elif outcome != "mine":
+			left += 1
+	_request_refresh()
+	if not changed_on_disk.is_empty():
+		EditorInterface.get_resource_filesystem().scan()
+		for res: String in changed_on_disk:
+			if res.begins_with("res://") and _is_open_in_editor(res):
+				await _reload_path(res)
+	if left == 0:
+		_log("Resolved %d file(s). They can be submitted now." % waiting.size())
+	else:
+		_log("%d file(s) still need resolving before they can be submitted." % left)
+	return left
+
+
+## One file's question and answer. Returns "combined", "mine", "theirs",
+## "later" (this file was skipped), "stop" (the user closed the dialog) or
+## "failed".
+func _resolve_one(file: Dictionary, position: int, total: int) -> String:
+	var res := String(file.res_path)
+	var local := String(file.local)
+	if bool(file.special):
+		await _show_alert(("'%s' needs more than its content combined - it was moved, deleted " +
+				"or changed type on the server. P4Godot can't do that one. In P4V, right-click " +
+				"the file and choose \"Resolve Files...\".") % res)
+		return "later"
+	var can_combine := not bool(file.binary)
+	while true:
+		var options := PackedStringArray()
+		var modes: Array = []
+		if can_combine:
+			options.append("Combine both versions")
+			modes.append("combine")
+		options.append("Keep mine (their changes are left out)")
+		modes.append("mine")
+		options.append("Take theirs (my changes are thrown away)")
+		modes.append("theirs")
+		options.append("Decide later")
+		modes.append("later")
+		var message := ("A teammate submitted a newer version of this file while you had it " +
+				"checked out:\n\n    %s\n\nYour version is on your computer; theirs is on the " +
+				"server. Choose what the file should contain when you submit.") % res
+		if can_combine:
+			message += ("\n\n\"Combine\" keeps both sets of changes, as long as you didn't " +
+					"both change the same lines.")
+			if _is_godot_text_resource(res):
+				message += (" This is one of Godot's own file formats, and a combined one " +
+						"can come out broken - open it and check it before you submit.")
+		else:
+			message += ("\n\nThis kind of file can't be combined: one version wins and the " +
+					"other is lost from the newest revision. Talk to whoever made the other " +
+					"change before you choose.")
+		var pick: Dictionary = await _show_option_dialog("Resolve (%d of %d)" % [position, total],
+				message, options, 0, "OK")
+		if not pick.ok:
+			return "stop"
+		var mode := String(modes[int(pick.index)])
+		if mode == "later":
+			return "later"
+		if mode == "theirs" and not await _show_confirm_dialog(
+				("Throw away your changes to '%s' and take your teammate's version?\n\n" +
+				"Everything you changed in this file is lost, and this can't be undone.") % res,
+				"Take Theirs", "Go Back"):
+			continue
+		var flag: String = {"combine": "-am", "mine": "-ay", "theirs": "-at"}[mode]
+		var result := await _p4_exec_logged(["resolve", flag, local])
+		var outcome := _resolve_outcome("" if result.output.is_empty() else String(result.output[0]),
+				int(result.exit_code))
+		# p4 exits 0 on a skipped merge, so the answer alone isn't proof: ask
+		# whether the file is still waiting.
+		var still := _unresolved_in(_parse_ztag(await _p4_exec(["-ztag", "resolve", "-n", local])))
+		if still.is_empty() and outcome in ["combined", "mine", "theirs"]:
+			return outcome
+		if mode == "combine" and outcome == "skipped":
+			await _show_alert(("You and your teammate changed the same lines of '%s', so " +
+					"Perforce can't combine the two versions by itself. Nothing was changed.\n\n" +
+					"Choose which version to keep. To combine them by hand instead, choose " +
+					"\"Decide later\" and use P4V (right-click the file there, \"Resolve " +
+					"Files...\").") % res)
+			can_combine = false
+			continue
+		await _show_alert(("Perforce didn't resolve '%s'. Press \"Log\" in the P4G panel to see " +
+				"what it said.") % res)
+		return "failed"
+	return "failed" # unreachable; while-true exits via return
+
+
 ## What actually happened, taken from the sync's own output rather than the
 ## preview's - p4 prints a normal-looking record for a file it refused to
 ## overwrite, so the refusals are subtracted here. Every problem names its next
@@ -5722,12 +5900,11 @@ func _get_latest_report(done: Dictionary, after: Dictionary, reload: Dictionary,
 	if not colliding.is_empty():
 		text += _kept_existing_text(colliding)
 	if not to_resolve.is_empty():
-		text += ("\n\n%d file(s) you have checked out need the two versions combined " +
-				"before you can submit them:\n\n%s\n\nP4Godot can't do that merge. In " +
-				"P4V, right-click the file and choose Resolve, or run `p4 resolve` in a " +
-				"terminal. For an image or a model there is nothing to combine - you keep " +
-				"one version and lose the other - so talk to whoever made the other " +
-				"change first.") % [to_resolve.size(), _file_listing(to_resolve, 30)]
+		text += ("\n\n%d file(s) you have checked out were also changed by a teammate, " +
+				"and the two versions have to be combined before you can submit:\n\n%s\n\n" +
+				"P4Godot asks you about each one next. You can also do it later: they are " +
+				"marked \"needs resolve\" in the P4G panel, and right-clicking one offers " +
+				"\"Resolve...\".") % [to_resolve.size(), _file_listing(to_resolve, 30)]
 	if int(done.malformed) > 0:
 		text += ("\n\n%d line(s) of Perforce's answer couldn't be read, so this summary " +
 				"may be incomplete. Press \"Get Latest...\" again to check.") % done.malformed
@@ -5966,9 +6143,10 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	# The server refuses the whole submit if a teammate got a newer version of
 	# any file in first. Say which files before asking for a description,
 	# instead of after a numbered changelist exists and the submit has failed.
-	var behind := _out_of_date_in(_parse_ztag(await _p4_exec(["-ztag", "fstat", "-Ro",
-			"-e", change, "-T", "depotFile,headRev,haveRev,action,unresolved",
-			_project_scope() if change == "default" else "//%s/..." % _p4_client])))
+	var opened_recs := _parse_ztag(await _p4_exec(["-ztag", "fstat", "-Ro",
+			"-e", change, "-T", "depotFile,clientFile,headRev,haveRev,action,unresolved",
+			_project_scope() if change == "default" else "//%s/..." % _p4_client]))
+	var behind := _out_of_date_in(opened_recs)
 	if not behind.is_empty():
 		var labels := {}
 		for f in files:
@@ -5978,14 +6156,27 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			lines.append("    " + String(labels.get(depot, depot)))
 		if behind.size() > 12:
 			lines.append("    ...and %d more" % (behind.size() - 12))
-		await _show_alert(("Perforce won't take this submit yet. %s changed on the server " +
-				"after you downloaded %s:\n\n%s\n\nA teammate submitted a newer version first, " +
-				"so their changes and yours have to be combined before yours can go in. " +
-				"Nothing was sent.\n\nPress \"Get Latest\" in the P4G panel, then combine the " +
-				"two versions in P4V (right-click the file there and choose \"Resolve " +
-				"Files...\"), and submit again.") % [
+		var go: bool = await _show_confirm_dialog(("Perforce won't take this submit yet. %s " +
+				"changed on the server after you downloaded %s:\n\n%s\n\nA teammate submitted " +
+				"a newer version first, so their changes and yours have to be combined before " +
+				"yours can go in. Nothing was sent.\n\nCombine them now? P4Godot fetches their " +
+				"version and asks you about each file. Afterwards, check your project still " +
+				"works and submit again.") % [
 				"This file" if behind.size() == 1 else "These %d files" % behind.size(),
-				"it" if behind.size() == 1 else "them", "\n".join(lines)])
+				"it" if behind.size() == 1 else "them", "\n".join(lines)],
+				"Combine Now", "Not Now")
+		if not go:
+			return
+		# The sync is what brings their version in and schedules the merge;
+		# on a file that is checked out it never touches the content on disk.
+		await _safe_sync(PackedStringArray(behind))
+		var wanted: Array = []
+		for rec in opened_recs:
+			if String(rec.get("depotFile", "")) in behind:
+				var local := String(rec.get("clientFile", ""))
+				var res := _local_to_res(local)
+				wanted.append(res if not res.is_empty() else local)
+		await _resolve_flow(wanted)
 		return
 
 	var desc := ""
@@ -6329,8 +6520,8 @@ func _submit_outcome_text(outcome: String, number: String, final: String, said: 
 					"work is untouched. The usual cause is that a teammate changed one of the " +
 					"same files first, so you need their version before you can send yours: " +
 					"right-click the file in the P4G panel and choose \"Sync This File\", then " +
-					"combine their changes with yours (P4V, or `p4 resolve` in a terminal) and " +
-					"submit again.\n\nYour files are in changelist %s in the P4G panel, with " +
+					"right-click it again and choose \"Resolve...\" to combine their changes " +
+					"with yours, and submit again.\n\nYour files are in changelist %s in the P4G panel, with " +
 					"your description. Submit it from there once the problem is sorted out.") \
 					% [said, number]
 	# The panel is only evidence once it is showing real data again: with the
@@ -6623,6 +6814,13 @@ func _query_pending_model() -> Dictionary:
 				if not res_path.is_empty():
 					depot_to_res[String(wrec.get("depotFile", ""))] = res_path
 
+	# 2b. Which of them have a merge waiting. Only asked when something is
+	#     opened: the answer is empty otherwise.
+	var unresolved := {}
+	if not opened.is_empty():
+		for waiting in _unresolved_in(_parse_ztag(await _p4_exec(["-ztag", "resolve", "-n"]))):
+			unresolved[String(waiting.res_path)] = true
+
 	# 3. Pending numbered changelists owned by us in this client.
 	var changes := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
 			"-c", _p4_client, "-u", _p4_user]))
@@ -6660,6 +6858,7 @@ func _query_pending_model() -> Dictionary:
 			"action": String(rec.get("action", "")),
 			"change": change_key,
 			"type": String(rec.get("type", "")),
+			"unresolved": unresolved.has(res_path),
 		})
 
 	return {
@@ -7488,6 +7687,8 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 		preselect: int, ok_text: String, extra_text: String = "") -> Dictionary:
 	if _shutting_down:
 		return {"ok": false, "index": -1, "extra": false}
+	if _selftest_mode:
+		_selftest_shown.append(message)
 	while _dialog_busy:
 		await get_tree().process_frame
 	_dialog_busy = true
@@ -7521,6 +7722,8 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
 		if is_instance_valid(dialog):
+			if not _selftest_option_picks.is_empty():
+				picker.select(int(_selftest_option_picks.pop_front()))
 			if _selftest_auto_answer == "confirm":
 				dialog.confirmed.emit()
 			elif _selftest_auto_answer == "extra" and not extra_text.is_empty():
@@ -9433,6 +9636,26 @@ func _run_cli_self_test_if_requested() -> void:
 					and mixed.contains("ignore rules (1):\n    res://x.log") \
 					and mixed.contains("(2):\n    res://t1\n    res://t2") \
 					and not mixed.contains("Refused")
+			var waiting := _unresolved_in([
+				{"clientFile": "C:/elsewhere/b.txt", "fromFile": "//d/b.txt", "resolveType": "content",
+					"contentResolveType": "3waytext"},
+				{"clientFile": "C:/elsewhere/a.bin", "fromFile": "//d/a.bin", "resolveType": "content",
+					"contentResolveType": "2wayraw"},
+				{"clientFile": "C:/elsewhere/b.txt", "fromFile": "//d/b.txt", "resolveType": "filetype"},
+				{"fromFile": "//d/none"}, {},
+			])
+			var resolve_ok: bool = waiting.size() == 2 \
+					and String(waiting[0].res_path) == "C:/elsewhere/a.bin" and bool(waiting[0].binary) \
+					and not bool(waiting[0].special) \
+					and String(waiting[1].res_path) == "C:/elsewhere/b.txt" and not bool(waiting[1].binary) \
+					and bool(waiting[1].special) \
+					and _resolve_outcome("C:/ws\\a.txt - merging //d/a.txt#2\nDiff chunks: 1 yours + 1 theirs + 0 both + 0 conflicting\n//ws/a.txt - merge from //d/a.txt\n", 0) == "combined" \
+					and _resolve_outcome("C:/ws\\a.txt - merging //d/a.txt#2\nDiff chunks: 0 yours + 0 theirs + 0 both + 1 conflicting\n//ws/a.txt - resolve skipped.\n", 0) == "skipped" \
+					and _resolve_outcome("C:/ws\\a.txt - vs //d/a.txt#2\n//ws/a.txt - ignored //d/a.txt\n", 0) == "mine" \
+					and _resolve_outcome("C:/ws\\a.bin - vs //d/a.bin#2\n//ws/a.bin - copy from //d/a.bin\n", 0) == "theirs" \
+					and _resolve_outcome("//ws/a.txt - merge from //d/a.txt\n", 1) == "failed" \
+					and _resolve_outcome("No file(s) to resolve.\n", 0) == "failed" \
+					and _is_godot_text_resource("res://a/Main.TSCN") and not _is_godot_text_resource("res://a.gd")
 			var names_ok: bool = _ignore_file_names("", true) == PackedStringArray([".p4ignore"]) \
 					and _ignore_file_names("P4IGNORE=.p4ignore\n", true) == PackedStringArray([".p4ignore"]) \
 					and _ignore_file_names("P4IGNORE=p4ignore.txt;.p4ignore (set)\r\n", true) \
@@ -9441,10 +9664,11 @@ func _run_cli_self_test_if_requested() -> void:
 						== PackedStringArray(["C:\\Users\\me\\ignore.txt"]) \
 					and _ignore_file_names("P4IGNORE=.p4ignore:.gitignore\n", false) \
 						== PackedStringArray([".p4ignore", ".gitignore"])
-			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s ignore-names=%s" \
-					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok, names_ok])
+			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s ignore-names=%s resolve=%s" \
+					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok, names_ok, resolve_ok])
 			_log("[selftest] %s: p4-answers" % ("PASS" if diff_ok and add_ok and rule_ok \
-					and revert_ok and pw_ok and move_ok and behind_ok and summary_ok and names_ok else "FAIL"))
+					and revert_ok and pw_ok and move_ok and behind_ok and summary_ok and names_ok \
+					and resolve_ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-file-actions-live":
@@ -9712,6 +9936,97 @@ func _run_cli_self_test_if_requested() -> void:
 					and replaced and restored and left == 0 else "FAIL"))
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-resolve-live":
+			# Live and DESTRUCTIVE (use tools/run-live-tests.sh: it needs the
+			# second user "mate" with workspace mate-ws at $P4TEST_MATE_WS).
+			# A teammate submits newer versions of three files checked out
+			# here: one that combines cleanly, one where both changed the same
+			# line, one binary. Submit must lead into resolving them, and each
+			# answer must leave the content it promised.
+			_selftest_auto_answer = "confirm"
+			var mate_dir := OS.get_environment("P4TEST_MATE_WS")
+			if mate_dir.is_empty() or not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: resolve-live - needs P4TEST_MATE_WS and nothing opened")
+				get_tree().quit()
+				return
+			var r_names := ["p4g_resolve_a_clean.txt", "p4g_resolve_b_clash.txt", "p4g_resolve_c_pic.bin"]
+			var eight := "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n"
+			var r_add := PackedStringArray(["add"])
+			for n: String in r_names:
+				var g := ProjectSettings.globalize_path("res://" + n)
+				var fw := FileAccess.open(g, FileAccess.WRITE)
+				fw.store_string(eight if n.ends_with(".txt") else "binary base")
+				fw.close()
+				r_add.append(g)
+			await _p4_exec_logged(r_add)
+			await _p4_exec_logged(["reopen", "-t", "binary", ProjectSettings.globalize_path("res://" + r_names[2])])
+			await _submit_changelist("default", [], "P4Godot selftest: resolve seed")
+			var mate := PackedStringArray(["-u", "mate", "-c", "mate-ws"])
+			await _p4_exec(mate + PackedStringArray(["sync", "//mate-ws/..."]))
+			var mate_text := [eight.replace("l1\n", "l1 mate\n"), eight.replace("l4\n", "l4 mate\n"), "binary from mate"]
+			var mine_text := [eight.replace("l8\n", "l8 dev\n"), eight.replace("l4\n", "l4 dev\n"), "binary from dev"]
+			var mate_args := PackedStringArray(["submit", "-d", "mate got there first"])
+			for i in 3:
+				var theirs := mate_dir.path_join(r_names[i])
+				await _p4_exec(mate + PackedStringArray(["edit", theirs]))
+				var fm := FileAccess.open(theirs, FileAccess.WRITE)
+				fm.store_string(mate_text[i])
+				fm.close()
+				# Checked out here BEFORE the teammate submits: this workspace's
+				# revision is then the old one.
+				await _do_checkout("res://" + r_names[i])
+				var fd := FileAccess.open(ProjectSettings.globalize_path("res://" + r_names[i]), FileAccess.WRITE)
+				fd.store_string(mine_text[i])
+				fd.close()
+			var mate_sub := await _p4_exec(mate + mate_args)
+			var staged: bool = String(mate_sub.output[0]).contains("submitted")
+
+			# Submit -> "Combine Now" -> a.clean: combine. b.clash: combine is
+			# refused, then keep mine. c.pic: no combine offered; take theirs.
+			_selftest_option_picks = [0, 0, 0, 1]
+			_selftest_shown.clear()
+			_last_submit_outcome = ""
+			await _submit_changelist("default", [], "P4Godot selftest: not sent, resolved instead")
+			var read := func(n: String) -> String:
+				return FileAccess.get_file_as_string(ProjectSettings.globalize_path("res://" + n)).replace("\r", "")
+			var a_text: String = read.call(r_names[0])
+			var combined_ok: bool = a_text.contains("l1 mate\n") and a_text.contains("l8 dev\n")
+			var mine_ok: bool = read.call(r_names[1]) == mine_text[1]
+			var theirs_ok: bool = read.call(r_names[2]) == mate_text[2]
+			var asked := "\n".join(_selftest_shown)
+			var told_ok: bool = asked.contains("Perforce won't take this submit yet. These 3 files") \
+					and asked.contains("changed the same lines of 'res://%s'" % r_names[1]) \
+					and asked.contains("This kind of file can't be combined") \
+					and asked.contains("take your teammate's version")
+			var none_left: bool = _unresolved_in(_parse_ztag(await _p4_exec(["-ztag", "resolve", "-n"]))).is_empty() \
+					and _selftest_option_picks.is_empty() and _last_submit_outcome == ""
+			_log("[selftest] staged=%s combined keeps both=%s clash kept mine=%s binary took theirs=%s dialogs=%s nothing left=%s" \
+					% [staged, combined_ok, mine_ok, theirs_ok, told_ok, none_left])
+
+			# The panel's model marks a waiting file and stops marking a resolved one.
+			await _do_checkout("res://main.gd")
+			var model: Dictionary = await _query_pending_model()
+			var marked := 0
+			for cl in model.changelists:
+				for mf in cl.files:
+					if bool(mf.unresolved):
+						marked += 1
+			await _p4_exec_logged(["revert", ProjectSettings.globalize_path("res://main.gd")])
+			await _submit_changelist("default", [], "P4Godot selftest: resolved and submitted")
+			var sent: bool = _last_submit_outcome == "submitted"
+			_log("[selftest] panel marks no resolved file as waiting=%s; submit after resolving went through=%s" \
+					% [marked == 0, sent])
+			var r_del := PackedStringArray(["delete"])
+			for n: String in r_names:
+				r_del.append(ProjectSettings.globalize_path("res://" + n))
+			await _p4_exec_logged(r_del)
+			await _submit_changelist("default", [], "P4Godot selftest: resolve cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] opened-after=%d" % left)
+			_log("[selftest] %s: resolve-live" % ("PASS" if staged and combined_ok and mine_ok \
+					and theirs_ok and told_ok and none_left and marked == 0 and sent and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-submit-behind-live":
 			# Live and DESTRUCTIVE (use tools/run-live-tests.sh: it needs the
 			# second user "mate" with workspace mate-ws at $P4TEST_MATE_WS).
@@ -9744,7 +10059,9 @@ func _run_cli_self_test_if_requested() -> void:
 			var changes_before := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending", "-c", _p4_client])).size()
 			_selftest_shown.clear()
 			_last_submit_outcome = ""
+			_selftest_auto_answer = "cancel" # "Not Now" to combining; resolve-live says yes
 			await _submit_changelist("default", [], "P4Godot selftest: must not be sent")
+			_selftest_auto_answer = "confirm"
 			var changes_after := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending", "-c", _p4_client])).size()
 			var told := "" if _selftest_shown.is_empty() else String(_selftest_shown[0])
 			var ok: bool = staged and _selftest_shown.size() == 1 \
@@ -9755,6 +10072,25 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] teammate submitted first=%s; submit refused up front naming only that file=%s; no changelist created=%s" \
 					% [staged, _selftest_shown.size() == 1 and told.contains(names[0]) and not told.contains(names[1]),
 					changes_before == changes_after])
+			# Once their version is fetched, the panel marks that file - and only
+			# that file - as waiting, and its menu offers Resolve.
+			await _safe_sync(PackedStringArray([_project_scope()]))
+			var behind_model: Dictionary = await _query_pending_model()
+			var marked: Array = []
+			for cl in behind_model.changelists:
+				for mf in cl.files:
+					if bool(mf.unresolved):
+						marked.append(String(mf.res_path))
+			_populate_context_menu({"type": "file", "res_path": "res://" + names[0],
+					"change": "default", "unresolved": true})
+			var with_item := _selftest_menu_labels()
+			_populate_context_menu({"type": "file", "res_path": "res://" + names[1],
+					"change": "default", "unresolved": false})
+			var marks_ok: bool = marked == ["res://" + names[0]] \
+					and with_item.begins_with("Resolve... | Open") \
+					and not _selftest_menu_labels().contains("Resolve")
+			_log("[selftest] panel marks only the file that needs resolving, and offers Resolve on it: %s" % marks_ok)
+			ok = ok and marks_ok
 			for n: String in names:
 				await _p4_exec_logged(["revert", ProjectSettings.globalize_path("res://" + n)])
 			await _p4_exec(["sync", "-s", _project_scope()])

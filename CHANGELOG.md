@@ -4,6 +4,16 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **Resolve, inside Godot.** When a teammate submits a newer version of a
+  file you have checked out, the two versions have to be combined before
+  you can submit. P4Godot now does that: per file you choose **Combine both
+  versions** (text files, when you didn't both change the same lines),
+  **Keep mine** or **Take theirs**. Files that need it are marked "needs
+  resolve" in the P4G panel with **Resolve...** on their right-click menu,
+  Get Latest leads into it, and so does a Submit that finds out-of-date
+  files. It used to end at "do it in P4V". Merging the same lines by hand
+  still needs P4V.
+
 - **P4Godot checks that Perforce skips Godot's `.godot` folder.** At
   startup, if no ignore rule covers it, P4Godot offers to add `.godot/` to
   the ignore file - checking the file out, or creating it. It also notices
