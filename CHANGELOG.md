@@ -4,6 +4,52 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **A moved file keeps its history even when you also changed it.** Moves
+  are now recorded by naming both paths to Perforce (`p4 edit` +
+  `p4 move -k`). Before, Perforce was left to match the old and new file by
+  content, and for a binary file that had been moved and changed it recorded
+  a delete and an unrelated add.
+- **A rename that only changes capital letters is explained.** A server
+  that ignores case can't record `Hero.png` → `hero.png`; it refused without
+  an error and the rename stayed on your disk only. P4Godot now says so, why
+  it matters on macOS, Linux and in exports, and how to do it in two steps.
+- **Submit names out-of-date files before sending anything.** If a teammate
+  submitted a newer version of a file in your changelist, the dialog lists
+  those files and what to do, before it asks for a description. It used to
+  be the server's refusal after the fact.
+- **Diff vs Depot no longer calls a changed file identical.** For a file
+  changed on disk but not checked out - the files Reconcile finds - the
+  dialog said it was identical to the server's version. It now shows the
+  differences. The same wrong answer came up with an external diff tool
+  configured (`P4DIFF`), and for a file deleted from disk; both fixed. A
+  file that isn't on the server yet says so, and an answer from Perforce
+  that P4Godot can't read is reported as such instead of as "identical".
+- **Reverting a moved file undoes the move.** Reverting the old path of a
+  move used to do nothing and say nothing: Perforce refuses it without
+  reporting an error. Reverting either path now asks "Undo the move of A to
+  B?" and puts the file back, together with its `.import` or `.uid`.
+- **Revert works on a file that isn't checked out.** If it was changed or
+  deleted on your computer, Revert offers to put back the version you
+  downloaded. If it matches, it says there is nothing to throw away.
+- **Deleting a file you had just moved** now marks the original for delete.
+  It used to bring the file back under its old name.
+- **Mark for Add explains itself.** A file your ignore rules leave out used
+  to be skipped silently; now a message names the rule. A file already in
+  Perforce says so. Adding several files gives one summary.
+- **An expired password can be changed inside Godot.** When the server
+  refuses everything because your password has expired, or an admin asked
+  for it to be changed, P4Godot asks for the current password and a new one,
+  changes it and logs you in. Before, every action failed with the server's
+  message in the Log and nothing else, and the login prompt could not get
+  past it.
+- For contributors: `tools/run-live-tests.sh` starts a throwaway Perforce
+  server on this machine (`tools/p4-test-server.sh`, a pinned `p4d` download
+  checked against Perforce's published checksum) and runs the tests that need
+  a real server there, as an ordinary user. This includes two cases that had
+  never been run: a submit that waits at a slow server trigger, and Cancel
+  pressed after every file was sent - the server finishes that submit
+  alone, and P4Godot reports "too late to cancel" with the change number.
+
 - **Submit and Get Latest show their progress, and can be cancelled.** A
   window shows how many files and how much data have moved, the file in
   hand, and the time taken. It isn't modal: the editor stays usable, and

@@ -3,3 +3,6 @@
 
 # Godot editor cache
 .godot/
+
+# Downloaded test tools (tools/p4-test-server.sh)
+.cache/

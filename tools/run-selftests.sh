@@ -11,7 +11,7 @@
 cd "$(dirname "$0")/.." || exit 1
 
 GODOT="${1:-${GODOT:-godot}}"
-TESTS="parse-ztag sync-report submit-verdict save-guards prewrite unchanged-save exec-quoting
+TESTS="parse-ztag sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
 diff-align dismiss-dialog build-change-spec fs-menu fstat-summary delete-action
 connection-store connection-dialogs progress streamed-exec breaker"
 

@@ -396,6 +396,9 @@ const P4_PATH_SETTING := "perforce/executable_path"
 var _p4_version: float = 0.0
 # The last connection probe's p4 output, for setup prompts that quote it.
 var _last_probe_text: String = ""
+## Whether the server treats "Hero.png" and "hero.png" as one file (`p4 info`'s
+## caseHandling). Windows and macOS servers do; Linux servers usually don't.
+var _server_folds_case: bool = false
 
 var _override_port: String = ""
 var _override_user: String = ""
@@ -535,6 +538,10 @@ var _shader_files_dirty: bool = true
 # CLI self-test only: "confirm"/"decline" auto-answers dialogs by emitting the
 # same signal a real button click would (see the self-test section below).
 var _selftest_auto_answer: String = ""
+## Self-tests only: text to type into the next input dialogs, first in first
+## out, and every alert and confirmation shown so far.
+var _selftest_typed: Array = []
+var _selftest_shown: Array = []
 ## True while a --p4-selftest-* run is driving the plugin. Startup prompts and
 ## the focus-in scan stay out of the way so a test sees only its own actions.
 var _selftest_mode: bool = false
@@ -686,12 +693,16 @@ func _probe_connection() -> String:
 	var info: Dictionary = {} if records.is_empty() else records[0]
 	_p4_user = String(info.get("userName", ""))
 	_p4_port = String(info.get("serverAddress", ""))
+	_server_folds_case = String(info.get("caseHandling", "")) == "insensitive"
 	var client := String(info.get("clientName", ""))
 	var root := String(info.get("clientRoot", ""))
 	if client == "*unknown*" or client.is_empty() or not _project_inside_root(root):
 		# `p4 info` works without a ticket but listing workspaces doesn't, so
 		# log in before the workspace picker - or it finds nothing.
-		if _looks_like_login_error(await _p4_exec(["login", "-s"], false)):
+		var ticket: Dictionary = await _p4_exec(["login", "-s"], false)
+		if _looks_like_password_expired(ticket):
+			return "password expired"
+		if _looks_like_login_error(ticket):
 			return "not logged in"
 		return "no client"
 	_p4_client = client
@@ -830,6 +841,10 @@ func _offer_connection_setup() -> void:
 			continue
 		if status == "not logged in":
 			if not await _login_flow():
+				break
+			continue
+		if status == "password expired":
+			if not await _change_password_flow():
 				break
 			continue
 		if status == "no client":
@@ -1000,6 +1015,9 @@ func _login_flow() -> bool:
 		if result.exit_code == 0:
 			_log("Logged in to Perforce as %s." % who)
 			return true
+		if _looks_like_password_expired(result):
+			# Logging in again can't fix this one; only a new password does.
+			return await _change_password_flow()
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
 		if msg.contains("doesn't exist"):
 			# Wrong Perforce user (e.g. the OS username default). Let them fix
@@ -1045,10 +1063,98 @@ func _looks_like_login_error(result: Dictionary) -> bool:
 	return false
 
 
+## The server's answer to every command, `login` included, once a password has
+## expired or an admin ran `p4 admin resetpassword` (measured on a 2026.1
+## server). Only `p4 passwd` gets past it, so this is not a login error:
+## asking for the same password again can never work.
+func _looks_like_password_expired(result: Dictionary) -> bool:
+	if int(result.get("exit_code", 0)) == 0:
+		return false
+	for chunk in result.get("output", []):
+		if String(chunk).contains("Your password has expired"):
+			return true
+	return false
+
+
+## What `p4 passwd` said, without the prompts it echoes before its answer
+## ("Enter old password: ", "Enter new password: ", ...).
+func _passwd_answer(output_text: String) -> String:
+	var lines: Array = []
+	for raw in output_text.split("\n"):
+		var line := String(raw).strip_edges()
+		if line.is_empty() or line.ends_with("password:"):
+			continue
+		lines.append(line)
+	return "\n".join(lines)
+
+
+## Choose a new Perforce password from inside the editor, then log in with
+## it. Returns true once the server has accepted both. A Godot-only user may
+## have no P4V and no terminal habit, so this can't just point them elsewhere.
+func _change_password_flow() -> bool:
+	var who := _p4_user if not _p4_user.is_empty() else \
+			(_override_user if not _override_user.is_empty() else "your Perforce user")
+	var where := "" if _p4_port.is_empty() else (" on %s" % _p4_port)
+	while true:
+		var old: Dictionary = await _show_input_dialog("P4 Password Expired",
+				("Your Perforce password%s has expired. The server refuses everything " +
+				"until you choose a new one.\n\nCurrent password for %s:") % [where, who],
+				"", false, "Next", true)
+		if not old.ok:
+			return false
+		var fresh: Dictionary = await _show_input_dialog("P4 Password Expired",
+				"New password for %s:" % who, "", false, "Next", true)
+		if not fresh.ok:
+			return false
+		var again: Dictionary = await _show_input_dialog("P4 Password Expired",
+				"Type the new password once more:", "", false, "Change Password", true)
+		if not again.ok:
+			return false
+		if String(fresh.text) != String(again.text):
+			await _show_alert("The two new passwords didn't match, so nothing was changed. Try again.")
+			continue
+		var result: Dictionary = await _p4_exec_spec(["passwd"],
+				"%s\n%s\n%s\n" % [String(old.text), String(fresh.text), String(fresh.text)])
+		var answer := _passwd_answer("" if result.output.is_empty() else String(result.output[0]))
+		if result.exit_code != 0 or not answer.contains("Password updated"):
+			await _show_alert(("Perforce didn't change your password:\n\n%s\n\nNothing was " +
+					"changed. You can try again.") % answer)
+			continue
+		# A new password ends every ticket the old one issued (measured), so
+		# log in straight away instead of prompting for what was just typed.
+		var login: Dictionary = await _p4_exec_spec(["login"], String(fresh.text) + "\n")
+		if login.exit_code != 0:
+			await _show_alert("Perforce changed your password, but logging in with it failed. " +
+					"Press Refresh in the P4G panel and log in with the new password.")
+			return false
+		_log("Changed the Perforce password for %s and logged in." % who)
+		return true
+	return false # unreachable; while-true exits via return
+
+
+## Auto-prompt wrapper for an expired password met mid-session. Shares the
+## login prompt's single-flight flags: one prompt at a time, and a cancel
+## silences both until the user presses Refresh.
+func _offer_password_change() -> void:
+	if _login_prompt_active or _login_declined or _setup_active or _shutting_down:
+		return
+	_login_prompt_active = true
+	if await _change_password_flow():
+		_p4_available = true
+		_update_conn_status()
+		_request_refresh()
+	else:
+		_login_declined = true
+		_log("The password change didn't finish - Perforce operations will fail until it does. Press Refresh to try again.")
+	_login_prompt_active = false
+
+
 ## Called after every plain p4 result: a dead-ticket failure pops one re-login
 ## prompt. (Spec-stdin commands skip this - `p4 login` itself is one of them.)
 func _maybe_offer_login(result: Dictionary) -> void:
-	if _looks_like_login_error(result):
+	if _looks_like_password_expired(result):
+		_offer_password_change()
+	elif _looks_like_login_error(result):
 		_offer_login()
 
 
@@ -3236,9 +3342,31 @@ func _diff_path(res_path: String) -> void:
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
 	var local_path := ProjectSettings.globalize_path(res_path)
-	var result := await _p4_exec(["diff", "-dul", local_path])
+	# -f: compare files that aren't checked out too. Without it p4 answers
+	# "file(s) not opened on this client" for a file changed on disk but not
+	# checked out - the files Reconcile finds - and that read as "identical".
+	if not FileAccess.file_exists(local_path):
+		# p4 prints the file's header and no difference for a file that is
+		# gone from disk (deleted, opened for delete, the old half of a move).
+		await _show_alert("'%s' isn't on your computer any more - it was deleted or moved - so there's nothing to compare." % res_path)
+		return
+	# -E P4DIFF=: with an external diff tool configured, p4 hands the files to
+	# that tool and prints only the header, which reads as "no difference".
+	var result := await _p4_exec(["-E", "P4DIFF=", "diff", "-f", "-dul", local_path])
 	var text := "" if result.output.is_empty() else String(result.output[0])
-	if not _diff_has_changes(text):
+	var verdict := _diff_verdict(text, int(result.exit_code))
+	if verdict == "unknown" and (text.contains("Usage:") or text.contains("Invalid option")):
+		# A p4 too old for -E: ask the plain way.
+		result = await _p4_exec(["diff", "-f", "-dul", local_path])
+		text = "" if result.output.is_empty() else String(result.output[0])
+		verdict = _diff_verdict(text, int(result.exit_code))
+	if verdict == "new":
+		await _show_alert("'%s' isn't on the Perforce server yet, so there's no earlier version to compare it with." % res_path)
+		return
+	if verdict == "unknown":
+		await _show_alert("Godot couldn't compare '%s' with the server's version. Press \"Log\" in the P4G panel to see what Perforce said." % res_path)
+		return
+	if verdict == "same":
 		await _show_alert("'%s' is identical to the version you downloaded from the server - there's nothing to compare." % res_path)
 		return
 	if text.contains("files differ"):
@@ -3366,6 +3494,21 @@ func _diff_has_changes(text: String) -> bool:
 		if line.begins_with("@@"):
 			return true
 	return false
+
+
+## What `p4 diff -f -dul <one file>` found: "changed", "same" (p4 printed the
+## file's header and no hunk), "new" (the file was never downloaded from the
+## server - untracked, or opened for add), or "unknown" for anything else.
+## "same" needs the header as proof: p4 exits 0 on its refusals, so an answer
+## this doesn't recognise must not be read as "no difference".
+func _diff_verdict(text: String, exit_code: int) -> String:
+	if _diff_has_changes(text):
+		return "changed"
+	if text.contains("file(s) not on client"):
+		return "new"
+	if exit_code == 0 and _diff_depot_path(text, "").begins_with("//"):
+		return "same"
+	return "unknown"
 
 
 ## The depot path from the diff's "--- //depot/...<TAB>date" header line.
@@ -4052,17 +4195,151 @@ func _get_selected_res_path() -> String:
 ## user must not lose work in a file they didn't mean to touch. Shared by the
 ## toolbar "Revert Selected File" button and the tree's per-row context menu.
 func _revert_path(res_path: String) -> void:
-	var proceed: bool = await _show_confirm_dialog(
-			("Throw away your changes to '%s'?\n\nPerforce puts this file back to the " +
+	# A moved file is two records, the old path (move/delete) and the new one
+	# (move/add). p4 undoes both when asked to revert the new path, and refuses
+	# the old one alone with "has been moved, not reverted" and exit 0. So a
+	# move is always reverted through its new path.
+	var rec := await _fetch_fstat_record(res_path)
+	var action := String(rec.get("action", ""))
+	if action.is_empty():
+		await _revert_unopened(res_path, rec)
+		return
+	var targets := PackedStringArray([ProjectSettings.globalize_path(res_path)])
+	var old_res := ""
+	var new_res := ""
+	if action == "move/delete" or action == "move/add":
+		var other := await _other_half_of_move(rec)
+		if other.is_empty():
+			await _show_alert(("'%s' is half of a move, and Godot couldn't find the other " +
+					"half, so it left both alone. Press \"Log\" in the P4G panel to see what " +
+					"Perforce said.") % res_path)
+			return
+		if action == "move/delete":
+			old_res = res_path
+			new_res = String(other.res_path)
+			targets[0] = String(other.depot_path)
+		else:
+			old_res = String(other.res_path)
+			new_res = res_path
+	# The .import / .uid Godot keeps beside a file goes back with it. Left
+	# behind after an undone move, it would sit at the new path with nothing
+	# to describe, and Godot would write a fresh one at the old path.
+	var companions: Array = []
+	for sidecar: String in _sidecars_of(res_path):
+		var side_rec := await _fetch_fstat_record(sidecar)
+		var side_action := String(side_rec.get("action", ""))
+		if side_action.is_empty():
+			continue
+		if side_action == "move/delete":
+			var side_other := await _other_half_of_move(side_rec)
+			if side_other.is_empty():
+				continue
+			targets.append(String(side_other.depot_path))
+		else:
+			targets.append(ProjectSettings.globalize_path(sidecar))
+		companions.append(sidecar.get_file())
+	var question := ("Throw away your changes to '%s'?\n\nPerforce puts this file back to the " +
 			"version on the server. Everything you changed is lost - what you saved as " +
-			"well as anything unsaved in the editor - and this can't be undone.") % res_path,
-			"Throw Away My Changes", "Cancel")
+			"well as anything unsaved in the editor - and this can't be undone.") % res_path
+	if not new_res.is_empty():
+		question = ("Undo the move of '%s' to '%s'?\n\nPerforce puts the file back at its " +
+				"old place with the version on the server, and removes it from the new " +
+				"place. Everything you changed in it is lost - what you saved as well as " +
+				"anything unsaved in the editor - and this can't be undone.") % [old_res, new_res]
+	if not companions.is_empty():
+		question += "\n\nThe same goes for %s, which Godot keeps beside it." % " and ".join(companions)
+	var proceed: bool = await _show_confirm_dialog(question,
+			"Undo Move" if not new_res.is_empty() else "Throw Away My Changes", "Cancel")
 	if not proceed:
 		_log("Revert of '%s' cancelled." % res_path)
 		return
-	await _p4_exec_logged(["revert", ProjectSettings.globalize_path(res_path)])
-	_checked_out_this_session.erase(res_path)
+	var result := await _p4_exec_logged(PackedStringArray(["revert"]) + targets)
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	if not _revert_did_something(text, int(result.exit_code)):
+		_request_refresh()
+		await _show_alert(("Perforce didn't revert '%s'. Nothing was changed. Press \"Log\" in " +
+				"the P4G panel to see what it said.") % res_path)
+		return
+	_forget_path(res_path)
+	for sidecar: String in _sidecars_of(res_path):
+		_forget_path(sidecar)
+	if new_res.is_empty():
+		await _reload_path(res_path)
+		return
+	_forget_path(old_res)
+	_forget_path(new_res)
+	EditorInterface.get_resource_filesystem().scan()
+	_request_refresh()
+
+
+## "Revert" on a file that isn't checked out. There is nothing for p4 revert
+## to do, but the user may still have something to throw away: a file changed
+## or deleted on disk without a checkout (a save outside Godot, or with
+## checkout on save turned off). `p4 sync -f <file>#have` puts back the version
+## that was downloaded.
+func _revert_unopened(res_path: String, rec: Dictionary) -> void:
+	var depot := String(rec.get("depotFile", ""))
+	if depot.is_empty() or not String(rec.get("haveRev", "")).is_valid_int():
+		await _show_alert(("'%s' isn't on the Perforce server, so there's no earlier version " +
+				"to go back to.") % res_path)
+		return
+	var global_path := ProjectSettings.globalize_path(res_path)
+	var missing := not FileAccess.file_exists(global_path)
+	if not missing:
+		var diff := await _p4_exec(["-E", "P4DIFF=", "diff", "-f", "-dul", global_path])
+		var verdict := _diff_verdict("" if diff.output.is_empty() else String(diff.output[0]),
+				int(diff.exit_code))
+		if verdict == "same":
+			await _show_alert(("'%s' isn't checked out and matches the version you downloaded, " +
+					"so there's nothing to throw away.") % res_path)
+			return
+		if verdict != "changed":
+			await _show_alert(("'%s' isn't checked out, and Godot couldn't tell whether it " +
+					"differs from the version you downloaded. Press \"Log\" in the P4G panel " +
+					"to see what Perforce said.") % res_path)
+			return
+	var proceed: bool = await _show_confirm_dialog(
+			(("'%s' was deleted from your computer." if missing
+			else "'%s' was changed on your computer without being checked out.") +
+			"\n\nPut back the version you downloaded from the server? " +
+			"Your changes to it are lost, and this can't be undone.") % res_path,
+			"Put It Back", "Cancel")
+	if not proceed:
+		_log("Revert of '%s' cancelled." % res_path)
+		return
+	var result := await _p4_exec_logged(["sync", "-f", depot + "#have"])
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	if int(result.exit_code) != 0 or not (text.contains(" - refreshing ") or text.contains(" - added as ")):
+		await _show_alert(("Perforce didn't put '%s' back. Press \"Log\" in the P4G panel to " +
+				"see what it said.") % res_path)
+		return
+	_forget_path(res_path)
+	EditorInterface.get_resource_filesystem().scan()
 	await _reload_path(res_path)
+
+
+## The other record of a move, from one half's fstat record: {res_path,
+## depot_path}, or {} when it can't be found. `movedFile` is a depot path.
+func _other_half_of_move(rec: Dictionary) -> Dictionary:
+	var depot := String(rec.get("movedFile", ""))
+	if depot.is_empty():
+		return {}
+	var recs := _parse_ztag(await _p4_exec(["-ztag", "fstat", depot]))
+	if recs.is_empty():
+		return {}
+	var local := String(recs[0].get("clientFile", ""))
+	if local.is_empty():
+		return {}
+	var res := _local_to_res(local)
+	return {"res_path": res if not res.is_empty() else local, "depot_path": depot}
+
+
+## Whether `p4 revert`'s answer shows a file actually reverted. p4 exits 0 when
+## it refuses ("has been moved, not reverted", "file(s) not opened on this
+## client"), so the exit code alone proves nothing.
+func _revert_did_something(text: String, exit_code: int) -> bool:
+	# Every file p4 reverts gets a "<file> - was <action>, <what happened>" line.
+	return exit_code == 0 and not text.contains("not reverted") and text.contains(" - was ")
 
 
 ## Sync res_path to the head revision and reload it from disk. Shared by the
@@ -5574,6 +5851,30 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	if files.is_empty():
 		await _show_alert("This changelist has no files to submit.")
 		return
+	# The server refuses the whole submit if a teammate got a newer version of
+	# any file in first. Say which files before asking for a description,
+	# instead of after a numbered changelist exists and the submit has failed.
+	var behind := _out_of_date_in(_parse_ztag(await _p4_exec(["-ztag", "fstat", "-Ro",
+			"-e", change, "-T", "depotFile,headRev,haveRev,action,unresolved",
+			_project_scope() if change == "default" else "//%s/..." % _p4_client])))
+	if not behind.is_empty():
+		var labels := {}
+		for f in files:
+			labels[String(f.depot_path)] = String(f.label)
+		var lines: Array = []
+		for depot: String in behind.slice(0, 12):
+			lines.append("    " + String(labels.get(depot, depot)))
+		if behind.size() > 12:
+			lines.append("    ...and %d more" % (behind.size() - 12))
+		await _show_alert(("Perforce won't take this submit yet. %s changed on the server " +
+				"after you downloaded %s:\n\n%s\n\nA teammate submitted a newer version first, " +
+				"so their changes and yours have to be combined before yours can go in. " +
+				"Nothing was sent.\n\nPress \"Get Latest\" in the P4G panel, then combine the " +
+				"two versions in P4V (right-click the file there and choose \"Resolve " +
+				"Files...\"), and submit again.") % [
+				"This file" if behind.size() == 1 else "These %d files" % behind.size(),
+				"it" if behind.size() == 1 else "them", "\n".join(lines)])
+		return
 
 	var desc := ""
 	if change == "default":
@@ -5932,6 +6233,28 @@ func _submit_outcome_text(outcome: String, number: String, final: String, said: 
 			"not submitted - submit it again. If it isn't, the submit went through. " +
 			"(`p4 describe -s %s` in a terminal answers the same question.)") \
 			% [said, number, number]
+
+
+## Depot paths of the opened files in `fstat` records that the server would
+## refuse in a submit: an older revision than the server's newest, or a
+## merge still waiting (`unresolved`). A file being added has nothing older to
+## be behind.
+func _out_of_date_in(records: Array) -> Array:
+	var behind: Array = []
+	for rec in records:
+		var depot := String(rec.get("depotFile", ""))
+		if depot.is_empty():
+			continue
+		if rec.has("unresolved"):
+			behind.append(depot)
+			continue
+		if String(rec.get("action", "")) in ["add", "move/add", "branch", "import"]:
+			continue
+		var head := String(rec.get("headRev", ""))
+		var have := String(rec.get("haveRev", ""))
+		if head.is_valid_int() and have.is_valid_int() and int(have) < int(head):
+			behind.append(depot)
+	return behind
 
 
 ## The files a submit will include, queried fresh: the default changelist's
@@ -6510,6 +6833,9 @@ const P4_PROGRESS_MIN_VERSION := 2021.1
 
 ## Self-tests only (see the lambda in _p4_exec_streamed).
 var _selftest_cancel_on_progress: bool = false
+## Self-tests only: press Cancel once p4 reports every file sent - the server
+## then has the whole submit and only its triggers and commit are left.
+var _selftest_cancel_when_sent: bool = false
 ## How the last _submit_changelist ended: "submitted", "not_submitted" or
 ## "unknown" ("" before any submit). For self-tests; nothing else reads it.
 var _last_submit_outcome: String = ""
@@ -6558,6 +6884,10 @@ func _p4_exec_streamed(args: PackedStringArray, tracker: P4Progress) -> Dictiona
 		# Self-tests only: press Cancel the moment the transfer is under way.
 		if _selftest_cancel_on_progress and tracker.reporting:
 			_selftest_cancel_on_progress = false
+			_cancel_streamed()
+		if _selftest_cancel_when_sent and tracker.reporting and tracker.in_flight() == 0 \
+				and tracker.files_done >= tracker.expected_files():
+			_selftest_cancel_when_sent = false
 			_cancel_streamed())
 	_streamed_req = req
 	_p4_inflight += 1
@@ -6792,6 +7122,10 @@ func _p4_worker_loop() -> void:
 			req.exit_code = OS.execute(req.bin, _os_args(req.args), output, true)
 		else:
 			req.exit_code = _p4_execute_with_stdin(req.bin, req.args, req.stdin_path, output)
+			# Here, not only on the main thread after the await: the file can
+			# hold a password, and an editor quit mid-command never resumes
+			# that await.
+			DirAccess.remove_absolute(req.stdin_path)
 		req.output = output
 		req.call_deferred("_finish")
 
@@ -6910,6 +7244,8 @@ static func _decode_p4_bytes(bytes: PackedByteArray) -> String:
 func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) -> bool:
 	if _shutting_down:
 		return false # A continuation resumed mid-teardown - nobody left to ask.
+	if _selftest_mode:
+		_selftest_shown.append(text)
 	while _dialog_busy:
 		await get_tree().process_frame
 	_dialog_busy = true
@@ -7013,6 +7349,8 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
 		if is_instance_valid(dialog):
+			if not _selftest_typed.is_empty():
+				input.text = String(_selftest_typed.pop_front())
 			if _selftest_auto_answer == "confirm":
 				dialog.confirmed.emit()
 			elif _selftest_auto_answer == "extra" and not extra_text.is_empty():
@@ -7214,6 +7552,8 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 ## fight over the pending-result state.
 func _show_alert(text: String) -> void:
 	_log(text.replace("\n\n", "\n"))
+	if _selftest_mode:
+		_selftest_shown.append(text)
 	if _shutting_down:
 		return # Logged above; no dialog mid-teardown.
 	while _dialog_busy:
@@ -7513,8 +7853,47 @@ func _ctx_checkout(paths: PackedStringArray) -> void:
 
 
 func _ctx_add(paths: PackedStringArray) -> void:
-	for res in _fs_files_only(paths):
-		await _add_path(res)
+	var files := _fs_files_only(paths)
+	if files.size() == 1:
+		await _add_path(files[0])
+		return
+	# Several files: one summary at the end, not a dialog per file.
+	var by_outcome := {"added": [], "ignored": [], "tracked": [], "failed": []}
+	for res in files:
+		var outcome := await _add_path(res, false)
+		if outcome.is_empty():
+			return # not connected; already said so
+		by_outcome[outcome].append(res)
+	var summary := _add_summary_text(by_outcome)
+	if not summary.is_empty():
+		await _show_alert(summary)
+
+
+## What to tell the user after Mark for Add on several files, or "" when
+## every one of them was added and there is nothing to explain.
+func _add_summary_text(by_outcome: Dictionary) -> String:
+	var added: Array = by_outcome.get("added", [])
+	var parts: Array = []
+	var notes := {
+		"ignored": "Left out by your ignore rules",
+		"tracked": "Already in Perforce, so there was nothing to add",
+		"failed": "Refused by Perforce (press \"Log\" in the P4G panel to see why)",
+	}
+	for key: String in ["ignored", "tracked", "failed"]:
+		var names: Array = by_outcome.get(key, [])
+		if names.is_empty():
+			continue
+		var shown: Array = names.slice(0, 8)
+		var lines := "\n".join(shown.map(func(n: Variant) -> String: return "    " + String(n)))
+		if names.size() > shown.size():
+			lines += "\n    ...and %d more" % (names.size() - shown.size())
+		parts.append("%s (%d):\n%s" % [notes[key], names.size(), lines])
+	if parts.is_empty():
+		return ""
+	return "Marked %d of %d files for add.\n\n%s" % [added.size(),
+			added.size() + int(by_outcome.get("ignored", []).size())
+			+ int(by_outcome.get("tracked", []).size()) + int(by_outcome.get("failed", []).size()),
+			"\n\n".join(parts)]
 
 
 func _ctx_sync(paths: PackedStringArray) -> void:
@@ -7542,14 +7921,59 @@ func _ctx_status(paths: PackedStringArray) -> void:
 	await _status_to_log(_fs_files_only(paths))
 
 
-## Open res_path for add (`p4 add`). No-ops (with a p4 message) on already-tracked
-## files. Refreshes the changelist tree.
-func _add_path(res_path: String) -> void:
+## Open res_path for add (`p4 add`) and return what happened ("added",
+## "ignored", "tracked", "failed", or "" when not connected). With `report`
+## it explains anything but "added" in a dialog; a caller adding many files
+## passes false and reports once.
+func _add_path(res_path: String, report: bool = true) -> String:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
-		return
-	await _p4_exec_logged(["add", ProjectSettings.globalize_path(res_path)])
+		return ""
+	var global_path := ProjectSettings.globalize_path(res_path)
+	var result := await _p4_exec_logged(["add", global_path])
 	_request_refresh()
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	var outcome := _add_outcome(text, int(result.exit_code))
+	if not report:
+		return outcome
+	if outcome == "ignored":
+		# p4 prints "opened for add" and then refuses, so say which rule did it.
+		var why: Dictionary = await _p4_exec(["ignores", "-i", "-v", global_path])
+		var rule := _ignore_rule_in("" if why.output.is_empty() else String(why.output[0]))
+		await _show_alert(("Perforce didn't add '%s': your ignore rules say to leave it out.%s\n\n" +
+				"Nothing was changed. If this file does belong on the server, change that " +
+				"rule first, then mark the file for add again.") % [res_path,
+				"" if rule.is_empty() else "\n\nThe rule: %s" % rule])
+	elif outcome == "tracked":
+		await _show_alert("'%s' is already in Perforce, so there's nothing to add." % res_path)
+	elif outcome == "failed":
+		await _show_alert(("Perforce didn't add '%s'. Press \"Log\" in the P4G panel to see " +
+				"what it said.") % res_path)
+	return outcome
+
+
+## What `p4 add <one file>` did: "added", "ignored" (P4IGNORE covers the file;
+## p4 prints a misleading "opened for add" line first and then refuses),
+## "tracked" (already on the server; p4 exits 0), or "failed".
+func _add_outcome(text: String, exit_code: int) -> String:
+	if text.contains("ignored file can't be added"):
+		return "ignored"
+	if text.contains("can't add existing file") or text.contains("can't add (already opened"):
+		return "tracked"
+	if exit_code == 0 and (text.contains("opened for add") or text.contains("currently opened for add")):
+		return "added"
+	return "failed"
+
+
+## The "<file>:<line>:<rule>" part of `p4 ignores -i -v`'s
+## "<path> ignored by <file>:<line>:<rule>", or "" when it isn't there.
+func _ignore_rule_in(text: String) -> String:
+	for raw in text.split("\n"):
+		var line := String(raw).strip_edges()
+		var at := line.find(" ignored by ")
+		if at >= 0:
+			return line.substr(at + " ignored by ".length())
+	return ""
 
 
 ## Log a concise Perforce status line for each selected file - a quick read-only
@@ -7741,15 +8165,16 @@ func _handle_fs_delete(res_path: String, is_folder: bool) -> void:
 			"your team when you submit?") % res_path, "Delete in Perforce", "Not Yet"):
 		_log("Left '%s' tracked in Perforce - run Reconcile to record the deletion." % res_path)
 		return
-	await _p4_open_for_delete(res_path, decision)
+	await _p4_open_for_delete(res_path, decision, rec)
 	_forget_path(res_path)
 	# Godot deletes an asset's .import (and a script's .uid) along with it.
 	for sidecar: String in _sidecars_of(res_path):
 		if FileAccess.file_exists(ProjectSettings.globalize_path(sidecar)):
 			continue
-		var side_decision := _delete_action_for(await _fetch_fstat_record(sidecar))
+		var side_rec := await _fetch_fstat_record(sidecar)
+		var side_decision := _delete_action_for(side_rec)
 		if side_decision != "none":
-			await _p4_open_for_delete(sidecar, side_decision)
+			await _p4_open_for_delete(sidecar, side_decision, side_rec)
 			_forget_path(sidecar)
 	_request_refresh()
 
@@ -7773,14 +8198,28 @@ func _handle_fs_move(old_res: String, new_res: String, is_folder: bool) -> void:
 	if not tracked:
 		_log("Moved '%s' -> '%s' - source not tracked by Perforce, nothing to record." % [old_res, new_res])
 		return
+	if _is_case_only_rename(old_res, new_res, _server_folds_case):
+		# Measured: `p4 move` answers "can't move to an existing file" and
+		# exits 0, and two moves in one changelist cancel out to a plain edit.
+		# It takes two submits, so it can't be done behind the user's back.
+		var via := new_res.get_basename() + "_tmp" \
+				+ ("" if new_res.get_extension().is_empty() else "." + new_res.get_extension())
+		await _show_alert(("You renamed '%s' to '%s'. The two names differ only in capital " +
+				"letters, and this Perforce server treats them as the same name, so it can't " +
+				"record the rename. For your team the file keeps its old name.\n\nThat matters: " +
+				"Godot now uses the new name, and on macOS, on Linux and in an exported game the " +
+				"old name no longer matches it.\n\nTo rename it for everyone, do it in two " +
+				"steps: rename it to something else (for example '%s') and submit, then rename " +
+				"that to '%s' and submit again.") % [old_res, new_res, via.get_file(), new_res.get_file()])
+		return
 	if not await _confirm_fs_action(
-			("You moved '%s'\n     -> '%s'.\n\nRecord this as a Perforce move? It preserves the " +
-			"file's history (and falls back to delete + add if the contents changed during the " +
-			"move).") % [old_res, new_res], "Record Move", "Skip"):
+			("You moved '%s'\n     -> '%s'.\n\nRecord this as a Perforce move? Your team then " +
+			"gets the move, and the file keeps its history under the new name.")
+			% [old_res, new_res], "Record Move", "Skip"):
 		_log("Move of '%s' not recorded in Perforce - run Reconcile if you want it tracked." % old_res)
 		return
 	var result := await _p4_record_move(old_res, new_res, is_folder)
-	if result.exit_code != 0:
+	if int(result.moved) == 0:
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
 		await _show_alert(("Couldn't record the move of '%s' in Perforce:\n\n%s\n\nThe files are " +
 				"already moved on disk - use Reconcile to record it.") % [old_res, msg])
@@ -7791,50 +8230,112 @@ func _handle_fs_move(old_res: String, new_res: String, is_folder: bool) -> void:
 	_request_refresh()
 
 
+## A rename that changes nothing but upper and lower case, on a server that
+## ignores case in names.
+func _is_case_only_rename(old_res: String, new_res: String, server_folds_case: bool) -> bool:
+	return server_folds_case and old_res != new_res and old_res.to_lower() == new_res.to_lower()
+
+
 ## How to record a single-file deletion, from its `-ztag fstat` record. Pure, so
 ## a headless self-test can pin the mapping:
 ## - "none":      untracked, or already deleted at head - nothing to do.
 ## - "revert":    only open for add (never in the depot) - undo the pending add.
+## - "unmove":    the new half of a move. Reverting it would bring the file
+##                back at its old path (measured), so forget the move without
+##                touching disk and open the old path for delete.
 ## - "reconcile": tracked (opened for edit or not) but now missing on disk -
 ##                `p4 reconcile -d` records the delete without restoring the file.
 func _delete_action_for(rec: Dictionary) -> String:
 	if rec.is_empty() or not rec.has("depotFile"):
 		return "none"
 	var act := String(rec.get("action", ""))
-	if act == "add" or act == "move/add":
+	if act == "add":
 		return "revert"
+	if act == "move/add":
+		return "unmove"
 	if act == "" and String(rec.get("headAction", "")) in ["delete", "move/delete"]:
 		return "none"
 	return "reconcile"
 
 
-func _p4_open_for_delete(res_path: String, decision: String) -> void:
+func _p4_open_for_delete(res_path: String, decision: String, rec: Dictionary = {}) -> void:
 	var global_path := ProjectSettings.globalize_path(res_path)
 	match decision:
 		"revert":
 			await _p4_exec_logged(["revert", global_path])
+		"unmove":
+			var old_depot := String(rec.get("movedFile", ""))
+			await _p4_exec_logged(["revert", "-k", global_path])
+			if not old_depot.is_empty():
+				await _p4_exec_logged(["delete", "-k", old_depot])
 		"reconcile":
 			await _p4_exec_logged(["reconcile", "-d", global_path])
 
 
-## Record a move via `p4 reconcile -M`, scoped to just the two paths plus their
-## sidecars (or the two subtrees for a folder). Move detection pairs the now-missing source with the
-## new file by content: matched -> a history-preserving move/delete + move/add;
-## unmatched (Godot rewrote it) -> a plain delete + add.
+## Record a move the editor has already made on disk, as a Perforce move:
+## `p4 edit <old>` then `p4 move -k <old> <new>` (-k: don't touch the files, they
+## are already where they belong). A folder is one pair of "/..." paths; a
+## file brings its .import / .uid sidecars. Returns {moved: <files recorded>,
+## exit_code, output}.
+##
+## Why not `reconcile -M`, which this used to be: that guesses the pairing from
+## file content, and for a binary file that was moved and changed it guesses
+## "delete + add" - the history is cut (measured). Naming both paths can't
+## miss. Reconcile stays as the fallback when nothing could be moved.
+##
+## Measured on 2025.2 and 2026.1, all relied on below:
+## - `edit` of a file that has left its old path opens it and then exits 1 on
+##   "chmod: ... cannot find the file". That exit code is not a failure.
+## - `move -k` without the edit answers "not opened on this client", exit 0.
+## - A file opened for add moves as a plain add of the new path.
+## - The moved file keeps the read-only flag it had before the edit, because
+##   p4 never saw it at the new path.
 func _p4_record_move(old_res: String, new_res: String, is_folder: bool) -> Dictionary:
 	var old_g := ProjectSettings.globalize_path(old_res)
 	var new_g := ProjectSettings.globalize_path(new_res)
+	var pairs: Array = []
 	if is_folder:
-		old_g = _as_recursive(old_g)
-		new_g = _as_recursive(new_g)
-		return await _p4_exec_logged(["reconcile", "-M", old_g, new_g])
-	var args: PackedStringArray = ["reconcile", "-M", old_g, new_g]
-	# Godot moved the .import / .uid sidecar too; record it in the same pass.
-	for i in _sidecars_of(old_res).size():
-		var new_side := ProjectSettings.globalize_path(_sidecars_of(new_res)[i])
-		if FileAccess.file_exists(new_side):
-			args.append_array([ProjectSettings.globalize_path(_sidecars_of(old_res)[i]), new_side])
-	return await _p4_exec_logged(args)
+		pairs.append([_as_recursive(old_g), _as_recursive(new_g)])
+	else:
+		pairs.append([old_g, new_g])
+		for i in _sidecars_of(old_res).size():
+			var new_side := ProjectSettings.globalize_path(_sidecars_of(new_res)[i])
+			if FileAccess.file_exists(new_side):
+				pairs.append([ProjectSettings.globalize_path(_sidecars_of(old_res)[i]), new_side])
+	var edit_args := PackedStringArray(["edit"])
+	for pair in pairs:
+		edit_args.append(String(pair[0]))
+	await _p4_exec_logged(edit_args)
+	var moved := 0
+	var said: Array = []
+	for pair in pairs:
+		var result := await _p4_exec_logged(["-ztag", "move", "-k", String(pair[0]), String(pair[1])])
+		said.append("" if result.output.is_empty() else String(result.output[0]).strip_edges())
+		for local in _moved_paths_in(_parse_ztag(result)):
+			moved += 1
+			_set_file_writable(local, true)
+	if moved > 0:
+		return {"exit_code": 0, "output": ["\n".join(said)], "moved": moved}
+	_log("Perforce recorded no move for '%s'; trying Reconcile instead." % old_res)
+	var fallback_args := PackedStringArray(["reconcile", "-M"])
+	for pair in pairs:
+		fallback_args.append_array([String(pair[0]), String(pair[1])])
+	var fallback := await _p4_exec_logged(fallback_args)
+	var text := "" if fallback.output.is_empty() else String(fallback.output[0])
+	var opened: bool = int(fallback.exit_code) == 0 and text.contains(" - opened for ")
+	return {"exit_code": int(fallback.exit_code), "output": fallback.output, "moved": 1 if opened else 0}
+
+
+## The local paths `p4 -ztag move -k` reports as recorded: one record per file,
+## action "move/add" (or "add" when the source was only opened for add).
+## Refusals come back as plain lines with no record, and exit 0.
+func _moved_paths_in(records: Array) -> PackedStringArray:
+	var paths := PackedStringArray()
+	for rec in records:
+		var local := String(rec.get("path", ""))
+		if not local.is_empty() and String(rec.get("action", "")) in ["move/add", "add"]:
+			paths.append(local)
+	return paths
 
 
 ## A local path as a p4 recursive scope (append "/..."), for folder operations.
@@ -8627,6 +9128,8 @@ func _run_cli_self_test_if_requested() -> void:
 				"untracked": [{}, "none"],
 				"tracked": [{"depotFile": "//d/a", "headRev": "3"}, "reconcile"],
 				"opened-add": [{"depotFile": "//d/a", "action": "add"}, "revert"],
+				"moved-here": [{"depotFile": "//d/b", "action": "move/add", "movedFile": "//d/a"}, "unmove"],
+				"moved-away": [{"depotFile": "//d/a", "action": "move/delete", "movedFile": "//d/b"}, "reconcile"],
 				"opened-edit": [{"depotFile": "//d/a", "action": "edit", "headRev": "3"}, "reconcile"],
 				"gone-at-head": [{"depotFile": "//d/a", "headAction": "delete"}, "none"],
 			}
@@ -8734,6 +9237,508 @@ func _run_cli_self_test_if_requested() -> void:
 					and edited.contains("second") and edited.contains("//depot/a") \
 					and not edited.contains("old line")
 			_log("[selftest] %s: build-change-spec" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-p4-answers":
+			# Server-independent: the readers of p4's answers to diff, add,
+			# revert, login and passwd, fed text copied from a 2026.1 server.
+			var hdr := "--- //game/main/a.txt\t2026-10-07 18:28:00.000000000 -0700\n" \
+					+ "+++ C:/ws\\a.txt\t2026-10-07 18:28:00.000000000 -0700\n"
+			var diff_ok: bool = \
+					_diff_verdict(hdr + "@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n", 0) == "changed" \
+					and _diff_verdict(hdr + "(... files differ ...)\n", 0) == "changed" \
+					and _diff_verdict(hdr, 0) == "same" \
+					and _diff_verdict("new.txt - file(s) not on client.\n", 0) == "new" \
+					and _diff_verdict("a.txt - file(s) not opened on this client.\n", 0) == "unknown" \
+					and _diff_verdict("", 0) == "unknown" \
+					and _diff_verdict(hdr, 1) == "unknown"
+			var add_ok: bool = \
+					_add_outcome("//game/main/q.txt#1 - opened for add\n", 0) == "added" \
+					and _add_outcome("//game/main/q.txt#1 - currently opened for add\n", 0) == "added" \
+					and _add_outcome("//game/main/x.log#1 - opened for add\n" \
+						+ "C:/ws\\x.log - ignored file can't be added.\n", 1) == "ignored" \
+					and _add_outcome("//game/main/a.txt - can't add existing file\n", 0) == "tracked" \
+					and _add_outcome("//game/main/b.txt - can't add (already opened for edit)\n" \
+						+ "... //game/main/b.txt - warning: add of existing file\n", 0) == "tracked" \
+					and _add_outcome("", 0) == "failed" \
+					and _add_outcome("Connect to server failed; check $P4PORT.\n", 1) == "failed"
+			var rule_ok: bool = \
+					_ignore_rule_in("C:/ws\\x.log ignored by C:/ws\\.p4ignore:1:*.log\n") \
+						== "C:/ws\\.p4ignore:1:*.log" \
+					and _ignore_rule_in("C:/ws\\a.txt not ignored\n") == ""
+			var revert_ok: bool = \
+					_revert_did_something("//game/main/a.txt#1 - was edit, reverted\n", 0) \
+					and _revert_did_something("//game/main/q.txt#none - was add, abandoned\n", 0) \
+					and _revert_did_something("//game/main/b.txt#1 - was move/delete, reverted\n" \
+						+ "//game/main/b3.txt#none - was move/add, deleted\n", 0) \
+					and not _revert_did_something("//game/main/b.txt#1 - has been moved, not reverted\n", 0) \
+					and not _revert_did_something("b.txt - file(s) not opened on this client.\n", 0) \
+					and not _revert_did_something("", 0) \
+					and not _revert_did_something("//game/main/a.txt#1 - was edit, reverted\n", 1)
+			var expired := {"exit_code": 1, "output": ["Your password has expired, please change your password.\n"]}
+			var dead := {"exit_code": 1, "output": ["Perforce password (P4PASSWD) invalid or unset.\n"]}
+			var pw_ok: bool = _looks_like_password_expired(expired) \
+					and not _looks_like_login_error(expired) \
+					and not _looks_like_password_expired(dead) \
+					and _looks_like_login_error(dead) \
+					and not _looks_like_password_expired({"exit_code": 0, "output": ["Your password has expired"]}) \
+					and _passwd_answer("Enter old password: \r\nEnter new password: \r\n" \
+						+ "Password should be at least 8 characters in length.\r\n") \
+						== "Password should be at least 8 characters in length." \
+					and _passwd_answer("Enter old password: \r\nEnter new password: \r\n" \
+						+ "Re-enter new password: \r\nPassword updated.\r\n") == "Password updated."
+			var moved_recs := [
+				{"clientFile": "//ws/gfx/hero.png", "path": "C:/ws\\gfx\\hero.png", "action": "move/add",
+					"fromFile": "//game/main/art/hero.png"},
+				{"clientFile": "//ws/gfx/new.txt", "path": "C:/ws\\gfx\\new.txt", "action": "add"},
+				{"depotFile": "//game/main/x", "action": "edit"},
+				{},
+			]
+			var move_ok: bool = _moved_paths_in(moved_recs) \
+						== PackedStringArray(["C:/ws\\gfx\\hero.png", "C:/ws\\gfx\\new.txt"]) \
+					and _moved_paths_in([]).is_empty() \
+					and _is_case_only_rename("res://Hero.png", "res://hero.png", true) \
+					and not _is_case_only_rename("res://Hero.png", "res://hero.png", false) \
+					and not _is_case_only_rename("res://Hero.png", "res://Hero.png", true) \
+					and not _is_case_only_rename("res://Hero.png", "res://art/hero.png", true)
+			var behind_ok: bool = _out_of_date_in([
+						{"depotFile": "//d/current", "headRev": "3", "haveRev": "3", "action": "edit"},
+						{"depotFile": "//d/behind", "headRev": "4", "haveRev": "3", "action": "edit"},
+						{"depotFile": "//d/merge", "headRev": "4", "haveRev": "4", "action": "edit", "unresolved": ""},
+						{"depotFile": "//d/new", "action": "add"},
+						{"depotFile": "//d/readd", "headRev": "2", "haveRev": "none", "action": "add"},
+						{"depotFile": "//d/moved", "headRev": "2", "haveRev": "1", "action": "move/add"},
+						{"depotFile": "//d/gone", "headRev": "5", "haveRev": "2", "action": "delete"},
+						{"desc": "try"}, {},
+					]) == ["//d/behind", "//d/merge", "//d/gone"] \
+					and _out_of_date_in([]).is_empty()
+			var all_added := _add_summary_text({"added": ["res://a", "res://b"], "ignored": [],
+					"tracked": [], "failed": []})
+			var mixed := _add_summary_text({"added": ["res://a"], "ignored": ["res://x.log"],
+					"tracked": ["res://t1", "res://t2"], "failed": []})
+			var summary_ok: bool = all_added.is_empty() \
+					and mixed.begins_with("Marked 1 of 4 files for add.") \
+					and mixed.contains("ignore rules (1):\n    res://x.log") \
+					and mixed.contains("(2):\n    res://t1\n    res://t2") \
+					and not mixed.contains("Refused")
+			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s" \
+					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok])
+			_log("[selftest] %s: p4-answers" % ("PASS" if diff_ok and add_ok and rule_ok \
+					and revert_ok and pw_ok and move_ok and behind_ok and summary_ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-file-actions-live":
+			# Live and DESTRUCTIVE (two real submits; use a throwaway server):
+			# Diff vs Depot, Mark for Add and Revert on the files where p4 answers
+			# with a refusal and exit 0. Needs "*.log" in the P4IGNORE file and
+			# nothing opened.
+			_selftest_auto_answer = "confirm"
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: file-actions-live - files already opened; needs a clean workspace")
+				get_tree().quit()
+				return
+			var dir := "res://p4g_file_actions_test"
+			var dir_g := ProjectSettings.globalize_path(dir)
+			DirAccess.make_dir_recursive_absolute(dir_g)
+			for n: String in ["plain.txt", "moved.txt", "ignored.log", "fresh.txt"]:
+				var fw := FileAccess.open(dir_g.path_join(n), FileAccess.WRITE)
+				fw.store_string("one\ntwo\n")
+				fw.close()
+			if not await _p4_path_ignored(dir_g.path_join("ignored.log")):
+				_log("[selftest] FAIL: file-actions-live - '*.log' isn't ignored here; add it to the P4IGNORE file")
+				get_tree().quit()
+				return
+			await _p4_exec_logged(["add", dir_g.path_join("plain.txt"), dir_g.path_join("moved.txt")])
+			await _submit_changelist("default", [], "P4Godot selftest: file actions")
+			var ok := _last_submit_outcome == "submitted"
+
+			# Diff: changed on disk, not checked out.
+			var plain := dir.path_join("plain.txt")
+			var plain_g := dir_g.path_join("plain.txt")
+			_set_file_writable(plain_g, true)
+			var fw2 := FileAccess.open(plain_g, FileAccess.WRITE)
+			fw2.store_string("one\nTWO\n")
+			fw2.close()
+			var bare := await _p4_exec(["diff", "-dul", plain_g])
+			var control: bool = String(bare.output[0]).contains("not opened on this client")
+			_selftest_shown.clear()
+			diff_window.hide()
+			await _diff_path(plain)
+			var diff_ok: bool = diff_window.visible and _selftest_shown.is_empty() \
+					and not _diff_change_blocks.is_empty()
+			diff_window.hide()
+			_log("[selftest] diff of a changed, unopened file: window=%s (without -f p4 says 'not opened': %s)" \
+					% [diff_ok, control])
+			await _p4_exec(["sync", "-f", plain_g])
+			_selftest_shown.clear()
+			await _diff_path(plain)
+			var same_ok: bool = not diff_window.visible and _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("is identical")
+			_selftest_shown.clear()
+			await _diff_path(dir.path_join("fresh.txt"))
+			var new_ok: bool = not diff_window.visible and _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("isn't on the Perforce server yet")
+			_log("[selftest] diff of an unchanged file says identical: %s; of an untracked file says not on server: %s" \
+					% [same_ok, new_ok])
+			ok = ok and control and diff_ok and same_ok and new_ok
+
+			# Mark for Add: ignored, already tracked, and a plain new file.
+			_selftest_shown.clear()
+			await _add_path(dir.path_join("ignored.log"))
+			var ign_ok: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("ignore rules") \
+					and String(_selftest_shown[0]).contains("*.log") \
+					and _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty()
+			_selftest_shown.clear()
+			await _add_path(plain)
+			var tracked_ok: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("already in Perforce")
+			_selftest_shown.clear()
+			await _add_path(dir.path_join("fresh.txt"))
+			var fresh_ok: bool = _selftest_shown.is_empty() \
+					and String((await _fetch_fstat_record(dir.path_join("fresh.txt"))).get("action", "")) == "add"
+			_log("[selftest] add: ignored file explained=%s tracked file explained=%s new file added quietly=%s" \
+					% [ign_ok, tracked_ok, fresh_ok])
+			ok = ok and ign_ok and tracked_ok and fresh_ok
+
+			# Revert: an add, then a move from each half, then nothing to revert.
+			_selftest_shown.clear()
+			await _revert_path(dir.path_join("fresh.txt"))
+			var add_rev_ok: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).begins_with("Throw away your changes") \
+					and _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty() \
+					and FileAccess.file_exists(dir_g.path_join("fresh.txt"))
+			var move_ok := true
+			for half: String in ["moved.txt", "moved2.txt"]:
+				await _p4_exec_logged(["edit", dir_g.path_join("moved.txt")])
+				await _p4_exec_logged(["move", dir_g.path_join("moved.txt"), dir_g.path_join("moved2.txt")])
+				var bare_rev := await _p4_exec(["revert", dir_g.path_join("moved.txt")])
+				var refused: bool = String(bare_rev.output[0]).contains("has been moved, not reverted") \
+						and _parse_ztag(await _p4_exec(["-ztag", "opened"])).size() == 2
+				_selftest_shown.clear()
+				await _revert_path(dir.path_join(half))
+				var undone: bool = _selftest_shown.size() == 1 \
+						and String(_selftest_shown[0]).begins_with("Undo the move of '%s' to '%s'?" \
+							% [dir.path_join("moved.txt"), dir.path_join("moved2.txt")]) \
+						and _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty() \
+						and FileAccess.file_exists(dir_g.path_join("moved.txt")) \
+						and not FileAccess.file_exists(dir_g.path_join("moved2.txt"))
+				_log("[selftest] revert a move through %s: undone=%s (plain p4 revert of the old half refuses: %s)" \
+						% [half, undone, refused])
+				move_ok = move_ok and undone and refused
+			# Revert on a file that isn't checked out: nothing to do when it
+			# matches, and an offer to put it back when it was changed or deleted.
+			_selftest_shown.clear()
+			await _revert_path(plain)
+			var idle_ok: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("nothing to throw away")
+			_set_file_writable(plain_g, true)
+			var fw3 := FileAccess.open(plain_g, FileAccess.WRITE)
+			fw3.store_string("scribbled\n")
+			fw3.close()
+			_selftest_shown.clear()
+			await _revert_path(plain)
+			var restored: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("changed on your computer without being checked out") \
+					and FileAccess.get_file_as_string(plain_g).replace("\r", "") == "one\ntwo\n"
+			_set_file_writable(plain_g, true)
+			DirAccess.remove_absolute(plain_g)
+			_selftest_shown.clear()
+			await _diff_path(plain)
+			var gone_diff_ok: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("isn't on your computer any more")
+			_selftest_shown.clear()
+			await _revert_path(plain)
+			var undeleted: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("was deleted from your computer") \
+					and FileAccess.file_exists(plain_g)
+			_log("[selftest] revert: add=%s moves=%s unopened: same explained=%s changed put back=%s deleted put back=%s; diff of a deleted file explained=%s" \
+					% [add_rev_ok, move_ok, idle_ok, restored, undeleted, gone_diff_ok])
+			ok = ok and add_rev_ok and move_ok and idle_ok and restored and undeleted and gone_diff_ok
+
+			# An external diff tool (P4DIFF) must not turn a change into "identical".
+			_set_file_writable(plain_g, true)
+			var fw4 := FileAccess.open(plain_g, FileAccess.WRITE)
+			fw4.store_string("one\nTWO\n")
+			fw4.close()
+			OS.set_environment("P4DIFF", "echo")
+			var fooled := await _p4_exec(["diff", "-f", "-dul", plain_g])
+			_selftest_shown.clear()
+			diff_window.hide()
+			await _diff_path(plain)
+			var tool_ok: bool = diff_window.visible and _selftest_shown.is_empty() \
+					and _diff_verdict(String(fooled.output[0]), int(fooled.exit_code)) == "same"
+			diff_window.hide()
+			OS.unset_environment("P4DIFF")
+			await _p4_exec(["sync", "-f", plain_g])
+			_log("[selftest] diff with P4DIFF set still shows the change: %s" % tool_ok)
+			ok = ok and tool_ok
+
+			# Mark for Add on several files reports once.
+			_selftest_shown.clear()
+			await _ctx_add(PackedStringArray([dir.path_join("fresh.txt"), dir.path_join("ignored.log"), plain]))
+			var many_ok: bool = _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).begins_with("Marked 1 of 3 files for add.")
+			await _p4_exec_logged(["revert", dir_g.path_join("fresh.txt")])
+			_log("[selftest] add of three files gives one summary: %s" % many_ok)
+			ok = ok and many_ok
+
+			# An asset moved with its .import, then undone: both go back.
+			for n: String in ["pic.dat", "pic.dat.import"]:
+				var fwp := FileAccess.open(dir_g.path_join(n), FileAccess.WRITE)
+				fwp.store_string(n + "\n")
+				fwp.close()
+			await _p4_exec_logged(["add", dir_g.path_join("pic.dat"), dir_g.path_join("pic.dat.import")])
+			await _submit_changelist("default", [], "P4Godot selftest: file actions asset")
+			for n: String in ["pic.dat", "pic.dat.import"]:
+				DirAccess.rename_absolute(dir_g.path_join(n), dir_g.path_join(n.replace("pic", "pic2")))
+			await _handle_fs_move(dir.path_join("pic.dat"), dir.path_join("pic2.dat"), false)
+			var both_moved: bool = _parse_ztag(await _p4_exec(["-ztag", "opened"])).size() == 4
+			_selftest_shown.clear()
+			await _revert_path(dir.path_join("pic.dat"))
+			var side_ok: bool = both_moved and _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("pic.dat.import, which Godot keeps beside it") \
+					and _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty() \
+					and FileAccess.file_exists(dir_g.path_join("pic.dat.import")) \
+					and not FileAccess.file_exists(dir_g.path_join("pic2.dat.import"))
+			_log("[selftest] undo of a moved asset takes its .import back too: %s" % side_ok)
+			ok = ok and side_ok
+
+			# Deleting a file that was moved: the old path ends up opened for
+			# delete and nothing comes back on disk.
+			DirAccess.rename_absolute(dir_g.path_join("moved.txt"), dir_g.path_join("moved3.txt"))
+			await _handle_fs_move(dir.path_join("moved.txt"), dir.path_join("moved3.txt"), false)
+			DirAccess.remove_absolute(dir_g.path_join("moved3.txt"))
+			await _handle_fs_delete(dir.path_join("moved3.txt"), false)
+			var now_open := _parse_ztag(await _p4_exec(["-ztag", "opened"]))
+			var del_ok: bool = now_open.size() == 1 \
+					and String(now_open[0].get("action", "")) == "delete" \
+					and String(now_open[0].get("depotFile", "")).ends_with("/moved.txt") \
+					and not FileAccess.file_exists(dir_g.path_join("moved.txt")) \
+					and not FileAccess.file_exists(dir_g.path_join("moved3.txt"))
+			_log("[selftest] delete of a moved file: old path opened for delete, nothing restored=%s" % del_ok)
+			ok = ok and del_ok
+			await _p4_exec_logged(["revert", dir_g.path_join("moved.txt")])
+
+			await _p4_exec_logged(["delete", plain_g, dir_g.path_join("moved.txt"),
+					dir_g.path_join("pic.dat"), dir_g.path_join("pic.dat.import")])
+			await _submit_changelist("default", [], "P4Godot selftest: file actions cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			for n: String in ["ignored.log", "fresh.txt"]:
+				DirAccess.remove_absolute(dir_g.path_join(n))
+			DirAccess.remove_absolute(dir_g)
+			_log("[selftest] opened-after=%d" % left)
+			_log("[selftest] %s: file-actions-live" % ("PASS" if ok and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-submit-behind-live":
+			# Live and DESTRUCTIVE (use tools/run-live-tests.sh: it needs the
+			# second user "mate" with workspace mate-ws at $P4TEST_MATE_WS).
+			# A teammate submits a newer version of a file this workspace has
+			# checked out; Submit must name the file and send nothing.
+			_selftest_auto_answer = "confirm"
+			var mate_ws := OS.get_environment("P4TEST_MATE_WS")
+			if mate_ws.is_empty() or not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: submit-behind-live - needs P4TEST_MATE_WS and nothing opened")
+				get_tree().quit()
+				return
+			var names := ["p4godot_behind_shared.txt", "p4godot_behind_mine.txt"]
+			for n: String in names:
+				var fw := FileAccess.open(ProjectSettings.globalize_path("res://" + n), FileAccess.WRITE)
+				fw.store_string("first\n")
+				fw.close()
+				await _p4_exec_logged(["add", ProjectSettings.globalize_path("res://" + n)])
+			await _submit_changelist("default", [], "P4Godot selftest: behind seed")
+			var as_mate := PackedStringArray(["-u", "mate", "-c", "mate-ws"])
+			var theirs := mate_ws.path_join(names[0])
+			await _p4_exec(as_mate + PackedStringArray(["sync", "//mate-ws/..."]))
+			await _p4_exec(as_mate + PackedStringArray(["edit", theirs]))
+			var fm := FileAccess.open(theirs, FileAccess.WRITE)
+			fm.store_string("first\nmate\n")
+			fm.close()
+			var mate_sub := await _p4_exec(as_mate + PackedStringArray(["submit", "-d", "mate got there first", theirs]))
+			var staged: bool = String(mate_sub.output[0]).contains("submitted")
+			for n: String in names:
+				await _do_checkout("res://" + n)
+			var changes_before := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending", "-c", _p4_client])).size()
+			_selftest_shown.clear()
+			_last_submit_outcome = ""
+			await _submit_changelist("default", [], "P4Godot selftest: must not be sent")
+			var changes_after := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending", "-c", _p4_client])).size()
+			var told := "" if _selftest_shown.is_empty() else String(_selftest_shown[0])
+			var ok: bool = staged and _selftest_shown.size() == 1 \
+					and told.begins_with("Perforce won't take this submit yet. This file changed") \
+					and told.contains(names[0]) and not told.contains(names[1]) \
+					and _last_submit_outcome == "" and changes_before == changes_after \
+					and _parse_ztag(await _p4_exec(["-ztag", "opened"])).size() == 2
+			_log("[selftest] teammate submitted first=%s; submit refused up front naming only that file=%s; no changelist created=%s" \
+					% [staged, _selftest_shown.size() == 1 and told.contains(names[0]) and not told.contains(names[1]),
+					changes_before == changes_after])
+			for n: String in names:
+				await _p4_exec_logged(["revert", ProjectSettings.globalize_path("res://" + n)])
+			await _p4_exec(["sync", "-s", _project_scope()])
+			for n: String in names:
+				await _p4_exec_logged(["delete", ProjectSettings.globalize_path("res://" + n)])
+			await _submit_changelist("default", [], "P4Godot selftest: behind cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] opened-after=%d" % left)
+			_log("[selftest] %s: submit-behind-live" % ("PASS" if ok and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-moves-live":
+			# Live and DESTRUCTIVE (three real submits; use a throwaway server):
+			# moves recorded through _handle_fs_move the way the FileSystem dock
+			# reports them - after the files have already moved on disk. Covers
+			# the case content-matching loses (a binary moved and changed), an
+			# asset with its .import, a file only opened for add, a folder, and a
+			# rename that only changes case. Needs nothing opened.
+			_selftest_auto_answer = "confirm"
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: moves-live - files already opened; needs a clean workspace")
+				get_tree().quit()
+				return
+			await _probe_connection()
+			var dir := "res://p4g_moves_test"
+			var dir_g := ProjectSettings.globalize_path(dir)
+			DirAccess.make_dir_recursive_absolute(dir_g.path_join("art/sub"))
+			var noise := PackedByteArray()
+			noise.resize(4096)
+			for i in range(0, noise.size(), 8):
+				noise.encode_s64(i, randi() << 32 | randi())
+			var seeded := {"blob.bin": noise, "art/hero.png": "png\n".to_utf8_buffer(),
+					"art/hero.png.import": "import\n".to_utf8_buffer(),
+					"art/sub/deep.txt": "deep\n".to_utf8_buffer(), "Name.txt": "name\n".to_utf8_buffer()}
+			var add_args := PackedStringArray(["add"])
+			for n: String in seeded:
+				var fw := FileAccess.open(dir_g.path_join(n), FileAccess.WRITE)
+				fw.store_buffer(seeded[n])
+				fw.close()
+				add_args.append(dir_g.path_join(n))
+			await _p4_exec_logged(add_args)
+			await _submit_changelist("default", [], "P4Godot selftest: moves seed")
+			var ok := _last_submit_outcome == "submitted"
+
+			# 1. A binary moved AND changed. Content matching can't pair it.
+			var blob_old := dir_g.path_join("blob.bin")
+			var blob_new := dir_g.path_join("blob_moved.bin")
+			DirAccess.rename_absolute(blob_old, blob_new)
+			_set_file_writable(blob_new, true)
+			var fa := FileAccess.open(blob_new, FileAccess.READ_WRITE)
+			fa.seek_end()
+			fa.store_buffer(noise.slice(0, 64))
+			fa.close()
+			_set_file_writable(blob_new, false)
+			var guess := await _p4_exec(["reconcile", "-n", "-M", blob_old, blob_new])
+			var guess_lost: bool = not String(guess.output[0]).contains("move/add")
+			await _handle_fs_move(dir.path_join("blob.bin"), dir.path_join("blob_moved.bin"), false)
+			var blob_rec := await _fetch_fstat_record(dir.path_join("blob_moved.bin"))
+			var blob_ok: bool = String(blob_rec.get("action", "")) == "move/add" \
+					and String(blob_rec.get("movedFile", "")).ends_with("/blob.bin") \
+					and not _selftest_is_read_only(blob_new)
+			_log("[selftest] moved+changed binary: move/add=%s writable=%s (reconcile -M would have cut its history: %s)" \
+					% [String(blob_rec.get("action", "")) == "move/add", not _selftest_is_read_only(blob_new), guess_lost])
+			ok = ok and blob_ok and guess_lost
+
+			# 2. An asset and its .import, both read-only and unopened.
+			DirAccess.rename_absolute(dir_g.path_join("art/hero.png"), dir_g.path_join("art/hero2.png"))
+			DirAccess.rename_absolute(dir_g.path_join("art/hero.png.import"), dir_g.path_join("art/hero2.png.import"))
+			await _handle_fs_move(dir.path_join("art/hero.png"), dir.path_join("art/hero2.png"), false)
+			var side_rec := await _fetch_fstat_record(dir.path_join("art/hero2.png.import"))
+			var asset_ok: bool = String((await _fetch_fstat_record(dir.path_join("art/hero2.png"))).get("action", "")) == "move/add" \
+					and String(side_rec.get("action", "")) == "move/add" \
+					and not _selftest_is_read_only(dir_g.path_join("art/hero2.png.import"))
+			_log("[selftest] asset with .import: both move/add and writable=%s" % asset_ok)
+			ok = ok and asset_ok
+
+			# 3. A file only opened for add becomes an add at the new path.
+			var fresh := FileAccess.open(dir_g.path_join("fresh.txt"), FileAccess.WRITE)
+			fresh.store_string("fresh\n")
+			fresh.close()
+			await _p4_exec_logged(["add", dir_g.path_join("fresh.txt")])
+			DirAccess.rename_absolute(dir_g.path_join("fresh.txt"), dir_g.path_join("fresh2.txt"))
+			await _handle_fs_move(dir.path_join("fresh.txt"), dir.path_join("fresh2.txt"), false)
+			var add_ok: bool = String((await _fetch_fstat_record(dir.path_join("fresh2.txt"))).get("action", "")) == "add" \
+					and (await _fetch_fstat_record(dir.path_join("fresh.txt"))).get("action", "") == ""
+			_log("[selftest] file opened for add: plain add at the new path=%s" % add_ok)
+			ok = ok and add_ok
+
+			# 4. A folder, with a moved file, an untracked file and a subfolder.
+			var stray := FileAccess.open(dir_g.path_join("art/untracked.txt"), FileAccess.WRITE)
+			stray.store_string("stray\n")
+			stray.close()
+			DirAccess.rename_absolute(dir_g.path_join("art"), dir_g.path_join("gfx"))
+			await _handle_fs_move(dir.path_join("art"), dir.path_join("gfx"), true)
+			var deep := await _fetch_fstat_record(dir.path_join("gfx/sub/deep.txt"))
+			var chained := await _fetch_fstat_record(dir.path_join("gfx/hero2.png"))
+			var folder_ok: bool = String(deep.get("action", "")) == "move/add" \
+					and String(chained.get("action", "")) == "move/add" \
+					and String(chained.get("movedFile", "")).ends_with("/art/hero.png") \
+					and not (await _fetch_fstat_record(dir.path_join("gfx/untracked.txt"))).has("action") \
+					and not _selftest_is_read_only(dir_g.path_join("gfx/sub/deep.txt"))
+			_log("[selftest] folder: files move/add, earlier move chained to the original=%s" % folder_ok)
+			ok = ok and folder_ok
+
+			# 5. A rename that only changes case is refused with an explanation.
+			var folds := _server_folds_case
+			DirAccess.rename_absolute(dir_g.path_join("Name.txt"), dir_g.path_join("name.txt"))
+			_selftest_shown.clear()
+			var before := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			await _handle_fs_move(dir.path_join("Name.txt"), dir.path_join("name.txt"), false)
+			var after := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			var case_ok: bool = not folds or (before == after and _selftest_shown.size() == 1 \
+					and String(_selftest_shown[0]).contains("differ only in capital letters"))
+			_log("[selftest] case-only rename (server folds case=%s): refused and explained=%s" % [folds, case_ok])
+			ok = ok and case_ok
+			DirAccess.rename_absolute(dir_g.path_join("name.txt"), dir_g.path_join("Name.txt"))
+			if not folds:
+				await _p4_exec_logged(["revert", dir_g.path_join("Name.txt"), dir_g.path_join("name.txt")])
+
+			await _submit_changelist("default", [], "P4Godot selftest: moves")
+			var log_text := await _p4_exec(["filelog", "-m1", blob_new])
+			var history_ok: bool = _last_submit_outcome == "submitted" \
+					and String(log_text.output[0]).contains("moved from")
+			_log("[selftest] after submit the binary's history says 'moved from': %s" % history_ok)
+			ok = ok and history_ok
+			await _p4_exec_logged(["delete", _as_recursive(dir_g)])
+			await _submit_changelist("default", [], "P4Godot selftest: moves cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			DirAccess.remove_absolute(dir_g.path_join("gfx/untracked.txt"))
+			_log("[selftest] opened-after=%d" % left)
+			_log("[selftest] %s: moves-live" % ("PASS" if ok and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-password-expired-live="):
+			# Live: --p4-selftest-password-expired-live=<current>,<new>. Run it
+			# after an admin ran "p4 admin resetpassword -u <this user>". Checks
+			# that the first refused command leads to the change-password
+			# prompts, that a wrong current password is reported and asked
+			# again, and that commands work afterwards.
+			var parts := arg.substr("--p4-selftest-password-expired-live=".length()).split(",")
+			if parts.size() != 2:
+				_log("[selftest] FAIL: password-expired-live - pass <current>,<new>")
+				get_tree().quit()
+				return
+			_selftest_auto_answer = "confirm"
+			_login_declined = false
+			_selftest_typed = ["not-the-password", parts[1], parts[1], parts[0], parts[1], "a-typo",
+					parts[0], parts[1], parts[1]]
+			_selftest_shown.clear()
+			var before := await _p4_exec(["-ztag", "opened"])
+			var refused: bool = _looks_like_password_expired(before)
+			var waited := 0
+			while (_login_prompt_active or _selftest_shown.size() < 2) and waited < 1200:
+				await get_tree().process_frame
+				waited += 1
+			var after := await _p4_exec(["-ztag", "opened"])
+			var told: bool = _selftest_shown.size() == 2 \
+					and String(_selftest_shown[0]).contains("Password invalid") \
+					and String(_selftest_shown[1]).contains("didn't match")
+			var log_clean: bool = log_box != null and log_box.text.contains("passwd") \
+					and not log_box.text.contains(parts[0]) and not log_box.text.contains(parts[1])
+			_log("[selftest] refused-first=%s alerts=%s typed-left=%d works-after=%s log-holds-no-password=%s" \
+					% [refused, told, _selftest_typed.size(), int(after.exit_code) == 0, log_clean])
+			_log("[selftest] %s: password-expired-live" % ("PASS" if refused and told and log_clean \
+					and _selftest_typed.is_empty() and int(after.exit_code) == 0 else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-submit-roundtrip":
@@ -9201,6 +10206,53 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] FAIL: submit-cancel - the outcome reported doesn't match the server")
 			else:
 				_log("[selftest] FAIL: submit-cancel - the workspace wasn't usable after the cancel")
+			get_tree().quit()
+			return
+		if arg.begins_with("--p4-selftest-submit-slow-trigger-live="):
+			# Live and DESTRUCTIVE (three real submits; use a throwaway server):
+			# --p4-selftest-submit-slow-trigger-live=<seconds>, on a server whose
+			# change-content trigger sleeps that long (tools/p4-test-server.sh
+			# trigger). First a submit left alone, which must wait the trigger
+			# out and succeed. Then one cancelled after every file is sent: the
+			# server has it all and finishes the job with p4 gone, so the only
+			# true thing to tell the user is "too late, it was submitted".
+			var wait_sec := int(arg.substr("--p4-selftest-submit-slow-trigger-live=".length()))
+			_selftest_auto_answer = "confirm"
+			if wait_sec <= 0 or not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: submit-slow-trigger-live - pass the trigger's seconds, and start with nothing opened")
+				get_tree().quit()
+				return
+			var names := ["p4godot_trigger_a.txt", "p4godot_trigger_b.txt"]
+			var outcomes: Array = []
+			var times: Array = []
+			var in_depot: Array = []
+			for i in 2:
+				var g := ProjectSettings.globalize_path("res://" + names[i])
+				var fw := FileAccess.open(g, FileAccess.WRITE)
+				fw.store_string("slow trigger %d\n" % i)
+				fw.close()
+				await _p4_exec_logged(["add", g])
+				_selftest_cancel_when_sent = i == 1
+				_selftest_shown.clear()
+				var began := Time.get_ticks_msec()
+				await _submit_changelist("default", [], "P4Godot selftest: slow trigger %d" % i)
+				times.append(Time.get_ticks_msec() - began)
+				outcomes.append(_last_submit_outcome)
+				in_depot.append(not _parse_ztag(await _p4_exec(["-ztag", "files", g])).is_empty())
+			var hook_fired := not _selftest_cancel_when_sent
+			var told := "" if _selftest_shown.is_empty() else String(_selftest_shown[-1])
+			_log("[selftest] left alone: %s after %d ms, in depot=%s" % [outcomes[0], times[0], in_depot[0]])
+			_log("[selftest] cancelled once sent (cancel pressed=%s): %s after %d ms, in depot=%s; told: %s" \
+					% [hook_fired, outcomes[1], times[1], in_depot[1], told.get_slice("\n", 0)])
+			var ok: bool = outcomes[0] == "submitted" and in_depot[0] and int(times[0]) >= wait_sec * 1000 \
+					and hook_fired and outcomes[1] == "submitted" and in_depot[1] \
+					and told.begins_with("Too late to cancel")
+			for n: String in names:
+				await _p4_exec_logged(["delete", ProjectSettings.globalize_path("res://" + n)])
+			await _submit_changelist("default", [], "P4Godot selftest: slow trigger cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] opened-after=%d" % left)
+			_log("[selftest] %s: submit-slow-trigger-live" % ("PASS" if ok and left == 0 else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-get-latest-cancel":
@@ -9900,6 +10952,13 @@ func _run_cli_self_test_if_requested() -> void:
 				await _selftest_report_opened(p)
 			get_tree().quit()
 			return
+
+
+## Self-tests only: whether the OS would refuse a write to this file.
+func _selftest_is_read_only(global_path: String) -> bool:
+	if OS.get_name() == "Windows":
+		return FileAccess.get_read_only_attribute(global_path)
+	return FileAccess.get_unix_permissions(global_path) & FileAccess.UNIX_WRITE_OWNER == 0
 
 
 func _selftest_menu_labels() -> String:

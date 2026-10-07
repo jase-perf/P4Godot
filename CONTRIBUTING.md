@@ -52,7 +52,20 @@ tests what a release zip would ship — your last commit, not uncommitted
 edits — and it retries the deadlocked runs for you. CI runs the same script
 on every push and pull request (`.github/workflows/ci.yml`).
 
-**Live** tests need a real workspace. Read-only ones — `probe`, `list-opened`,
+**Live** tests need a real Perforce server. One command starts a throwaway
+one on your machine and runs them there, as an ordinary user with no admin
+rights (the access a P4Godot user has):
+
+```
+tools/run-live-tests.sh <path-to-godot> [test ...]
+```
+
+It downloads Perforce's `p4d` once into `.cache/` (checked against a pinned
+checksum), tests your working tree, and deletes the server afterwards.
+`tools/p4-test-server.sh start <dir>` gives you the same server to poke at by
+hand. So far this has only been run on Windows.
+
+Against your own workspace: read-only ones — `probe`, `list-opened`,
 `reconcile-report`, `reconcile-preview` — are safe to run against a workspace
 in any state, and `reconcile-report` prints exactly what the Reconcile dialog
 would say, which is the first thing to try on any reconcile complaint. Others

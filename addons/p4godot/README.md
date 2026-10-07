@@ -344,11 +344,14 @@ unknown, with what to do next.
   hover over a file starts the lookup in the background, and the status shows
   from the next hover, so hovering never waits on the server.
 - **Delete, move, and rename tracking.** Deleting a file offers to open it
-  for delete. Moving or renaming offers to record a history-preserving move
-  (`p4 reconcile -M`, which falls back to delete + add if the content changed
-  during the move). The `.import` and `.uid` files Godot moves along with an
-  asset are recorded too. These actions prompt by default, or apply silently
-  with the "Auto add/edit/delete" setting.
+  for delete. Moving or renaming offers to record a Perforce move, so the
+  file keeps its history under the new name even if you also changed it
+  (`p4 edit` + `p4 move -k`). The `.import` and `.uid` files Godot moves
+  along with an asset are recorded too, and reverting a moved file undoes the
+  move for all of them. A rename that only changes capital letters
+  (`Hero.png` → `hero.png`) can't be recorded on a server that ignores case;
+  P4Godot says so and explains the two-step way round. These actions prompt
+  by default, or apply silently with the "Auto add/edit/delete" setting.
 
 ### Files you edited in Photoshop, Blender, or anywhere else
 
