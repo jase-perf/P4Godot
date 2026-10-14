@@ -778,6 +778,31 @@ func _project_inside_root(client_root: String) -> bool:
 	return (project.rstrip("/") + "/").begins_with(root.rstrip("/") + "/")
 
 
+## From p4's "P4PORT IDENTIFICATION HAS CHANGED" warning: the address it names
+## ("127.0.0.1:2199" - the form `p4 trust -l` keys on) and the new fingerprint,
+## exactly as printed. p4 compares fingerprints case-sensitively: a lowercase
+## copy installs but doesn't match (measured on 2026.1).
+func _fingerprint_change_in(text: String) -> Dictionary:
+	var address := ""
+	var addr_match := RegEx.create_from_string("P4PORT '([^']+)'").search(text)
+	if addr_match:
+		address = addr_match.get_string(1)
+	var fp_match := RegEx.create_from_string("(?:[0-9A-Fa-f]{2}:){15,}[0-9A-Fa-f]{2}").search(text)
+	return {"address": address, "new": fp_match.get_string() if fp_match else ""}
+
+
+## The fingerprint `p4 trust -l` lists for an address ("host:port fp" lines),
+## or "" when there is none.
+func _trusted_fingerprint_for(trust_list: String, address: String) -> String:
+	if address.is_empty():
+		return ""
+	for raw_line in trust_list.split("\n"):
+		var parts := String(raw_line).strip_edges().split(" ", false)
+		if parts.size() == 2 and parts[0] == address:
+			return parts[1]
+	return ""
+
+
 ## Interactive connection setup: figure out what's missing (server -> login ->
 ## client), ask for just that piece, and re-probe until `p4 info` resolves this
 ## project. Workspace suggestions come from the user's existing clients on the
@@ -827,11 +852,33 @@ func _offer_connection_setup() -> void:
 			await _p4_exec_logged(["trust", "-i", fp])
 			continue
 		if status == "fingerprint changed":
-			await _show_alert("WARNING: this Perforce server's SSL fingerprint has CHANGED since " +
-					"this computer last connected.\n\nThat can mean the server was reinstalled - or " +
-					"that something is intercepting the connection. Ask your server admin before " +
-					"trusting the new fingerprint (`p4 trust -f -y` in a terminal).")
-			break
+			var change := _fingerprint_change_in(_last_probe_text)
+			if String(change.new).is_empty():
+				await _show_alert("WARNING: this Perforce server's SSL fingerprint has CHANGED since " +
+						"this computer last connected, and P4Godot couldn't read the new one (see " +
+						"the P4 Log).\n\nThat can mean the server's certificate was replaced - or " +
+						"that something is intercepting the connection. Ask your server admin before " +
+						"trusting it (`p4 trust -f` in a terminal).")
+				break
+			var known := await _p4_exec(["trust", "-l"])
+			var old_fp := _trusted_fingerprint_for("" if known.output.is_empty() \
+					else String(known.output[0]), String(change.address))
+			var trust_new: bool = await _show_confirm_dialog(("WARNING: the SSL fingerprint of the " +
+					"Perforce server at %s has CHANGED since this computer last connected.\n\n" +
+					"Fingerprint you trusted before:\n%s\n\nFingerprint the server shows now:\n%s\n\n" +
+					"That happens when an admin replaces the server's certificate - and when " +
+					"something is intercepting the connection. Trust the new fingerprint only if " +
+					"your server admin confirms the change and the new fingerprint matches the one " +
+					"they gave you, character for character.") \
+					% [change.address, old_fp if not old_fp.is_empty() else "(not found)", change.new],
+					"Trust New Fingerprint", "Cancel")
+			if not trust_new:
+				break
+			# -f replaces the old entry; -i installs exactly the fingerprint shown.
+			# p4 installs any value it is given without checking it (measured), so
+			# the next pass's probe is what confirms it matches.
+			await _p4_exec_logged(["trust", "-f", "-i", String(change.new)])
+			continue
 		if status == "no server":
 			var prefill: String = await _suggest_port()
 			var res: Dictionary = await _show_input_dialog("P4 Connection Setup",
@@ -3207,6 +3254,13 @@ const DIFF_BG_ADD := Color(0.16, 0.55, 0.22, 0.38)
 const DIFF_BG_FILL := Color(0.5, 0.5, 0.55, 0.10) # alignment filler rows
 const DIFF_GUTTER_COLS := 7 # "12345  " line-number prefix baked into each line
 const DIFF_CONTEXT_KEEP := 3 # context lines kept around each change when collapsed
+# Largest file shown side by side, either side. Past this the panes slow the
+# editor down and a line-by-line view stops being readable; P4V handles it.
+const DIFF_MAX_BYTES := 1024 * 1024
+# Base filetypes p4 treats as text (old names included); anything else is
+# shown as "not text" without downloading it.
+const P4_TEXT_TYPES := ["text", "xtext", "ktext", "kxtext", "ctext", "cxtext", "ltext",
+		"xltext", "unicode", "xunicode", "utf8", "xutf8", "utf16", "xutf16", "symlink"]
 
 
 ## Per-character foreground coloring for the diff panes: dims the baked-in
@@ -3353,6 +3407,12 @@ func _diff_path(res_path: String) -> void:
 		# gone from disk (deleted, opened for delete, the old half of a move).
 		await _show_alert("'%s' isn't on your computer any more - it was deleted or moved - so there's nothing to compare." % res_path)
 		return
+	var local_file := FileAccess.open(local_path, FileAccess.READ)
+	var local_size := -1 if local_file == null else int(local_file.get_length())
+	local_file = null
+	if local_size > DIFF_MAX_BYTES:
+		await _show_alert(_diff_too_big_message(res_path, local_size))
+		return
 	# -E P4DIFF=: with an external diff tool configured, p4 hands the files to
 	# that tool and prints only the header, which reads as "no difference".
 	var result := await _p4_exec(["-E", "P4DIFF=", "diff", "-f", "-dul", local_path])
@@ -3381,6 +3441,19 @@ func _diff_path(res_path: String) -> void:
 	if not depot_path.begins_with("//"):
 		await _show_alert("Godot couldn't work out where '%s' lives on the Perforce server, so it can't compare the two. Press \"Log\" in the P4G panel to see what Perforce said." % res_path)
 		return
+	# Size and filetype of the downloaded revision, before downloading it again.
+	var have_stat := await _p4_exec(["-ztag", "fstat", "-Ol", depot_path + "#have"])
+	var have_check := _diff_have_check(_parse_ztag(have_stat))
+	match String(have_check.verdict):
+		"binary":
+			await _show_alert("'%s' is stored in Perforce as a binary file, so there's nothing to show side by side." % res_path)
+			return
+		"too big":
+			await _show_alert(_diff_too_big_message(res_path, int(have_check.size)))
+			return
+		"unknown":
+			await _show_alert("Godot couldn't look up the server's copy of '%s' to compare against. Press \"Log\" in the P4G panel to see what Perforce said." % res_path)
+			return
 	var have := await _p4_exec(["print", "-q", depot_path + "#have"])
 	if have.exit_code != 0:
 		await _show_alert("Godot couldn't download the server's copy of '%s' to compare against. Press \"Log\" in the P4G panel to see what Perforce said." % res_path)
@@ -3512,6 +3585,30 @@ func _diff_verdict(text: String, exit_code: int) -> String:
 	if exit_code == 0 and _diff_depot_path(text, "").begins_with("//"):
 		return "same"
 	return "unknown"
+
+
+## Whether the revision `-ztag fstat -Ol <depot>#have` describes can be shown
+## side by side, as {verdict, size}: "ok", "binary" (its filetype isn't text),
+## "too big" (over DIFF_MAX_BYTES), or "unknown" (no record: p4 answers
+## "file(s) not on client" with exit 0). Decided before the revision is
+## downloaded.
+func _diff_have_check(records: Array) -> Dictionary:
+	for rec in records:
+		if not (rec is Dictionary and rec.has("headType")):
+			continue
+		var size := int(rec.get("fileSize", "0"))
+		if not P4_TEXT_TYPES.has(String(rec.headType).get_slice("+", 0)):
+			return {"verdict": "binary", "size": size}
+		if size > DIFF_MAX_BYTES:
+			return {"verdict": "too big", "size": size}
+		return {"verdict": "ok", "size": size}
+	return {"verdict": "unknown", "size": 0}
+
+
+func _diff_too_big_message(res_path: String, size: int) -> String:
+	return ("'%s' is %s - too large to show side by side here (the limit is %s). " +
+			"Use Diff in P4V for a file this size.") \
+			% [res_path, String.humanize_size(size), String.humanize_size(DIFF_MAX_BYTES)]
 
 
 ## The depot path from the diff's "--- //depot/...<TAB>date" header line.
@@ -9684,7 +9781,33 @@ func _run_cli_self_test_if_requested() -> void:
 					and _diff_verdict("new.txt - file(s) not on client.\n", 0) == "new" \
 					and _diff_verdict("a.txt - file(s) not opened on this client.\n", 0) == "unknown" \
 					and _diff_verdict("", 0) == "unknown" \
-					and _diff_verdict(hdr, 1) == "unknown"
+					and _diff_verdict(hdr, 1) == "unknown" \
+					and String(_diff_have_check([{"depotFile": "//d/a.txt", "headType": "text+k", "fileSize": "40"}]).verdict) == "ok" \
+					and String(_diff_have_check([{}, {"headType": "utf16", "fileSize": "10"}]).verdict) == "ok" \
+					and String(_diff_have_check([{"headType": "binary+F", "fileSize": "40"}]).verdict) == "binary" \
+					and String(_diff_have_check([{"headType": "ubinary"}]).verdict) == "binary" \
+					and _diff_have_check([{"headType": "text", "fileSize": str(DIFF_MAX_BYTES + 1)}]) \
+						== {"verdict": "too big", "size": DIFF_MAX_BYTES + 1} \
+					and String(_diff_have_check([{"headType": "text", "fileSize": str(DIFF_MAX_BYTES)}]).verdict) == "ok" \
+					and String(_diff_have_check([]).verdict) == "unknown" \
+					and String(_diff_have_check([{"desc": "x"}]).verdict) == "unknown"
+			var changed_text := "******* WARNING P4PORT IDENTIFICATION HAS CHANGED! *******\n" \
+					+ "It is possible that someone is intercepting your connection\n" \
+					+ "to the Perforce P4PORT '127.0.0.1:2199'\n" \
+					+ "If this is not a scheduled key change, then you should contact\n" \
+					+ "your Perforce administrator.\n" \
+					+ "The fingerprint for the mismatched key sent to your client is\n" \
+					+ "0C:34:FA:41:1D:0F:DC:41:35:CD:36:86:5D:C0:43:77:9D:AD:CF:C2\n" \
+					+ "To allow connection use the 'p4 trust' command.\n"
+			var trust_list := "other.host:1666 11:22:33:44:55:66:77:88:99:00:11:22:33:44:55:66:77:88:99:00\r\n" \
+					+ "127.0.0.1:2199 B7:E3:77:F3:D2:19:F5:68:07:6F:B2:65:7B:45:A9:DA:BE:C0:53:69\r\n"
+			var trust_ok: bool = _fingerprint_change_in(changed_text) == {"address": "127.0.0.1:2199",
+						"new": "0C:34:FA:41:1D:0F:DC:41:35:CD:36:86:5D:C0:43:77:9D:AD:CF:C2"} \
+					and _fingerprint_change_in("Connect to server failed.\n") == {"address": "", "new": ""} \
+					and _trusted_fingerprint_for(trust_list, "127.0.0.1:2199") \
+						== "B7:E3:77:F3:D2:19:F5:68:07:6F:B2:65:7B:45:A9:DA:BE:C0:53:69" \
+					and _trusted_fingerprint_for(trust_list, "127.0.0.1:21") == "" \
+					and _trusted_fingerprint_for(trust_list, "") == ""
 			var add_ok: bool = \
 					_add_outcome("//game/main/q.txt#1 - opened for add\n", 0) == "added" \
 					and _add_outcome("//game/main/q.txt#1 - currently opened for add\n", 0) == "added" \
@@ -9787,11 +9910,11 @@ func _run_cli_self_test_if_requested() -> void:
 						== PackedStringArray(["C:\\Users\\me\\ignore.txt"]) \
 					and _ignore_file_names("P4IGNORE=.p4ignore:.gitignore\n", false) \
 						== PackedStringArray([".p4ignore", ".gitignore"])
-			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s ignore-names=%s resolve=%s" \
-					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok, names_ok, resolve_ok])
+			_log("[selftest] diff=%s add=%s rule=%s revert=%s password=%s move=%s behind=%s add-summary=%s ignore-names=%s resolve=%s trust=%s" \
+					% [diff_ok, add_ok, rule_ok, revert_ok, pw_ok, move_ok, behind_ok, summary_ok, names_ok, resolve_ok, trust_ok])
 			_log("[selftest] %s: p4-answers" % ("PASS" if diff_ok and add_ok and rule_ok \
 					and revert_ok and pw_ok and move_ok and behind_ok and summary_ok and names_ok \
-					and resolve_ok else "FAIL"))
+					and resolve_ok and trust_ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-file-actions-live":
