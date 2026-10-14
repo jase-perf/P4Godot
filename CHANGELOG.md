@@ -4,6 +4,14 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **A server whose SSL certificate changed can be trusted again inside
+  Godot.** The warning now shows the fingerprint you trusted before and the
+  one the server shows now, and **Trust New Fingerprint** installs exactly
+  that one. It used to send you to a terminal.
+- **Diff vs Depot on a very large or binary file says so** instead of
+  downloading it. Files over 1 MB, on either side, are left to P4V; a file
+  Perforce stores as binary is named as such before anything is fetched.
+
 - **Resolve, inside Godot.** When a teammate submits a newer version of a
   file you have checked out, the two versions have to be combined before
   you can submit. P4Godot now does that: per file you choose **Combine both

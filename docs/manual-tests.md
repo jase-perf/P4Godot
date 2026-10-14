@@ -76,6 +76,8 @@ by hand:
 | 35 | As 19 with an image. | The question says this kind of file can't be combined and offers only Keep mine / Take theirs / Decide later. **Take theirs** asks once more, then the image in the editor is your teammate's. |
 | 36 | Leave a file needing resolve (choose **Decide later**). Look at the P4G panel. | The row is red with "(needs resolve)", its tooltip explains, and right-click offers **Resolve...** first. |
 | 37 | Have a teammate check out a file whose type is exclusive (`+l`), then rename that file in the FileSystem dock and accept **Record Move**. | "Perforce didn't record the move of ...", with Perforce's reason and a sentence about the exclusive lock. Nothing new is in the panel. |
+| 38 | On a test `ssl:` server this computer already trusts, have the admin replace the certificate (`p4d -Gc` with an empty `P4SSLDIR`, then restart). Press **Refresh**. | A warning naming the server, the fingerprint you trusted before and the new one. **Cancel**: nothing changes and the toolbar stays "Not connected". Refresh again and choose **Trust New Fingerprint**: it connects, and `p4 trust -l` lists the new fingerprint. |
+| 39 | Right-click a text file over 1 MB that you changed → **P4: Diff vs Depot**. Then the same on a changed `.png`. | The first says the file is too large to show and names P4V. The second says the file is stored as binary. Neither freezes the editor. |
 
 ## Screenshots for the README
 
