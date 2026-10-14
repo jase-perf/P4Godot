@@ -521,6 +521,16 @@ const NET_MAXWAIT_SAVE_SEC := 30 # the blocking calls right before a save
 # a progress window and a Cancel button (see _p4_exec_streamed).
 const UNREACHABLE_BACKOFF_MSEC := 60000
 var _unreachable_until_msec: int = 0
+# The save path's own connect check (see _tcp_dialable): p4 has no connect
+# timeout, and an unreachable host costs ~21 s on Windows, measured, whatever
+# net.maxwait says. A server that answered this recently isn't checked again.
+const REACHABLE_TRUST_MSEC := 30000
+const DIAL_DEADLINE_MSEC := 2000
+var _last_contact_msec: int = 0
+# The P4PORT this computer dials, from the override or `p4 set`. Not
+# _p4_port: that is the server's own serverAddress, which can be a name only
+# the server knows.
+var _dial_port: String = ""
 
 # Last-seen UndoRedo version per editor history id (see _history_advanced).
 var _history_versions: Dictionary = {}
@@ -696,6 +706,7 @@ func _probe_connection() -> String:
 	var info: Dictionary = {} if records.is_empty() else records[0]
 	_p4_user = String(info.get("userName", ""))
 	_p4_port = String(info.get("serverAddress", ""))
+	_dial_port = await _suggest_port()
 	_server_folds_case = String(info.get("caseHandling", "")) == "insensitive"
 	var client := String(info.get("clientName", ""))
 	var root := String(info.get("clientRoot", ""))
@@ -1237,11 +1248,85 @@ func _note_connectivity(result: Dictionary) -> void:
 	var text := "" if result.output.is_empty() else String(result.output[0])
 	if text.contains("Connect to server failed") or text.contains("TCP connect to") \
 			or text.contains("exceeded maximum configured duration"):
-		if not _server_unreachable():
-			_log("The Perforce server isn't answering - saves won't wait on it for the next minute (press Refresh to retry sooner).")
-		_unreachable_until_msec = Time.get_ticks_msec() + UNREACHABLE_BACKOFF_MSEC
+		_mark_unreachable()
 	elif int(result.get("exit_code", -1)) == 0:
 		_unreachable_until_msec = 0
+		_last_contact_msec = Time.get_ticks_msec()
+
+
+func _mark_unreachable() -> void:
+	if not _server_unreachable():
+		_log("The Perforce server isn't answering - saves won't wait on it for the next minute (press Refresh to retry sooner).")
+	_unreachable_until_msec = Time.get_ticks_msec() + UNREACHABLE_BACKOFF_MSEC
+	_last_contact_msec = 0
+
+
+## Host and port from a P4PORT, for the save path's connect check:
+## "ssl:host:1666", "tcp6:[::1]:1666", "host:1666", "1666" (this computer).
+## {} for a form that doesn't dial a TCP port directly (rsh:, jsh:) or doesn't
+## parse - those are left to p4.
+static func _p4port_host_and_port(p4port: String) -> Dictionary:
+	var s := p4port.strip_edges()
+	if s.is_empty() or s.begins_with("rsh:") or s.begins_with("jsh:"):
+		return {}
+	var protocol := RegEx.create_from_string("^(?:ssl|tcp)(?:4|6|46|64)?:").search(s)
+	if protocol:
+		s = s.substr(protocol.get_end())
+	var host := "localhost"
+	var port_text := s
+	var colon := s.rfind(":")
+	if colon != -1:
+		host = s.substr(0, colon).trim_prefix("[").trim_suffix("]")
+		port_text = s.substr(colon + 1)
+	if host.is_empty() or not port_text.is_valid_int():
+		return {}
+	var port := port_text.to_int()
+	if port <= 0 or port > 65535:
+		return {}
+	return {"host": host, "port": port}
+
+
+## Whether something accepts a TCP connection at the P4PORT within
+## deadline_msec, name lookup included. Blocking: for the main-thread save
+## path, where p4's own ~21 s connect timeout would freeze the editor. Answers
+## true whenever it can't tell (a P4PORT it can't parse, a name lookup still
+## running at the deadline), so p4 decides as it did before: a false "the
+## server is down" would skip the checkout a save needs.
+func _tcp_dialable(p4port: String, deadline_msec: int) -> bool:
+	var target := _p4port_host_and_port(p4port)
+	if target.is_empty():
+		return true
+	var deadline := Time.get_ticks_msec() + deadline_msec
+	var address := String(target.host)
+	if not address.is_valid_ip_address():
+		var item := IP.resolve_hostname_queue_item(address)
+		if item == IP.RESOLVER_INVALID_ID:
+			return true
+		while IP.get_resolve_item_status(item) == IP.RESOLVER_STATUS_WAITING \
+				and Time.get_ticks_msec() < deadline:
+			OS.delay_msec(5)
+		var status := IP.get_resolve_item_status(item)
+		address = IP.get_resolve_item_address(item) if status == IP.RESOLVER_STATUS_DONE else ""
+		IP.erase_resolve_item(item)
+		if status == IP.RESOLVER_STATUS_WAITING:
+			return true
+		if address.is_empty():
+			return false
+	var tcp := StreamPeerTCP.new()
+	if tcp.connect_to_host(address, int(target.port)) != OK:
+		return false
+	var connected := false
+	while Time.get_ticks_msec() < deadline:
+		tcp.poll()
+		var st := tcp.get_status()
+		if st == StreamPeerTCP.STATUS_CONNECTED:
+			connected = true
+			break
+		if st != StreamPeerTCP.STATUS_CONNECTING:
+			break
+		OS.delay_msec(5)
+	tcp.disconnect_from_host()
+	return connected
 
 
 func _server_unreachable() -> bool:
@@ -7271,6 +7356,11 @@ func _p4_exec_sync(args: PackedStringArray) -> Dictionary:
 		return {"exit_code": -1, "output": [""]}
 	if _server_unreachable():
 		return _skipped_result()
+	var recently := _last_contact_msec != 0 \
+			and Time.get_ticks_msec() - _last_contact_msec < REACHABLE_TRUST_MSEC
+	if not recently and not _tcp_dialable(_dial_port, DIAL_DEADLINE_MSEC):
+		_mark_unreachable()
+		return _skipped_result()
 	var loud := _should_log_cmd(args)
 	args = _with_connection_flags(_escape_path_args(args), NET_MAXWAIT_SAVE_SEC)
 	if loud:
@@ -9450,6 +9540,61 @@ func _run_cli_self_test_if_requested() -> void:
 			_unreachable_until_msec = 0
 			_log("[selftest] first-exit=%d tripped=%s skipped=%s fast=%dms" % [int(first.exit_code), tripped, skipped, fast_ms])
 			_log("[selftest] %s: breaker" % ("PASS" if tripped and skipped and fast_ms < 1000 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-dial":
+			# Server-independent: the save path's connect check. An unroutable
+			# address must fail in about the deadline, not p4's ~21 s; a closed
+			# local port fails at once; a listening one passes.
+			var parse_ok: bool = _p4port_host_and_port("ssl:p4.example.com:1666") == {"host": "p4.example.com", "port": 1666} \
+					and _p4port_host_and_port("tcp6:[::1]:1667") == {"host": "::1", "port": 1667} \
+					and _p4port_host_and_port("perforce:1666") == {"host": "perforce", "port": 1666} \
+					and _p4port_host_and_port("1666") == {"host": "localhost", "port": 1666} \
+					and _p4port_host_and_port("ssl:1666") == {"host": "localhost", "port": 1666} \
+					and _p4port_host_and_port("ssl64:10.0.0.5:2000") == {"host": "10.0.0.5", "port": 2000} \
+					and _p4port_host_and_port("rsh:p4d -r /x -i").is_empty() \
+					and _p4port_host_and_port("").is_empty() \
+					and _p4port_host_and_port("host:notaport").is_empty() \
+					and _p4port_host_and_port("host:70000").is_empty()
+			var server := TCPServer.new()
+			var listen_port := 0
+			for candidate in range(47100, 47200):
+				if server.listen(candidate, "127.0.0.1") == OK:
+					listen_port = candidate
+					break
+			var t0 := Time.get_ticks_msec()
+			var open_ok := listen_port != 0 and _tcp_dialable("127.0.0.1:%d" % listen_port, 2000)
+			var open_ms := Time.get_ticks_msec() - t0
+			server.stop()
+			t0 = Time.get_ticks_msec()
+			var closed_ok := listen_port != 0 and not _tcp_dialable("127.0.0.1:%d" % listen_port, 2000)
+			var closed_ms := Time.get_ticks_msec() - t0
+			t0 = Time.get_ticks_msec()
+			var dead_ok := not _tcp_dialable("10.255.255.1:1666", 2000)
+			var dead_ms := Time.get_ticks_msec() - t0
+			var unparsed_ok := _tcp_dialable("rsh:p4d -i", 2000)
+			# End to end: a save-path command against the unroutable address
+			# comes back "skipped" in about the deadline and trips the breaker.
+			var saved_port := _override_port
+			var saved_dial := _dial_port
+			_override_port = "10.255.255.1:1666"
+			_dial_port = _override_port
+			_last_contact_msec = 0
+			# The startup probe may have tripped the breaker already, which would
+			# skip the command before the check under test runs.
+			_unreachable_until_msec = 0
+			t0 = Time.get_ticks_msec()
+			var sync_r := _p4_exec_sync(["fstat", "C:/nothing"])
+			var save_ms := Time.get_ticks_msec() - t0
+			var save_ok: bool = String(sync_r.output[0]).contains("skipped") and _server_unreachable() \
+					and save_ms >= 1500 and save_ms < 3000
+			_override_port = saved_port
+			_dial_port = saved_dial
+			_unreachable_until_msec = 0
+			_log("[selftest] parse=%s open=%s(%dms) closed=%s(%dms) unroutable=%s(%dms) unparsed=%s save-path=%s(%dms)" \
+					% [parse_ok, open_ok, open_ms, closed_ok, closed_ms, dead_ok, dead_ms, unparsed_ok, save_ok, save_ms])
+			_log("[selftest] %s: dial" % ("PASS" if parse_ok and open_ok and closed_ok and dead_ok \
+					and dead_ms < 3000 and unparsed_ok and save_ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-probe":

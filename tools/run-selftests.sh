@@ -3,7 +3,9 @@
 # addon is unpacked from `git archive HEAD` - the same files a release zip
 # ships - into a throwaway Godot project. CI runs this; so can you.
 #
-#   tools/run-selftests.sh [path-to-godot]      (or set GODOT)
+#   tools/run-selftests.sh [path-to-godot] [test ...]   (or set GODOT)
+#
+# Name tests to run only those. VERBOSE=1 prints each test's [selftest] lines.
 #
 # On Windows pass the ..._console.exe build; the GUI binary prints nothing.
 # Needs `p4` on PATH (exec-quoting runs `p4 -V`). Tests the committed HEAD,
@@ -11,9 +13,11 @@
 cd "$(dirname "$0")/.." || exit 1
 
 GODOT="${1:-${GODOT:-godot}}"
+[ $# -gt 0 ] && shift
 TESTS="parse-ztag sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
 diff-align dismiss-dialog build-change-spec fs-menu fstat-summary delete-action
-connection-store connection-dialogs progress streamed-exec breaker"
+connection-store connection-dialogs progress streamed-exec breaker dial"
+[ $# -gt 0 ] && TESTS="$*"
 
 if ! "$GODOT" --version >/dev/null 2>&1; then
 	echo "FAIL: can't run Godot at '$GODOT'. Pass its path as the first argument."
@@ -111,6 +115,7 @@ for t in $TESTS; do
 	# [[:space:]]* because Godot's lines end in CRLF on Windows.
 	if grep -q "\[selftest\] PASS: $t[[:space:]]*\$" "$log" && ! grep -q "\[selftest\] FAIL" "$log"; then
 		echo "ok: $t"
+		[ -n "${VERBOSE:-}" ] && grep "\[selftest\]" "$log" | sed "s/^/    /"
 	else
 		echo "FAIL: $t (attempt $attempt)"
 		cat "$log"
