@@ -4,6 +4,12 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **Saving no longer freezes Godot when the server is out of reach.** With
+  the VPN down or the server offline, the first save that needed Perforce
+  froze the editor for about 21 seconds (the operating system's connection
+  timeout, which p4 has no setting to shorten). P4Godot now checks that the
+  server answers at all, giving up after 2 seconds, before it runs p4 on a
+  save.
 - **A server whose SSL certificate changed can be trusted again inside
   Godot.** The warning now shows the fingerprint you trusted before and the
   one the server shows now, and **Trust New Fingerprint** installs exactly
