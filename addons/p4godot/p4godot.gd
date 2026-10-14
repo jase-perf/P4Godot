@@ -7712,7 +7712,10 @@ static func _p4_run_streamed(req: P4Request, output: Array) -> void:
 	while true:
 		# Sample "still running" BEFORE reading, so output written just before
 		# p4 exits is still collected on this pass.
-		var running := OS.is_process_running(pid)
+		# Not after a kill: on Linux and macOS OS.kill() also reaps the process
+		# (waitpid), so asking again is an error ("not a child of the calling
+		# process") on every poll until the pipes drain.
+		var running := not req.killed and OS.is_process_running(pid)
 		var batch := PackedStringArray()
 		var got_data := false
 		for i in 2:
@@ -7766,7 +7769,12 @@ static func _p4_run_streamed(req: P4Request, output: Array) -> void:
 			kept[i].append(_decode_p4_bytes(rest).rstrip("\r"))
 		for line in kept[i]:
 			joined.append(String(line))
-	if not req.detach:
+	if req.killed:
+		# The status of a killed p4 is lost where OS.kill() reaps it, and
+		# Godot then reports 0 - a cancel that reads as success. Callers read
+		# `cancelled` and ask the server what happened.
+		req.exit_code = -1
+	elif not req.detach:
 		req.exit_code = OS.get_process_exit_code(pid)
 	output.append("\n".join(joined) + ("\n" if not joined.is_empty() else ""))
 

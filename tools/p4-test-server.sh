@@ -21,8 +21,7 @@
 # only and holds nothing but test data.
 #
 # Needs `p4` on PATH and, for `fetch`, curl and sha256sum (or shasum).
-# Tested on Windows (Git Bash). The macOS and Linux rows of the table below
-# carry Perforce's published checksums but have not been run from here.
+# Tested on Windows (Git Bash); CI also runs it on Linux. Not yet run on macOS.
 set -u
 CALLER="$(pwd)"
 cd "$(dirname "$0")/.." || exit 1
@@ -37,20 +36,16 @@ CONFIG_NAME=".p4config-p4godot-test"
 
 case "$(uname -s)" in
 	MINGW*|MSYS*|CYGWIN*)
-		PLATFORM="windows-x86_64"; URL_PATH="bin.ntx64/p4d.exe"; EXE="p4d.exe"
-		SHA="b2d4254c5e5a8fc2b9389504b97de17fcba0e7045146de7ac214d074f1a75e3a" ;;
+		PLATFORM="windows-x86_64"; URL_PATH="bin.ntx64/p4d.exe"; EXE="p4d.exe" ;;
 	Darwin)
 		if [ "$(uname -m)" = "arm64" ]; then
 			PLATFORM="macos-arm64"; URL_PATH="bin.macosx12arm64/p4d"
-			SHA="63014339967fc8103b3dea409e49294e5e7ddfa661a4f65ef699c6bebb35e173"
 		else
 			PLATFORM="macos-x86_64"; URL_PATH="bin.macosx1015x86_64/p4d"
-			SHA="775a640a50f81392e85445dec0f94bb2ecce172cd68845c652a75c812fec685f"
 		fi
 		EXE="p4d" ;;
 	*)
-		PLATFORM="linux-x86_64"; URL_PATH="bin.linux26x86_64/p4d"; EXE="p4d"
-		SHA="a087490c5d226dac25ed6040012bea6b0eb522198d9aa0486c03efd9bd9d56f3" ;;
+		PLATFORM="linux-x86_64"; URL_PATH="bin.linux26x86_64/p4d"; EXE="p4d" ;;
 esac
 P4D="$REPO/.cache/p4d/$RELEASE/$PLATFORM/$EXE"
 
@@ -114,14 +109,21 @@ sha256_of() {
 }
 
 fetch() {
-	if [ -x "$P4D" ] && [ "$(sha256_of "$P4D")" = "$SHA" ]; then return 0; fi
+	# A copy already here was checked when it was downloaded (it is only
+	# moved into place after that).
+	if [ -x "$P4D" ]; then return 0; fi
 	mkdir -p "$(dirname "$P4D")" || die "can't create $(dirname "$P4D")"
 	echo "fetch $BASE/$URL_PATH" >&2
 	curl -fsSL -o "$P4D.part" "$BASE/$URL_PATH" || die "download failed"
+	# Checked against the SHA256SUMS Perforce publishes beside each binary,
+	# not a hash pinned here: Perforce rebuilds a release in place for each
+	# patch (r26.1's p4d changed on 2026-10-07), which broke a pinned hash.
+	sums="$(curl -fsSL "$BASE/$(dirname "$URL_PATH")/SHA256SUMS")" || die "can't download SHA256SUMS"
+	want="$(printf '%s\n' "$sums" | tr -d '\r' | awk -v f="$(basename "$URL_PATH")" '$2 == f || $2 == "*" f { print $1 }')"
 	got="$(sha256_of "$P4D.part")"
-	if [ "$got" != "$SHA" ]; then
+	if [ -z "$want" ] || [ "$got" != "$want" ]; then
 		rm -f "$P4D.part"
-		die "checksum mismatch for $URL_PATH: expected $SHA, got $got"
+		die "checksum mismatch for $URL_PATH: Perforce's SHA256SUMS says '$want', got $got"
 	fi
 	chmod +x "$P4D.part" && mv "$P4D.part" "$P4D" || die "can't install $P4D"
 }
