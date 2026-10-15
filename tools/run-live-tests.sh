@@ -70,6 +70,20 @@ config/name="p4godot-livetest"
 
 enabled=PackedStringArray("res://addons/p4godot/plugin.cfg")
 EOF
+# A plugin that doesn't compile can't run any test: each would only wait out
+# its timeout and retries.
+if command -v timeout >/dev/null 2>&1; then
+	timeout 180 "$GODOT" --headless --path "$proj" --check-only \
+		--script res://addons/p4godot/p4godot_test.gd > "$work/logs/check.log" 2>&1
+else
+	"$GODOT" --headless --path "$proj" --check-only \
+		--script res://addons/p4godot/p4godot_test.gd > "$work/logs/check.log" 2>&1
+fi
+if grep -q "SCRIPT ERROR" "$work/logs/check.log"; then
+	echo "FAIL: the plugin doesn't compile"
+	grep -A1 "SCRIPT ERROR" "$work/logs/check.log"
+	exit 1
+fi
 printf '.godot/\n*.log\n%s\n' "$P4CONFIG" > "$proj/.p4ignore"
 printf 'extends Node\n' > "$proj/main.gd"
 (

@@ -83,6 +83,9 @@ by hand:
 | 42 | Check out a scene and a script, edit both, leave the scene **unsaved**, then right-click the default changelist → **Shelve Files...**. | The confirmation lists both files, says they move to a new numbered changelist, and names the two files open in Godot with "save first". After confirming, a numbered changelist holds both, with a **Shelved** row underneath listing them in dimmer text. |
 | 43 | On that changelist, **Shelve and Revert...** → confirm, with the scene still open. Then **Unshelve Files...**. | The scene tab reloads to the server's version; the changelist shows no files but keeps its **Shelved** row. Unshelving brings both files back checked out, the scene tab reloads with your edits, and a message says what came back. |
 | 44 | As a second user, shelve an edit to a file you have checked out, plus a new file. Back as yourself, **Shelves...** → pick it → double-click each file, then **Unshelve All...** into a new changelist, and **Combine Now**. | The list shows the teammate's shelf with its full description. Double-clicking shows the shelved change beside the revision it was made from (the new file beside an empty pane). Unshelving makes a changelist "Review of #N...", names the file that needed combining, and the combined file keeps both edits. |
+| 45 | Right-click a scene tab, a script tab, and inside a script → **P4**. Then right-click an instanced scene's node in the Scene dock. | Each has a **P4** submenu with the FileSystem dock's actions; the code editor's starts with **Who Changed This Line?**. The node shows **P4: <scene>** and, if it has a script, **P4: <script>**. A scene never saved has no **P4** item. |
+| 46 | In a script with several submitted revisions, right-click a line → **P4** → **Who Changed This Line?** → **Show in History**. | The message names the change, author, date and description; the history window opens with that change selected. On a line you just typed: "one of your own changes". |
+| 47 | Open a submitted script, add a line, change one, delete one - don't save. Then **Get Latest** or submit. | Green bar beside the added line, blue beside the changed one, a red tick where the line was removed, each within half a second of typing. Undo all three and the marks go. After a submit the marks clear. |
 
 ## Screenshots for the README
 
@@ -99,4 +102,5 @@ crop to the relevant area. The README placeholders are HTML comments marked 📷
 | `diff-viewer.png` | The side-by-side diff window on a file with a few added and removed lines. |
 | `history.png` | The history window on a file with five or six revisions, one of them a rename, a row selected so the full description shows below. |
 | `shelves.png` | The Shelves window with a teammate's shelf selected: the list, its files, the description, and a diff of one file open beside it. |
+| `editor-menus.png` | The code editor with a few changed-line marks and the right-click **P4** submenu open on **Who Changed This Line?**. |
 | `connection-setup.png` | Optional: the workspace-suggestion dialog from connection setup. |

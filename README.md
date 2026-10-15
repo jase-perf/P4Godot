@@ -433,6 +433,28 @@ first.
   P4Godot says so and explains the two-step way round. These actions prompt
   by default, or apply silently with the "Auto add/edit/delete" setting.
 
+### P4 in the editor's other menus
+
+The same actions are on a **P4** submenu wherever a file is in front of you:
+
+- **Scene tabs** and **script tabs**: right-click a tab → **P4** acts on that
+  scene or script.
+- **The code editor**: right-click in a script → **P4** acts on the script,
+  and adds **Who Changed This Line?**. It names the change that last touched
+  the line under the cursor, who made it, when, and its description, and
+  **Show in History** opens the file's history at that change. It follows the
+  file back through renames. A line you changed yourself and haven't
+  submitted is called yours.
+- **The scene tree**: right-click a node → **P4: enemy.tscn** and
+  **P4: enemy.gd** act on the scene the node is an instance of and the script
+  it has.
+
+**Changed lines are marked in the code editor.** A thin bar beside the line
+numbers marks lines added (green) or changed (blue) since the version you
+downloaded, and a red tick marks where lines were removed. The marks follow
+what is in the editor, saved or not, and catch up after Get Latest or a
+submit.
+
 ### Files you edited in Photoshop, Blender, or anywhere else
 
 Textures, models and audio get edited in Photoshop, Blender and Audition,

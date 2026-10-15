@@ -4,6 +4,14 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **P4 in the editor's other right-click menus.** Scene tabs, script tabs and
+  the code editor have a **P4** submenu with the FileSystem dock's actions;
+  a scene tree node has one for the scene it is an instance of and one for
+  its script. In the code editor, **Who Changed This Line?** names the change,
+  author, date and description behind the line under the cursor, following
+  renames, and opens the file's history at that change.
+- **Changed lines are marked in the code editor**: added, changed and removed
+  lines since the version you downloaded, as you type.
 - **Shelving.** Right-click a changelist in the P4G panel to **Shelve Files**
   (or **Update Shelf**), **Shelve and Revert**, **Unshelve Files** or
   **Delete Shelved Files**; a changelist with a shelf lists its shelved files.
@@ -23,9 +31,9 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
   each other, or a revision with the file on your computer, in the same
   side-by-side view as Diff vs Depot. **Get This Revision** puts an older
   revision on your computer without changing anything on the server.
-- **The addon is now eight scripts instead of one.** `p4godot.gd` is still the
+- **The addon is now nine scripts instead of one.** `p4godot.gd` is still the
   plugin `plugin.cfg` names; the code it held is split by job into
-  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history`, `_shelves` and `_dock`. Nothing
+  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history`, `_shelves`, `_dock` and `_menus`. Nothing
   changes for users: updating by replacing the `addons/p4godot` folder picks
   up the new files. The self-tests moved out of the addon into
   `tests/p4godot_test.gd`, so the shipped plugin is about 3,000 lines lighter.

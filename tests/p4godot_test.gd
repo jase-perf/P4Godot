@@ -1094,6 +1094,124 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: shelves" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-editor-menus":
+			# Server-independent: the P4 submenus on scene tabs, script tabs, the
+			# code editor and the scene tree, and the pieces behind "Who Changed
+			# This Line?".
+			var files_ok: bool = _is_project_file("res://a.gd") and not _is_project_file("") \
+					and not _is_project_file("res://main.tscn::GDScript_x1") and not _is_project_file("res://dir/")
+			# A scene tree node: the instanced scene and the script it comes from;
+			# the open scene's root offers only its script.
+			var root := Node.new()
+			var enemy := Node.new()
+			root.add_child(enemy)
+			enemy.scene_file_path = "res://enemy.tscn"
+			var scr := GDScript.new()
+			scr.resource_path = "res://enemy_brain.gd"
+			enemy.set_script(scr)
+			root.scene_file_path = "res://main.tscn"
+			var node_files := _node_source_files(enemy, root)
+			var root_files := _node_source_files(root, root)
+			var nodes_ok: bool = node_files == ["res://enemy.tscn", "res://enemy_brain.gd"] and root_files.is_empty()
+			root.free()
+			_log("[selftest] editor-menus files=%s nodes=%s %s" % [files_ok, nodes_ok, node_files])
+
+			# Each slot's submenu. There's no server here; the menus stay silent
+			# when p4 is known to be unavailable, so say it is.
+			_p4_available = true
+			_slot_submenus.clear()
+			_slot_targets.clear()
+			var slot_menu := P4SlotMenu.new()
+			_populate_slot_menu(slot_menu, "scene_tabs", PackedStringArray(["res://main.tscn"]))
+			_populate_slot_menu(slot_menu, "script_tabs", PackedStringArray(["res://main.tscn::GDScript_x1"]))
+			_populate_slot_menu(slot_menu, "scene_tabs", PackedStringArray([""]))
+			_add_file_submenu(slot_menu, "code", "P4", "res://a.gd", 12)
+			var labels := func(key: String) -> Array:
+				var sub: PopupMenu = _slot_submenus[key]
+				var out: Array = []
+				for i in sub.item_count:
+					out.append(sub.get_item_text(i))
+				return out
+			var tab_labels: Array = labels.call("scene_tabs")
+			var code_labels: Array = labels.call("code")
+			var slots_ok: bool = _slot_submenus.keys().size() == 2 \
+					and String(_slot_targets.scene_tabs.res) == "res://main.tscn" \
+					and tab_labels.size() == _fs_context_actions().size() and tab_labels.has("History...") \
+					and not tab_labels.has("Who Changed This Line?") \
+					and code_labels[0] == "Who Changed This Line?" and int(_slot_targets.code.line) == 12
+			_log("[selftest] editor-menus slots=%s tab=%s code=%s" % [slots_ok, tab_labels, code_labels])
+
+			# A line on disk back to the have revision's line: lines added or
+			# changed on disk map to 0.
+			var have_lines := _split_lines("a\nb\nc\nd\ne\n")
+			var disk_lines := _split_lines("z\na\nb\nX\nd\ne\nf\n")
+			var hunks := _parse_unified_hunks(_line_diff_unified(have_lines, disk_lines))
+			var mapped: Array = []
+			for i in disk_lines.size():
+				mapped.append(_have_line_for(i + 1, hunks))
+			# p4's hunk for a pure insertion after line 2 names line 2 as its old start.
+			var inserted: Array = []
+			for i in 4:
+				inserted.append(_have_line_for(i + 1, [{"old_start": 2, "new_start": 3, "ops": ["add"]}]))
+			var map_ok: bool = mapped == [0, 1, 2, 0, 4, 5, 0] and inserted == [1, 2, 0, 3] \
+					and _have_line_for(3, []) == 3
+			# `p4 -Mj -ztag annotate -c -i` as measured: the file, then a line each.
+			var ann := _annotate_changes("\n".join([
+				'{"action":"move/add","change":"4","depotFile":"//game/main/b.gd","rev":"1","time":"1792108358","type":"text"}',
+				'{"data":"l1\\r\\n","lower":"2","upper":"4"}',
+				'{"data":"... depotFile looks like a field\\r\\n","lower":"3","upper":"4"}',
+			]))
+			var ann_ok: bool = ann == [2, 3]
+			_log("[selftest] editor-menus line map=%s %s inserted=%s annotate=%s" % [map_ok, mapped, inserted, ann])
+			# Changed-line marks: against "a b c d e".
+			var base_lines := _split_lines("a\nb\nc\nd\ne\n")
+			var mark_cases := [
+				["a\nB\nc\nd\ne\nf\n", {1: "changed", 5: "added"}],
+				["a\nc\nd\ne\n", {1: "deleted"}],
+				["a\nb\nc\n", {2: "deleted_end"}],
+				["z\na\nb\nc\nd\ne\n", {0: "added"}],
+				["a\nX\nY\nZ\ne\n", {1: "changed", 2: "changed", 3: "changed"}],
+				["a\nb\nc\nd\ne\n", {}],
+			]
+			var marks_ok := true
+			for mc: Array in mark_cases:
+				var got := _gutter_marks_for(base_lines, _split_lines(String(mc[0])))
+				if got != mc[1]:
+					marks_ok = false
+					_log("[selftest] marks for %s: %s, want %s" % [String(mc[0]).c_escape(), got, mc[1]])
+			var code := CodeEdit.new()
+			var gutters_before := code.get_gutter_count()
+			_gutter_attach(code)
+			_gutter_attach(code) # a second activation adds nothing
+			code.text = "a\nB\nc\nd\ne\n"
+			code.set_meta("p4_have_lines", base_lines)
+			_gutter_update(code)
+			# Another handler on the same signal - as the files layer has - must
+			# survive the marks being taken down.
+			var other := func() -> void: pass
+			code.text_changed.connect(other)
+			var gutter_ok: bool = code.get_gutter_count() == gutters_before + 1 \
+					and code.get_gutter_type(_gutter_index(code)) == TextEdit.GUTTER_TYPE_CUSTOM \
+					and code.get_meta("p4_gutter_marks") == {1: "changed"}
+			_unregister_gutters()
+			gutter_ok = gutter_ok and code.get_gutter_count() == gutters_before and _gutter_index(code) == -1 \
+					and code.text_changed.is_connected(other) \
+					and not code.text_changed.get_connections().any(func(c: Dictionary) -> bool:
+						return Callable(c.callable).get_method() == &"_gutter_schedule")
+			_log("[selftest] editor-menus gutter after takedown: %s" % [code.text_changed.get_connections().map(
+					func(c: Dictionary) -> String: return String(Callable(c.callable).get_method()))])
+			# A removal marked on a line that the next run then adds to stays
+			# visible as a change.
+			var flushed := {}
+			_gutter_flush(flushed, 2, [3], 4, 10)
+			_gutter_flush(flushed, 1, [4], 5, 10)
+			marks_ok = marks_ok and flushed == {3: "changed", 4: "changed"}
+			code.free()
+			_log("[selftest] editor-menus marks=%s gutter=%s" % [marks_ok, gutter_ok])
+			var ok := files_ok and nodes_ok and slots_ok and map_ok and ann_ok and marks_ok and gutter_ok
+			_log("[selftest] %s: editor-menus" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-fs-menu":
 			# Server-independent: folder filtering + the FileSystem-dock action set.
 			var fs_files := _fs_files_only(PackedStringArray(
@@ -1922,6 +2040,53 @@ func _run_cli_self_test_if_requested() -> void:
 					and diff_right_label.text.contains("(workspace)")
 			_log("[selftest] diff: previous=%s move=%s across-move=%s workspace=%s" % [prev_ok, move_ok, across_ok, ws_ok])
 
+			# 4b. Who changed each line. b.txt is "one TWO three four five": "one"
+			# from the first submit (under the old name a.txt, which annotate -i
+			# follows), "TWO" from the second, "five" from the third. Then with a
+			# line added on disk above them: the new line is "yours", and the
+			# others shift down by one. "Show in History" selects the change.
+			var first_change := int(_history_revs[3].change)
+			var second_change := int(_history_revs[2].change)
+			var third_change := int(_history_revs[0].change)
+			var who1 := await _who_changed_line(b_res, 1)
+			var who2 := await _who_changed_line(b_res, 2)
+			var who5 := await _who_changed_line(b_res, 5)
+			await _p4_exec_logged(["edit", b_g])
+			write.call(b_g, "zero\none\nTWO\nthree\nfour\nfive\n")
+			var who_new := await _who_changed_line(b_res, 1)
+			var who_shift := await _who_changed_line(b_res, 3)
+			# The editor's text, unsaved, differs from the disk ("zero one TWO
+			# three four five"): line 5 on screen is "five" (the third submit),
+			# where line 5 on disk is "four" (the second). And line 3 of a
+			# two-line editor text is past its end, though the disk has one.
+			var who_buffer := await _who_changed_line(b_res, 5, "one\nTWO\nthree\nfour\nfive\n", true)
+			var who_past := await _who_changed_line(b_res, 3, "zero\none\n", true)
+			# The code editor's marks for the same file, against the real #have:
+			# the added first line, and "four" changed in the editor (unsaved).
+			var marked := CodeEdit.new()
+			marked.text = "zero\none\nTWO\nthree\nFOUR\nfive\n"
+			_gutter_attach(marked)
+			await _gutter_fetch_have(marked, b_res)
+			var marks_live: Dictionary = marked.get_meta("p4_gutter_marks", {})
+			_unregister_gutters()
+			marked.free()
+			await _p4_exec_logged(["revert", b_g])
+			var who_ok: bool = int(who1.get("change", 0)) == first_change \
+					and int(who2.get("change", 0)) == second_change \
+					and String(who2.get("desc", "")).contains("second paragraph") \
+					and int(who5.get("change", 0)) == third_change \
+					and bool(who_new.get("local", false)) and int(who_shift.get("change", 0)) == second_change \
+					and int(who_buffer.get("change", 0)) == third_change \
+					and String(who_past.get("reason", "")).contains("nothing on line 3")
+			await _show_history(b_res, second_change)
+			var pick_ok: bool = _history_selected() == [2]
+			_log("[selftest] who changed: one=%s TWO=%s five=%s (want %d %d %d), added line local=%s, shifted=%s; history picks the change=%s" \
+					% [who1.get("change", who1.get("reason")), who2.get("change", who2.get("reason")),
+					who5.get("change", who5.get("reason")), first_change, second_change, third_change,
+					who_new.get("local", who_new.get("reason")), who_shift.get("change", who_shift.get("reason")), pick_ok])
+			_log("[selftest] changed-line marks against #have: %s" % [marks_live])
+			ok = ok and who_ok and pick_ok and marks_live == {0: "added", 4: "changed"}
+
 			# 5. Get revision #1, then refuse it on a checked-out file. The file
 			# is writable but unchanged first: `sync -s` refuses that ("can't
 			# clobber"), and _safe_sync's retry once fetched the head revision
@@ -1975,6 +2140,21 @@ func _run_cli_self_test_if_requested() -> void:
 			var pending_ok: bool = _selftest_shown.is_empty() and _history_revs.size() == 2 \
 					and _history_heading.text.contains("renamed from") \
 					and _history_rev_name(_history_revs[0], _history_depot_path) == "c.txt#2"
+			# Who changed a line, and the code editor's marks, on the new name:
+			# both are based on the old name's revision.
+			var utf8_change := int(_history_revs[0].change)
+			var who_moved := await _who_changed_line(dir.path_join("d.txt"), 3)
+			var moved_code := CodeEdit.new()
+			moved_code.text = "alpha\nBETA\ngamma\n"
+			_gutter_attach(moved_code)
+			await _gutter_fetch_have(moved_code, dir.path_join("d.txt"))
+			var moved_marks: Dictionary = moved_code.get_meta("p4_gutter_marks", {})
+			_unregister_gutters()
+			moved_code.free()
+			pending_ok = pending_ok and int(who_moved.get("change", 0)) == utf8_change \
+					and moved_marks == {1: "changed"}
+			_log("[selftest] unsubmitted rename: who changed line 3=%s (want %d), marks=%s" \
+					% [who_moved.get("change", who_moved.get("reason")), utf8_change, moved_marks])
 			await _p4_exec_logged(["revert", c_g, d_g])
 			_log("[selftest] filetype change diffed=%s, unsubmitted rename shows old history=%s (%s)" \
 					% [retyped_ok, pending_ok, _history_heading.text.strip_edges()])

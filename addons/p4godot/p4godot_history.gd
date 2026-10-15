@@ -30,6 +30,8 @@ var _history_have_rev: int = 0
 # first revision (see _filelog_revisions).
 var _history_renamed_from: String = ""
 var _history_truncated: bool = false
+# The change whose revision _populate_history selects (0: the newest).
+var _history_select_change: int = 0
 # ---------------------------------------------------------------------------
 # File history
 #
@@ -188,6 +190,140 @@ static func _no_content_reason(rev: Dictionary, current_depot: String) -> String
 	return "Revision %s deleted the file." % rev_name
 
 
+## The change that last touched each line, from `p4 -Mj -ztag annotate -c -i`:
+## index 0 is line 1. -i follows the file back through moves and branches, so
+## a renamed file's lines name the changes that wrote them rather than the
+## rename (measured on 2026.1). The first JSON object describes the file; each
+## line after it carries `lower`, the change, and `data`, the text.
+static func _annotate_changes(text: String) -> Array:
+	var out: Array = []
+	for raw in text.split("\n"):
+		var line := String(raw).strip_edges()
+		if not line.begins_with("{"):
+			continue
+		var rec: Variant = JSON.parse_string(line)
+		if rec is Dictionary and rec.has("data") and rec.has("lower"):
+			out.append(int(rec.lower))
+	return out
+
+
+## The line of the have revision that line `local_line` (1-based) of the file
+## on disk came from, given the hunks of `p4 diff -du` between them (as from
+## _parse_unified_hunks). 0 when the line was added or changed on disk.
+static func _have_line_for(local_line: int, hunks: Array) -> int:
+	var delta := 0 # have line - local line, past the hunks read so far
+	for h: Dictionary in hunks:
+		var o := int(h.old_start)
+		var n := int(h.new_start)
+		# A hunk with no old lines (a pure insertion) names the line before it.
+		if not h.ops.has("ctx") and not h.ops.has("del"):
+			o += 1
+		if local_line < n:
+			break
+		for op: String in h.ops:
+			match op:
+				"ctx":
+					if n == local_line:
+						return o
+					o += 1
+					n += 1
+				"del":
+					o += 1
+				"add":
+					if n == local_line:
+						return 0
+					n += 1
+		delta = o - n
+	return local_line + delta
+
+
+## The server revision the file in this workspace is based on, from its
+## fstat record: `depot#have`, or for a file whose rename isn't submitted
+## yet (opened for move/add) the file it was moved from at the revision it
+## was moved from - the new name has no revision of its own. "" for a file
+## never submitted.
+static func _base_revision_of(stat: Dictionary) -> String:
+	if String(stat.get("action", "")) == "move/add" and String(stat.get("movedFile", "")).begins_with("//"):
+		return "%s#%d" % [stat.movedFile, int(stat.get("movedRev", "0"))]
+	var depot := String(stat.get("depotFile", ""))
+	if depot.is_empty() or int(stat.get("haveRev", "0")) == 0:
+		return ""
+	return "%s#have" % depot
+
+
+## Who last changed line `line` (1-based) of res_path: {ok, reason, local,
+## change, user, time, desc}. The line is counted in `text` - the code
+## editor's, saved or not, so the answer is about the line on screen - or,
+## with `use_text` false, in the file on disk. `local` is true when the line
+## is one of this computer's own unsubmitted changes.
+func _who_changed_line(res_path: String, line: int, text: String = "", use_text: bool = false) -> Dictionary:
+	var fail := func(reason: String) -> Dictionary: return {"ok": false, "reason": reason}
+	var local_path := ProjectSettings.globalize_path(res_path)
+	if not use_text:
+		if not FileAccess.file_exists(local_path):
+			return fail.call("'%s' isn't on your computer." % res_path)
+		text = FileAccess.get_file_as_string(local_path)
+	var now_lines := _split_lines(text)
+	if line < 1 or line > now_lines.size():
+		return fail.call("There's nothing on line %d of '%s'." % [line, res_path])
+	var stat := await _fetch_fstat_record(res_path)
+	if _shutting_down:
+		return fail.call("")
+	var base := _base_revision_of(stat)
+	if base.is_empty():
+		return fail.call("'%s' has never been submitted to Perforce, so every line in it is yours and unsubmitted." % res_path)
+	if _revision_diffable(String(stat.get("headType", stat.get("type", "text"))), 0).verdict == "binary":
+		return fail.call("'%s' is stored in Perforce as a binary file, so it has no lines to look up." % res_path)
+	# The text's line numbers differ from the base revision's once it's
+	# edited: map through the differences between them, compared here rather
+	# than by `p4 diff`, which only sees the file on disk.
+	var printed := await _p4_exec(["print", "-q", base])
+	if _shutting_down:
+		return fail.call("")
+	if printed.exit_code != 0:
+		return fail.call("Godot couldn't download %s to compare with. Press \"Log\" in the P4G panel to see what Perforce said." % base)
+	var base_lines := _split_lines("" if printed.output.is_empty() else String(printed.output[0]))
+	var have_line := _have_line_for(line, _parse_unified_hunks(_line_diff_unified(base_lines, now_lines)))
+	if have_line == 0:
+		return {"ok": true, "reason": "", "local": true}
+	var a := await _p4_exec(["-Mj", "-ztag", "annotate", "-c", "-i", base])
+	if _shutting_down:
+		return fail.call("")
+	var changes := _annotate_changes("" if a.output.is_empty() else String(a.output[0]))
+	if have_line > changes.size():
+		return fail.call("Godot couldn't find line %d in Perforce's answer for '%s'. Press \"Log\" in the P4G panel to see what it said." % [line, res_path])
+	var change: int = changes[have_line - 1]
+	var desc := await _p4_exec(["-Mj", "-ztag", "describe", "-s", str(change)])
+	var recs := _shelf_records("" if desc.output.is_empty() else String(desc.output[0]))
+	if recs.is_empty():
+		return fail.call("Line %d was last changed in change %d, but Godot couldn't read that change. Press \"Log\" in the P4G panel to see what Perforce said." % [line, change])
+	return {"ok": true, "reason": "", "local": false, "change": change, "user": String(recs[0].user),
+			"time": int(recs[0].time), "desc": String(recs[0].desc)}
+
+
+## The "Who Changed This Line?" answer, with a way into the file's history
+## at that change. `text` and `use_text` as for _who_changed_line.
+func _show_who_changed_line(res_path: String, line: int, text: String = "", use_text: bool = false) -> void:
+	if not await _ensure_identity():
+		await _show_alert(NOT_CONNECTED_MESSAGE)
+		return
+	var who := await _who_changed_line(res_path, line, text, use_text)
+	if _shutting_down:
+		return
+	if not who.ok:
+		if not String(who.reason).is_empty():
+			await _show_alert(String(who.reason))
+		return
+	if who.local:
+		await _show_alert("Line %d of '%s' is one of your own changes, not submitted yet." % [line, res_path])
+		return
+	var bias := int(Time.get_time_zone_from_system().get("bias", 0))
+	var message := "Line %d of '%s' was last changed in change %d by %s on %s:\n\n%s" % [line, res_path,
+			who.change, who.user, _history_date(int(who.time), bias), who.desc]
+	if await _show_confirm_dialog(message, "Show in History", "Close"):
+		await _show_history(res_path, int(who.change))
+
+
 ## Whether `p4 diff2` found the two revisions' contents identical: its header
 ## line ends "==== identical" (a move with no edit, for one).
 static func _diff2_identical(text: String) -> bool:
@@ -269,8 +405,8 @@ func _read_filelog(target: String) -> Dictionary:
 ## Show the history of res_path in the history window. Everything is asked of
 ## the server first and the window changes in one step afterwards, so a click
 ## on the old list while the new one loads can't act on the new file's
-## revisions.
-func _show_history(res_path: String) -> void:
+## revisions. With `select_change`, that change's revision is selected.
+func _show_history(res_path: String, select_change: int = 0) -> void:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return
@@ -303,6 +439,7 @@ func _show_history(res_path: String) -> void:
 	_history_renamed_from = renamed_from
 	_history_truncated = int(parsed.most) >= HISTORY_MAX_REVS
 	_history_have_rev = 0 if not renamed_from.is_empty() else int(stat.get("haveRev", "0"))
+	_history_select_change = select_change
 	_populate_history()
 	history_window.title = "P4 History: %s" % res_path
 	history_window.popup_centered()
@@ -340,8 +477,14 @@ func _populate_history() -> void:
 		heading += " (the newest %d per file)" % HISTORY_MAX_REVS
 	_history_heading.text = heading
 	var first := root.get_first_child()
+	for item in root.get_children():
+		if _history_select_change > 0 and int(_history_revs[int(item.get_metadata(0))].change) == _history_select_change:
+			first = item
+			break
+	_history_select_change = 0 # asked for once; later refills keep the newest first
 	if first:
 		first.select(0)
+		_history_tree.scroll_to_item(first)
 	_update_history_buttons()
 
 

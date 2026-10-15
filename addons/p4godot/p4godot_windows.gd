@@ -723,7 +723,10 @@ static func _line_diff_unified(old_lines: PackedStringArray, new_lines: PackedSt
 
 ## The shortest list of "ctx" / "del" / "add" steps turning `a` into `b`
 ## (Myers' algorithm), after setting aside the lines both start and end with.
-static func _line_diff_ops(a: PackedStringArray, b: PackedStringArray) -> Array:
+## Past `max_edits` differences it stops looking and calls the middle
+## removed, then added: the work grows with the differences times the length.
+static func _line_diff_ops(a: PackedStringArray, b: PackedStringArray,
+		max_edits: int = LINE_DIFF_MAX_EDITS) -> Array:
 	var pre := 0
 	while pre < a.size() and pre < b.size() and a[pre] == b[pre]:
 		pre += 1
@@ -734,13 +737,13 @@ static func _line_diff_ops(a: PackedStringArray, b: PackedStringArray) -> Array:
 	var ops: Array = []
 	for _i in pre:
 		ops.append("ctx")
-	ops.append_array(_myers_ops(a.slice(pre, a.size() - suf), b.slice(pre, b.size() - suf)))
+	ops.append_array(_myers_ops(a.slice(pre, a.size() - suf), b.slice(pre, b.size() - suf), max_edits))
 	for _i in suf:
 		ops.append("ctx")
 	return ops
 
 
-static func _myers_ops(a: PackedStringArray, b: PackedStringArray) -> Array:
+static func _myers_ops(a: PackedStringArray, b: PackedStringArray, max_edits: int) -> Array:
 	var n := a.size()
 	var m := b.size()
 	var ops: Array = []
@@ -750,7 +753,7 @@ static func _myers_ops(a: PackedStringArray, b: PackedStringArray) -> Array:
 		for _i in m:
 			ops.append("add")
 		return ops
-	var max_d := mini(n + m, LINE_DIFF_MAX_EDITS)
+	var max_d := mini(n + m, max_edits)
 	var off := max_d + 1
 	# v[k + off]: the furthest x reached on diagonal k. trace[d] is v as it
 	# stood before step d, which the walk back needs.
