@@ -1,5 +1,5 @@
 @tool
-extends "p4godot_history.gd"
+extends "p4godot_shelves.gd"
 
 ## The P4G dock: toolbar, changelist tree, the actions on its rows, and the
 ## FileSystem dock menu and tooltips.
@@ -49,6 +49,7 @@ var new_changelist_button: Button
 var get_latest_button: Button
 var reconcile_button: Button
 var revert_unchanged_button: Button
+var shelves_button: Button
 # Right side of the toolbar: connection status (click = connection setup) and
 # the gear menu fronting the hidden setting checkboxes.
 var conn_status_button: Button
@@ -124,6 +125,9 @@ func _build_dock() -> void:
 	revert_unchanged_button = _add_toolbar_button(_toolbar_actions, "", "Revert Unchanged...",
 			"Revert opened files that have no actual changes (p4 revert -a).",
 			_on_revert_unchanged_pressed)
+	shelves_button = _add_toolbar_button(_toolbar_actions, "", "Shelves...",
+			"Browse shelved changelists - yours and your team's - to review them side by side or unshelve them into your workspace.",
+			_on_shelves_pressed)
 
 	var spacer := Control.new()
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -480,8 +484,9 @@ func _rebuild_tree(model: Dictionary) -> void:
 		cl_item.set_custom_color(1, dim)
 		cl_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
 		cl_item.set_selectable(1, false)
+		var shelved: Array = cl.get("shelved", [])
 		cl_item.set_metadata(0, {"type": "cl", "change": cl.change, "desc": cl.desc,
-				"file_count": cl.files.size()})
+				"file_count": cl.files.size(), "shelved_count": shelved.size()})
 		if folder_icon:
 			cl_item.set_icon(0, folder_icon)
 			cl_item.set_icon_modulate(0, P4_ACCENT) # the P4 brand touch
@@ -492,11 +497,13 @@ func _rebuild_tree(model: Dictionary) -> void:
 			f_item.set_text(0, String(f.res_path).trim_prefix("res://"))
 			f_item.set_tooltip_text(0, "%s\n%s" % [f.res_path, f.depot_path])
 			if bool(f.get("unresolved", false)):
-				# A teammate's newer version is waiting to be combined with
-				# this one; the server refuses the submit until it is.
+				# Another version - a teammate's newer one, or a shelf
+				# unshelved onto this one - is waiting to be combined with
+				# it; the server refuses the submit until it is.
 				f_item.set_text(0, "%s  (needs resolve)" % String(f.res_path).trim_prefix("res://"))
 				f_item.set_custom_color(0, ACTION_DELETE_COLOR)
-				f_item.set_tooltip_text(0, ("%s\n%s\nA teammate changed this file too. Right-click " +
+				f_item.set_tooltip_text(0, ("%s\n%s\nAnother version of this file - a teammate's, " +
+						"or a shelf you unshelved - is waiting to be combined with yours. Right-click " +
 						"and choose \"Resolve...\" to combine the two versions.") % [f.res_path, f.depot_path])
 			f_item.set_text(1, f.action)
 			f_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
@@ -508,6 +515,41 @@ func _rebuild_tree(model: Dictionary) -> void:
 			f_item.set_metadata(0, {"type": "file", "res_path": f.res_path,
 					"depot_path": f.depot_path, "action": f.action, "change": f.change,
 					"unresolved": bool(f.get("unresolved", false))})
+		if not shelved.is_empty():
+			# The shelf: copies of files on the server, not open here. A row
+			# of its own, so its files never read as checked out.
+			var shelf_item := tree.create_item(cl_item)
+			shelf_item.set_text(0, "Shelved")
+			shelf_item.set_text(1, "%d file%s" % [shelved.size(), "" if shelved.size() == 1 else "s"])
+			shelf_item.set_custom_color(0, dim)
+			shelf_item.set_custom_color(1, dim)
+			shelf_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
+			shelf_item.set_selectable(1, false)
+			shelf_item.set_tooltip_text(0, ("Copies of these files are shelved on the server in " +
+					"changelist #%s, for review or to pick up later. Right-click for what you can do " +
+					"with them.") % cl.change)
+			var shelf_icon := _theme_icon("Load")
+			if shelf_icon:
+				shelf_item.set_icon(0, shelf_icon)
+				shelf_item.set_icon_modulate(0, dim)
+			shelf_item.set_metadata(0, {"type": "shelf", "change": cl.change})
+			for s in shelved:
+				var s_item := tree.create_item(shelf_item)
+				var shown := String(s.res_path).trim_prefix("res://") if not String(s.res_path).is_empty() \
+						else String(s.depot_path)
+				s_item.set_text(0, shown)
+				s_item.set_tooltip_text(0, "%s\nshelved in changelist #%s" % [s.depot_path, cl.change])
+				s_item.set_custom_color(0, dim)
+				s_item.set_text(1, s.action)
+				s_item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
+				s_item.set_custom_color(1, _action_color(s.action))
+				s_item.set_selectable(1, false)
+				var s_icon := _file_icon(shown)
+				if s_icon:
+					s_item.set_icon(0, s_icon)
+					s_item.set_icon_modulate(0, Color(1, 1, 1, 0.6))
+				s_item.set_metadata(0, {"type": "shelved_file", "res_path": s.res_path,
+						"depot_path": s.depot_path, "action": s.action, "change": cl.change})
 
 
 func _editor_bold_font() -> Font:
@@ -515,16 +557,6 @@ func _editor_bold_font() -> Font:
 	if base and base.has_theme_font("bold", "EditorFonts"):
 		return base.get_theme_font("bold", "EditorFonts")
 	return null
-
-
-func _file_icon(res_path: String) -> Texture2D:
-	match res_path.get_extension().to_lower():
-		"tscn", "scn": return _theme_icon("PackedScene")
-		"gd": return _theme_icon("GDScript")
-		"cs": return _theme_icon("CSharpScript")
-		"tres", "res": return _theme_icon("Resource")
-		"png", "webp", "jpg", "jpeg", "svg", "bmp": return _theme_icon("Image")
-		_: return _theme_icon("File")
 
 
 ## Open the double-clicked / Enter-activated file row in the editor.
@@ -537,6 +569,9 @@ func _on_tree_item_activated() -> void:
 		return
 	if meta.get("type") == "setup":
 		_offer_connection_setup()
+		return
+	if meta.get("type") == "shelved_file":
+		_diff_shelved_row(meta, false)
 		return
 	if meta.get("type") != "file":
 		return
@@ -625,6 +660,13 @@ enum {
 	CTX_DIFF,
 	CTX_RESOLVE,
 	CTX_HISTORY,
+	CTX_SHELVE,
+	CTX_SHELVE_REVERT,
+	CTX_UNSHELVE,
+	CTX_DELETE_SHELF,
+	CTX_SHELF_DIFF,
+	CTX_SHELF_DIFF_WORKSPACE,
+	CTX_SHELF_WINDOW,
 }
 const CTX_MOVE_BASE := 1000
 
@@ -670,12 +712,34 @@ func _populate_context_menu(meta: Dictionary) -> void:
 		context_menu.add_separator()
 	elif kind == "cl":
 		var fc := int(meta.get("file_count", -1)) # -1 (unknown) is treated non-empty
+		var shelved := int(meta.get("shelved_count", 0))
 		if fc != 0:
 			context_menu.add_item("Submit Changelist...", CTX_SUBMIT)
 		# Editing the default changelist's description promotes it to a numbered one.
 		context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
-		if String(meta.get("change", "")) != "default" and fc == 0:
+		# Perforce won't delete a changelist that still has a shelf.
+		if String(meta.get("change", "")) != "default" and fc == 0 and shelved == 0:
 			context_menu.add_item("Delete Changelist", CTX_DELETE_CL)
+		if fc != 0 or shelved > 0:
+			context_menu.add_separator()
+		if fc != 0:
+			context_menu.add_item("Update Shelf..." if shelved > 0 else "Shelve Files...", CTX_SHELVE)
+			context_menu.add_item("Shelve and Revert...", CTX_SHELVE_REVERT)
+		if shelved > 0:
+			context_menu.add_item("Unshelve Files...", CTX_UNSHELVE)
+			context_menu.add_item("Delete Shelved Files...", CTX_DELETE_SHELF)
+		context_menu.add_separator()
+	elif kind == "shelf":
+		context_menu.add_item("Unshelve Files...", CTX_UNSHELVE)
+		context_menu.add_item("Delete Shelved Files...", CTX_DELETE_SHELF)
+		context_menu.add_item("Show in Shelves Window", CTX_SHELF_WINDOW)
+		context_menu.add_separator()
+	elif kind == "shelved_file":
+		context_menu.add_item("Diff vs Base", CTX_SHELF_DIFF)
+		context_menu.add_item("Diff vs Workspace", CTX_SHELF_DIFF_WORKSPACE)
+		context_menu.add_item("Unshelve This File...", CTX_UNSHELVE)
+		context_menu.add_item("Delete From Shelf...", CTX_DELETE_SHELF)
+		context_menu.add_separator()
 	context_menu.add_item("Refresh", CTX_REFRESH)
 
 
@@ -742,6 +806,28 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_DELETE_CL:
 			if meta.has("change"):
 				await _delete_changelist(meta.change)
+		CTX_SHELVE, CTX_SHELVE_REVERT:
+			if meta.get("type") == "cl":
+				await _shelve_changelist(String(meta.change), id == CTX_SHELVE_REVERT)
+		CTX_UNSHELVE:
+			if meta.has("change"):
+				var shelf := await _read_shelf(String(meta.change))
+				if shelf.get("files", []).is_empty():
+					await _show_alert("Changelist #%s has no shelved files any more." % meta.change)
+					_request_refresh()
+				else:
+					var only: Array = [String(meta.depot_path)] if meta.get("type") == "shelved_file" else []
+					await _unshelve(shelf, only, String(meta.change))
+		CTX_DELETE_SHELF:
+			if meta.has("change"):
+				var only: Array = [String(meta.depot_path)] if meta.get("type") == "shelved_file" else []
+				await _delete_shelf(String(meta.change), only)
+		CTX_SHELF_DIFF, CTX_SHELF_DIFF_WORKSPACE:
+			if meta.get("type") == "shelved_file":
+				await _diff_shelved_row(meta, id == CTX_SHELF_DIFF_WORKSPACE)
+		CTX_SHELF_WINDOW:
+			if meta.has("change"):
+				await _show_shelves(String(meta.change))
 		CTX_REFRESH:
 			_refresh_changelists()
 
@@ -800,7 +886,7 @@ func _refresh_changelists() -> void:
 ## dock is honestly inert instead of offering doomed actions.
 func _set_actions_enabled(enabled: bool) -> void:
 	for b: Button in [new_changelist_button, get_latest_button, reconcile_button,
-			revert_unchanged_button]:
+			revert_unchanged_button, shelves_button]:
 		if b:
 			b.disabled = not enabled
 

@@ -1191,6 +1191,16 @@ func _action_color(action: String) -> Color:
 	return ACTION_EDIT_COLOR # edit / integrate / branch
 
 
+func _file_icon(res_path: String) -> Texture2D:
+	match res_path.get_extension().to_lower():
+		"tscn", "scn": return _theme_icon("PackedScene")
+		"gd": return _theme_icon("GDScript")
+		"cs": return _theme_icon("CSharpScript")
+		"tres", "res": return _theme_icon("Resource")
+		"png", "webp", "jpg", "jpeg", "svg", "bmp": return _theme_icon("Image")
+		_: return _theme_icon("File")
+
+
 ## Whether res_path is open as a scene tab or in the script editor.
 func _is_open_in_editor(res_path: String) -> bool:
 	if res_path in EditorInterface.get_open_scenes():
@@ -1226,7 +1236,9 @@ var _external_scan_dismissed: String = ""
 
 
 ## The files with a merge waiting, from `p4 -ztag resolve -n` records:
-## [{res_path, local, binary, special}], sorted by path, one entry per file.
+## [{res_path, local, binary, special, shelf}], sorted by path, one entry per
+## file. `shelf`: the changelist whose shelf is the other version, or "" for
+## a newer submitted revision.
 ## `binary`: Perforce can't combine the two versions (contentResolveType is
 ## not a text merge), so one of them has to win. `special`: the file also needs
 ## a kind of resolve this plugin doesn't offer (a move, a delete, a filetype
@@ -1239,7 +1251,11 @@ func _unresolved_in(records: Array) -> Array:
 			continue
 		var res := _local_to_res(local)
 		var entry: Dictionary = by_local.get(local, {"res_path": res if not res.is_empty() else local,
-				"local": local, "binary": false, "special": false})
+				"local": local, "binary": false, "special": false, "shelf": ""})
+		# Set when the other version is a shelf unshelved onto this file
+		# rather than a newer submitted revision.
+		if not String(rec.get("shelvedChange", "")).is_empty():
+			entry.shelf = String(rec.shelvedChange)
 		if String(rec.get("resolveType", "content")) != "content":
 			entry.special = true
 		elif not String(rec.get("contentResolveType", "")).contains("text"):
@@ -1467,6 +1483,67 @@ func _format_other_opens(others: Array) -> String:
 
 
 # ---------------------------------------------------------------------------
+# Shelves
+#
+# `p4 -Mj -ztag describe -S -s N...` and `p4 -Mj -ztag changes -s shelved -l`.
+# JSON (-Mj) for the same reason as the file history: a description holding a
+# blank line ends a tagged record early. One describe call takes any number of
+# changelists and prints one JSON object per changelist (measured on 2026.1).
+# ---------------------------------------------------------------------------
+
+## The changelists in `p4 -Mj -ztag describe -S` or `changes -l` output, each
+## {change, user, client, time, desc, files}; `files` (describe only) holds
+## {depot, action, rev, type, size} per shelved file, where `rev` is the
+## revision the shelved file was based on. A delete has no type or size.
+## p4's messages ({"data": ...}) are skipped.
+static func _shelf_records(text: String) -> Array:
+	var out: Array = []
+	for raw in text.split("\n"):
+		var line := String(raw).strip_edges()
+		if not line.begins_with("{"):
+			continue
+		var rec: Variant = JSON.parse_string(line)
+		if not rec is Dictionary or not rec.has("change"):
+			continue
+		var files: Array = []
+		var i := 0
+		while rec.has("depotFile%d" % i):
+			files.append({
+				"depot": String(rec["depotFile%d" % i]),
+				"action": String(rec.get("action%d" % i, "")),
+				"rev": int(rec.get("rev%d" % i, "0")),
+				"type": String(rec.get("type%d" % i, "")),
+				"size": int(rec.get("fileSize%d" % i, "0")),
+			})
+			i += 1
+		out.append({
+			"change": String(rec.change),
+			"user": String(rec.get("user", "")),
+			"client": String(rec.get("client", "")),
+			"time": int(rec.get("time", "0")),
+			"desc": String(rec.get("desc", "")).strip_edges(),
+			"files": files,
+		})
+	return out
+
+
+## The shelved files of the given numbered changelists: {change: files}, with
+## each file as in _shelf_records. A changelist with nothing shelved is absent.
+func _read_shelves(changes: Array) -> Dictionary:
+	var out := {}
+	if changes.is_empty():
+		return out
+	var args: PackedStringArray = ["-Mj", "-ztag", "describe", "-S", "-s"]
+	for c in changes:
+		args.append(String(c))
+	var result := await _p4_exec(args)
+	for shelf in _shelf_records("" if result.output.is_empty() else String(result.output[0])):
+		if not shelf.files.is_empty():
+			out[String(shelf.change)] = shelf.files
+	return out
+
+
+# ---------------------------------------------------------------------------
 # Changelist model - the data behind the dock's changelist tree
 # ---------------------------------------------------------------------------
 
@@ -1476,8 +1553,11 @@ func _format_other_opens(others: Array) -> String:
 ## `opened_ok` says the `p4 opened` query itself succeeded (it exits 0 with an
 ## empty list when nothing is open), which is what lets _sync_opened_cache
 ## tell "nothing is checked out" from "we couldn't ask".
-## each changelist: {change: "default"|"<n>", desc: String, files: Array}
+## each changelist: {change: "default"|"<n>", desc: String, files: Array,
+##                   shelved: Array}
 ## each file:       {res_path, depot_path, action, change, type}
+## each shelved file: {res_path ("" if this workspace doesn't map it),
+##                   depot_path, action, rev, type, size, change}
 ## The default changelist is synthesized (p4 never lists it) and always present,
 ## even empty, so newly-opened files always have a home in the tree.
 func _query_pending_model() -> Dictionary:
@@ -1488,15 +1568,30 @@ func _query_pending_model() -> Dictionary:
 	var opened_result: Dictionary = await _p4_exec(["-ztag", "opened"])
 	var opened := _parse_ztag(opened_result)
 
-	# 2. Map each opened depotFile to a local path. `opened`'s clientFile is
-	#    CLIENT syntax (//workspace/...), not a filesystem path - `p4 where`'s
-	#    `path` field is the local OS path we can localize to res://.
+	# 1b. Pending numbered changelists owned by us in this client, and the
+	#     files shelved in those that have a shelf (`changes` tags them with
+	#     an empty `shelved` field).
+	var changes := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
+			"-c", _p4_client, "-u", _p4_user]))
+	var with_shelf: Array = []
+	for crec in changes:
+		if crec.has("shelved") and not String(crec.get("change", "")).is_empty():
+			with_shelf.append(String(crec.change))
+	var shelves := await _read_shelves(with_shelf)
+
+	# 2. Map each opened or shelved depotFile to a local path. `opened`'s
+	#    clientFile is CLIENT syntax (//workspace/...), not a filesystem path -
+	#    `p4 where`'s `path` field is the local OS path we can localize to res://.
 	var depot_to_res := {}
 	var depot_paths: PackedStringArray = []
 	for rec in opened:
 		var d := String(rec.get("depotFile", ""))
 		if not d.is_empty():
 			depot_paths.append(d)
+	for files: Array in shelves.values():
+		for f: Dictionary in files:
+			if not depot_paths.has(String(f.depot)):
+				depot_paths.append(String(f.depot))
 	if not depot_paths.is_empty():
 		var where_args: PackedStringArray = ["-ztag", "where"]
 		where_args.append_array(depot_paths)
@@ -1515,21 +1610,23 @@ func _query_pending_model() -> Dictionary:
 		for waiting in _unresolved_in(_parse_ztag(await _p4_exec(["-ztag", "resolve", "-n"]))):
 			unresolved[String(waiting.res_path)] = true
 
-	# 3. Pending numbered changelists owned by us in this client.
-	var changes := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
-			"-c", _p4_client, "-u", _p4_user]))
-
-	# Ordered list: default first, then numbered. by_change indexes into it.
+	# 3. Ordered list: default first, then numbered. by_change indexes into it.
 	var cls: Array = []
 	var by_change: Dictionary = {}
-	var default_cl := {"change": "default", "desc": "(default changelist)", "files": []}
+	var default_cl := {"change": "default", "desc": "(default changelist)", "files": [], "shelved": []}
 	cls.append(default_cl)
 	by_change["default"] = default_cl
 	for crec in changes:
 		var num := String(crec.get("change", ""))
 		if num.is_empty():
 			continue
-		var cl := {"change": num, "desc": String(crec.get("desc", "")).strip_edges(), "files": []}
+		var shelved: Array = []
+		for f: Dictionary in shelves.get(num, []):
+			shelved.append({"res_path": String(depot_to_res.get(String(f.depot), "")),
+					"depot_path": String(f.depot), "action": String(f.action), "rev": int(f.rev),
+					"type": String(f.type), "size": int(f.size), "change": num})
+		var cl := {"change": num, "desc": String(crec.get("desc", "")).strip_edges(), "files": [],
+				"shelved": shelved}
 		cls.append(cl)
 		by_change[num] = cl
 
@@ -1543,7 +1640,7 @@ func _query_pending_model() -> Dictionary:
 		if not by_change.has(change_key):
 			# Opened in a numbered CL that `changes` didn't return - synthesize a
 			# bucket so the file is never silently dropped.
-			var cl := {"change": change_key, "desc": "", "files": []}
+			var cl := {"change": change_key, "desc": "", "files": [], "shelved": []}
 			cls.append(cl)
 			by_change[change_key] = cl
 		by_change[change_key].files.append({
@@ -2510,9 +2607,12 @@ func _show_connection_dialog(port: String, user: String) -> Dictionary:
 ## change: String} - `change` is "default" or a changelist number, valid only
 ## when ok. The dropdown defaults to the first choice (the default changelist).
 func _show_checkout_target_dialog(text: String, ok_text: String,
-		cancel_text: String, choices: Array) -> Dictionary:
+		cancel_text: String, choices: Array, title: String = "Check Out",
+		picker_label: String = "Check out to:") -> Dictionary:
 	if _shutting_down:
 		return {"ok": false, "change": "default"}
+	if _selftest_mode:
+		_selftest_shown.append(text)
 	while _dialog_busy:
 		await get_tree().process_frame
 	_dialog_busy = true
@@ -2520,7 +2620,7 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	_dialog_result_confirmed = false
 
 	var dialog := ConfirmationDialog.new()
-	dialog.title = "Check Out"
+	dialog.title = title
 	dialog.set_ok_button_text(ok_text)
 	dialog.set_cancel_button_text(cancel_text)
 	var vbox := VBoxContainer.new()
@@ -2529,7 +2629,7 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	vbox.add_child(label)
 	var row := HBoxContainer.new()
 	var row_label := Label.new()
-	row_label.text = "Check out to:"
+	row_label.text = picker_label
 	row.add_child(row_label)
 	var picker := OptionButton.new()
 	for c in choices:
@@ -2548,6 +2648,8 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
 		if is_instance_valid(dialog):
+			if not _selftest_option_picks.is_empty():
+				picker.select(int(_selftest_option_picks.pop_front()))
 			if _selftest_auto_answer == "confirm":
 				dialog.confirmed.emit()
 			else:

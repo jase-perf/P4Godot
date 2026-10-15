@@ -4,6 +4,18 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **Shelving.** Right-click a changelist in the P4G panel to **Shelve Files**
+  (or **Update Shelf**), **Shelve and Revert**, **Unshelve Files** or
+  **Delete Shelved Files**; a changelist with a shelf lists its shelved files.
+  **Shelves...** in the P4G toolbar lists the newest shelves in the project,
+  yours or everyone's, and opens any changelist by number: compare a shelved
+  file with the revision it was made from or with your copy, without touching
+  your workspace, and unshelve all or some of it into a changelist you pick.
+  Unshelving keeps your own edits and offers to combine them with the shelved
+  version; it leaves alone files that are writable but not checked out, and
+  afterwards names every file it left out and why. Shelve and Revert checks
+  that the shelf holds what is on disk before it reverts anything. Submitting
+  a changelist that has a shelf deletes the shelf first, and says so.
 - **File history.** Right-click a file → **P4: History...** (in the
   FileSystem dock or the P4G panel) lists every submitted revision with its
   changelist, author, date and full description, following the file back
@@ -11,9 +23,9 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
   each other, or a revision with the file on your computer, in the same
   side-by-side view as Diff vs Depot. **Get This Revision** puts an older
   revision on your computer without changing anything on the server.
-- **The addon is now seven scripts instead of one.** `p4godot.gd` is still the
+- **The addon is now eight scripts instead of one.** `p4godot.gd` is still the
   plugin `plugin.cfg` names; the code it held is split by job into
-  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history` and `_dock`. Nothing
+  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history`, `_shelves` and `_dock`. Nothing
   changes for users: updating by replacing the `addons/p4godot` folder picks
   up the new files. The self-tests moved out of the addon into
   `tests/p4godot_test.gd`, so the shipped plugin is about 3,000 lines lighter.

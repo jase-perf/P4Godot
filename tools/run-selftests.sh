@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 GODOT="${1:-${GODOT:-godot}}"
 [ $# -gt 0 ] && shift
-TESTS="parse-ztag history sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
+TESTS="parse-ztag history shelves sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
 diff-align dismiss-dialog build-change-spec fs-menu fstat-summary delete-action
 connection-store connection-dialogs progress streamed-exec breaker dial"
 [ $# -gt 0 ] && TESTS="$*"
@@ -105,7 +105,9 @@ code=$?
 if [ "$code" -ne 0 ] || grep -q "SCRIPT ERROR" "$work/logs/check.log"; then
 	echo "FAIL: parse/warnings check (exit $code)"
 	cat "$work/logs/check.log"
-	failed="$failed check"
+	# A plugin that doesn't compile can't run any test: each would only wait
+	# out its timeout and retries.
+	exit 1
 else
 	echo "ok: parse/warnings check"
 fi

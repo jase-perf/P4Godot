@@ -768,21 +768,30 @@ func _resolve_one(file: Dictionary, position: int, total: int) -> String:
 				"the file and choose \"Resolve Files...\".") % res)
 		return "later"
 	var can_combine := not bool(file.binary)
+	var shelf := String(file.get("shelf", ""))
 	while true:
 		var options := PackedStringArray()
 		var modes: Array = []
 		if can_combine:
 			options.append("Combine both versions")
 			modes.append("combine")
-		options.append("Keep mine (their changes are left out)")
+		if shelf.is_empty():
+			options.append("Keep mine (their changes are left out)")
+			options.append("Take theirs (my changes are thrown away)")
+		else:
+			options.append("Keep mine (the shelved changes are left out)")
+			options.append("Take the shelved version (my changes are thrown away)")
 		modes.append("mine")
-		options.append("Take theirs (my changes are thrown away)")
 		modes.append("theirs")
 		options.append("Decide later")
 		modes.append("later")
 		var message := ("A teammate submitted a newer version of this file while you had it " +
 				"checked out:\n\n    %s\n\nYour version is on your computer; theirs is on the " +
 				"server. Choose what the file should contain when you submit.") % res
+		if not shelf.is_empty():
+			message = ("You unshelved changelist #%s onto this file while you had your own " +
+					"changes in it:\n\n    %s\n\nYour version is on your computer; the shelved " +
+					"one is on the server. Choose what the file should contain.") % [shelf, res]
 		if can_combine:
 			message += ("\n\n\"Combine\" keeps both sets of changes, as long as you didn't " +
 					"both change the same lines.")
@@ -801,9 +810,10 @@ func _resolve_one(file: Dictionary, position: int, total: int) -> String:
 		if mode == "later":
 			return "later"
 		if mode == "theirs" and not await _show_confirm_dialog(
-				("Throw away your changes to '%s' and take your teammate's version?\n\n" +
-				"Everything you changed in this file is lost, and this can't be undone.") % res,
-				"Take Theirs", "Go Back"):
+				("Throw away your changes to '%s' and take %s?\n\n" +
+				"Everything you changed in this file is lost, and this can't be undone.") % [res,
+				"your teammate's version" if shelf.is_empty() else "the shelved version"],
+				"Take Theirs" if shelf.is_empty() else "Take Shelved", "Go Back"):
 			continue
 		var flag: String = {"combine": "-am", "mine": "-ay", "theirs": "-at"}[mode]
 		var result := await _p4_exec_logged(["resolve", flag, local])
@@ -949,8 +959,8 @@ func _delete_changelist(change: String) -> void:
 	if result.exit_code != 0:
 		var msg := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
 		await _show_alert(("Perforce wouldn't delete changelist #%s:\n\n%s\n\nMost often " +
-				"it still has files in it - move them to another changelist or submit " +
-				"them first.") % [change, msg])
+				"it still has files in it, or shelved files - move them to another changelist, " +
+				"submit them, or delete the shelf first.") % [change, msg])
 	_request_refresh()
 
 
@@ -1139,16 +1149,42 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	if files.size() > shown:
 		file_lines.append("    ...and %d more" % (files.size() - shown))
 	var label := "the default changelist" if change == "default" else "changelist #%s" % change
+	# Perforce refuses to submit a changelist that has a shelf ("has shelved
+	# files -- cannot submit"), so the shelf goes first - said up front, since
+	# a teammate may be reviewing it.
+	var shelf_count := 0
+	var shelf_only: Array = []
+	if change != "default":
+		var shelf_files: Array = (await _read_shelves([change])).get(change, [])
+		shelf_count = shelf_files.size()
+		var submitting := files.map(func(f: Dictionary) -> String: return String(f.depot_path))
+		for sf: Dictionary in shelf_files:
+			if not submitting.has(String(sf.depot)):
+				shelf_only.append(String(sf.depot))
+	var shelf_note := "" if shelf_count == 0 else ("\n\nThis changelist also has %d shelved " +
+			"file%s. Perforce won't submit it while the shelf exists, so the shelf is deleted " +
+			"first; anyone reviewing it loses access.") % [shelf_count, "" if shelf_count == 1 else "s"]
+	if not shelf_only.is_empty():
+		shelf_note += ("\n\nThese shelved files aren't part of this submit, and the shelf is their " +
+				"only copy - unshelve them first to keep them:\n%s") % _file_listing(shelf_only)
 	var proceed: bool = await _show_confirm_dialog(
 			("Submit %s to Perforce?\n\nDescription:\n%s\n\nFiles (%d):\n%s\n\n" +
-			"This is permanent and visible to your whole team.")
-			% [label, desc, files.size(), "\n".join(file_lines)],
+			"This is permanent and visible to your whole team.%s")
+			% [label, desc, files.size(), "\n".join(file_lines), shelf_note],
 			"Submit to Perforce", "Cancel")
 	if not proceed:
 		_log("Submit cancelled.")
 		return
 	if not await _transfer_slot_free():
 		return # a download was started while the confirmation sat open
+	if shelf_count > 0:
+		var dropped := await _p4_exec_logged(["shelve", "-d", "-c", change])
+		if not (await _read_shelves([change])).get(change, []).is_empty():
+			await _show_alert(("Perforce wouldn't delete the shelf of changelist #%s, so it can't " +
+					"be submitted. Nothing was sent. Perforce said:\n\n%s") % [change,
+					"" if dropped.output.is_empty() else String(dropped.output[0]).strip_edges()])
+			_request_refresh()
+			return
 
 	var number := change
 	if change == "default":
@@ -1229,6 +1265,10 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	else:
 		_log("Submit of changelist %s: %s." % [number,
 				"not submitted" if outcome == "not_submitted" else "outcome unknown"])
+		if shelf_count > 0:
+			await _show_alert(("The shelf of changelist #%s was deleted before the submit, so " +
+					"it no longer exists. Whatever is still checked out in it can be shelved again " +
+					"if anyone needs to review it.") % change)
 	_request_refresh()
 
 

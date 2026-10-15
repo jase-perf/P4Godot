@@ -151,6 +151,9 @@ func _exit_tree() -> void:
 		diff_window = null
 		history_window = null
 		_history_tree = null
+		shelves_window = null
+		_shelves_tree = null
+		_shelf_files_tree = null
 		diff_left = null
 		diff_right = null
 		diff_left_label = null

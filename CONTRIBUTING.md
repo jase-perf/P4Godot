@@ -19,6 +19,7 @@ from every later layer with no wiring between them:
 | `p4godot_windows.gd` | The transfer progress window and the diff viewer |
 | `p4godot_flows.gd` | Get Latest, resolve, changelist create / edit / move, Submit, syncing one file |
 | `p4godot_history.gd` | The file history window: revisions, diffs between them, Get This Revision |
+| `p4godot_shelves.gd` | Shelving: your changelists' shelve, update, shelve and revert, unshelve and delete, and the Shelves window for everyone's shelves |
 | `p4godot_dock.gd` | The P4G dock, its changelist tree and actions, and the FileSystem dock's tooltips and right-click menu |
 | `p4godot.gd` | The plugin entry point named in `plugin.cfg`: an overview comment, `_enter_tree` and `_exit_tree` |
 

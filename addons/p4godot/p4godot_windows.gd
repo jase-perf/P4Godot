@@ -687,6 +687,126 @@ func _parse_unified_hunks(diff_text: String) -> Array:
 	return hunks
 
 
+# Past this many differences the line diff below stops looking for the
+# shortest edit and shows the changed middle as removed, then added.
+const LINE_DIFF_MAX_EDITS := 1500
+
+
+## A unified diff of two texts' lines, as one hunk covering both, for the
+## diff window when p4 can't make one: a file that exists on only one side
+## (a shelved add), or a comparison p4 gets wrong (`p4 diff file@=N` on the
+## new half of a shelved move read another file's content, measured on
+## 2026.1). Only the hunk's operations are read (_parse_unified_hunks); the
+## text shown always comes from the files. "" when both are empty.
+static func _line_diff_unified(old_lines: PackedStringArray, new_lines: PackedStringArray) -> String:
+	if old_lines.is_empty() and new_lines.is_empty():
+		return ""
+	var ops := _line_diff_ops(old_lines, new_lines)
+	var out := "@@ -%d,%d +%d,%d @@\n" % [mini(1, old_lines.size()), old_lines.size(),
+			mini(1, new_lines.size()), new_lines.size()]
+	var i := 0
+	var j := 0
+	for op: String in ops:
+		match op:
+			"ctx":
+				out += " " + old_lines[i] + "\n"
+				i += 1
+				j += 1
+			"del":
+				out += "-" + old_lines[i] + "\n"
+				i += 1
+			"add":
+				out += "+" + new_lines[j] + "\n"
+				j += 1
+	return out
+
+
+## The shortest list of "ctx" / "del" / "add" steps turning `a` into `b`
+## (Myers' algorithm), after setting aside the lines both start and end with.
+static func _line_diff_ops(a: PackedStringArray, b: PackedStringArray) -> Array:
+	var pre := 0
+	while pre < a.size() and pre < b.size() and a[pre] == b[pre]:
+		pre += 1
+	var suf := 0
+	while suf < a.size() - pre and suf < b.size() - pre \
+			and a[a.size() - 1 - suf] == b[b.size() - 1 - suf]:
+		suf += 1
+	var ops: Array = []
+	for _i in pre:
+		ops.append("ctx")
+	ops.append_array(_myers_ops(a.slice(pre, a.size() - suf), b.slice(pre, b.size() - suf)))
+	for _i in suf:
+		ops.append("ctx")
+	return ops
+
+
+static func _myers_ops(a: PackedStringArray, b: PackedStringArray) -> Array:
+	var n := a.size()
+	var m := b.size()
+	var ops: Array = []
+	if n == 0 or m == 0:
+		for _i in n:
+			ops.append("del")
+		for _i in m:
+			ops.append("add")
+		return ops
+	var max_d := mini(n + m, LINE_DIFF_MAX_EDITS)
+	var off := max_d + 1
+	# v[k + off]: the furthest x reached on diagonal k. trace[d] is v as it
+	# stood before step d, which the walk back needs.
+	var v := PackedInt32Array()
+	v.resize(2 * off + 1)
+	var trace: Array = []
+	var found := -1
+	for d in max_d + 1:
+		trace.append(v.duplicate())
+		var k := -d
+		while k <= d:
+			var x: int
+			if k == -d or (k != d and v[k - 1 + off] < v[k + 1 + off]):
+				x = v[k + 1 + off]
+			else:
+				x = v[k - 1 + off] + 1
+			var y := x - k
+			while x < n and y < m and a[x] == b[y]:
+				x += 1
+				y += 1
+			v[k + off] = x
+			if x >= n and y >= m:
+				found = d
+				break
+			k += 2
+		if found >= 0:
+			break
+	if found < 0:
+		for _i in n:
+			ops.append("del")
+		for _i in m:
+			ops.append("add")
+		return ops
+	var x := n
+	var y := m
+	for d in range(found, 0, -1):
+		var vd: PackedInt32Array = trace[d]
+		var k := x - y
+		var prev_k := k + 1 if (k == -d or (k != d and vd[k - 1 + off] < vd[k + 1 + off])) else k - 1
+		var prev_x := vd[prev_k + off]
+		var prev_y := prev_x - prev_k
+		while x > prev_x and y > prev_y:
+			ops.append("ctx")
+			x -= 1
+			y -= 1
+		ops.append("add" if x == prev_x else "del")
+		x = prev_x
+		y = prev_y
+	while x > 0 and y > 0:
+		ops.append("ctx")
+		x -= 1
+		y -= 1
+	ops.reverse()
+	return ops
+
+
 ## Build the aligned side-by-side rows for the whole file. Each row:
 ## {kind: "ctx"|"pair"|"del"|"add", old_line, new_line (1-based; 0 = filler),
 ##  left, right}. Hunks drive the classification and cursor advance; displayed

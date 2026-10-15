@@ -880,6 +880,220 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: history" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-shelves":
+			# Server-independent: output captured from p4d 2026.1. `describe -S`
+			# of two changelists in one call (one JSON object each; a move's
+			# deleted half has no type or size; a description with a blank
+			# line), and p4's message object, which is skipped.
+			var json := "\n".join([
+				'{"action0":"add","action1":"move/delete","action2":"move/add","action3":"edit","change":"7","changeType":"public","client":"dev-ws","depotFile0":"//game/main/added2.txt","depotFile1":"//game/main/n.txt","depotFile2":"//game/main/n_moved.txt","depotFile3":"//game/main/two.txt","desc":"Shelf A\\n\\nsecond paragraph\\n","digest0":"2832E21254F4D3B0ED755A827D07CE58","digest2":"C3BE117041A113540DEB0FF532B19543","digest3":"4FCC82A88EE38E0AA16C17F512C685C9","fileSize0":"6","fileSize2":"2","fileSize3":"12","rev0":"1","rev1":"1","rev2":"1","rev3":"2","shelved":"","status":"pending","time":"1792095163","type0":"text","type1":"text","type2":"text","type3":"text","user":"dev"}',
+				'{"action0":"edit","change":"8","changeType":"public","client":"dev-ws","depotFile0":"//game/main/one.txt","desc":"Shelf B\\n","digest0":"3B5D5C3712955042212316173CCF37BE","fileSize0":"2","rev0":"1","shelved":"","status":"pending","time":"1792095163","type0":"binary+l","user":"mate"}',
+				'{"code0":822155278,"data":"Invalid changelist number \'x\'.\\n","generic":1,"severity":3}',
+			])
+			var shelves := _shelf_records(json + "\r\n")
+			var a: Dictionary = shelves[0] if shelves.size() > 0 else {}
+			var parse_ok: bool = shelves.size() == 2 and String(a.change) == "7" \
+					and String(a.desc) == "Shelf A\n\nsecond paragraph" and a.files.size() == 4 \
+					and String(a.files[1].action) == "move/delete" and int(a.files[1].size) == 0 \
+					and int(a.files[3].rev) == 2 and String(a.files[3].type) == "text" \
+					and String(shelves[1].user) == "mate" and String(shelves[1].files[0].type) == "binary+l"
+			_log("[selftest] shelves parse=%s" % parse_ok)
+
+			# What an unshelve did, from the state afterwards plus p4's words
+			# for the refusals (its output as measured, mate unshelving dev's
+			# shelf, plus a refused overwrite naming the local path).
+			var said := "\n".join([
+				"//game/main/one.txt#1 - unshelved, opened for edit",
+				"... //game/main/one.txt - must resolve //game/main/one.txt@=3 before submitting",
+				"... //game/main/one.txt - also opened by dev@dev-ws",
+				"//game/main/pic.png - can't edit exclusive file already opened",
+				"... //game/main/pic.png - also opened by dev@dev-ws",
+				"//game/main/two.txt#1 - unshelved, opened for edit",
+				"... //game/main/two.txt - also opened by dev@dev-ws",
+				"Can't clobber writable file C:/ws/mate\\three.txt",
+				"//game/main/one.txt.bak - can't edit exclusive file already opened",
+			])
+			var wanted := ["//game/main/one.txt", "//game/main/pic.png", "//game/main/two.txt",
+					"//game/main/three.txt", "//game/main/one.txt.b", "//game/main/four.txt"]
+			var in_target := {
+				"//game/main/one.txt": {"depotFile": "//game/main/one.txt", "unresolved": "", "haveRev": "1", "headRev": "1"},
+				"//game/main/two.txt": {"depotFile": "//game/main/two.txt", "haveRev": "1", "headRev": "2"},
+			}
+			var report := _unshelve_report(wanted, in_target, said,
+					{"//game/main/three.txt": "C:/ws/mate/three.txt"})
+			var why := {}
+			for r in report.refused:
+				why[String(r.depot)] = String(r.why)
+			var report_ok: bool = report.opened == ["//game/main/one.txt", "//game/main/two.txt"] \
+					and report.resolve == ["//game/main/one.txt"] and report.behind == ["//game/main/two.txt"] \
+					and report.refused.size() == 4 \
+					and String(why.get("//game/main/pic.png", "")).contains("exclusive") \
+					and String(why.get("//game/main/pic.png", "")).contains("dev@dev-ws") \
+					and String(why.get("//game/main/three.txt", "")).contains("writable but isn't checked out") \
+					and String(why.get("//game/main/one.txt.b", "")).contains("didn't say why") \
+					and String(why.get("//game/main/four.txt", "")).contains("didn't say why")
+			# A file already open in the target counts only when p4 says it
+			# unshelved it, and a file checked out before isn't "behind" because
+			# of the shelf.
+			var target_out := "//d/kept.txt#2 - unshelved, opened for edit\n//d/refused.txt - can't unshelve, it's opened for edit"
+			var target_state := {"//d/kept.txt": {"haveRev": "1", "headRev": "2"},
+					"//d/refused.txt": {"haveRev": "1", "headRev": "1"}}
+			var already := _unshelve_report(["//d/kept.txt", "//d/refused.txt"], target_state, target_out, {},
+					{"//d/kept.txt": "9", "//d/refused.txt": "9"}, "9")
+			var already_ok: bool = already.opened == ["//d/kept.txt"] and already.behind.is_empty() \
+					and already.refused.size() == 1 and String(already.refused[0].why).contains("can't unshelve")
+			report_ok = report_ok and already_ok
+			_log("[selftest] shelves unshelve-report=%s already-in-target=%s %s" % [report_ok, already_ok, why])
+
+			# What can be done with each shelved file.
+			var edit_acts := _shelf_file_actions(a.files[3], true, true)
+			var del_acts := _shelf_file_actions(a.files[1], true, true)
+			var unmapped := _shelf_file_actions(a.files[3], false, false)
+			var missing := _shelf_file_actions(a.files[0], true, false)
+			var acts_ok: bool = edit_acts.base.ok and edit_acts.workspace.ok \
+					and not del_acts.base.ok and String(del_acts.base.reason).contains("deletes") \
+					and not del_acts.workspace.ok \
+					and unmapped.base.ok and not unmapped.workspace.ok \
+					and String(unmapped.workspace.reason).contains("isn't part of your workspace") \
+					and missing.base.ok and not missing.workspace.ok
+			_log("[selftest] shelves file-actions=%s" % acts_ok)
+
+			# A shelved add shows beside an empty left pane: every row an add.
+			var added_lines := _split_lines("one\ntwo\nthree\n")
+			var rows := _align_diff(PackedStringArray(), added_lines,
+					_parse_unified_hunks(_line_diff_unified(PackedStringArray(), added_lines)))
+			var kinds := rows.map(func(r: Dictionary) -> String: return String(r.kind))
+			var add_ok: bool = kinds == ["add", "add", "add"] and String(rows[2].right) == "three" \
+					and _line_diff_unified(PackedStringArray(), PackedStringArray()) == ""
+			# The line diff behind it: for generated pairs, its steps rebuild
+			# both sides, and it keeps as many lines as the longest common
+			# subsequence (so it is a shortest diff). Then one past the effort
+			# cap, which falls back to remove-then-add but still rebuilds both.
+			var rng := RandomNumberGenerator.new()
+			rng.seed = 4711
+			var lcs_len := func(x: PackedStringArray, y: PackedStringArray) -> int:
+				var prev := PackedInt32Array()
+				prev.resize(y.size() + 1)
+				for i in x.size():
+					var cur := PackedInt32Array()
+					cur.resize(y.size() + 1)
+					for j in y.size():
+						cur[j + 1] = prev[j] + 1 if x[i] == y[j] else maxi(prev[j + 1], cur[j])
+					prev = cur
+				return prev[y.size()]
+			var rebuilds := func(x: PackedStringArray, y: PackedStringArray, ops: Array) -> bool:
+				var rx := PackedStringArray()
+				var ry := PackedStringArray()
+				var i := 0
+				var j := 0
+				for op: String in ops:
+					if op != "add":
+						if i >= x.size():
+							return false
+						rx.append(x[i])
+						i += 1
+					if op != "del":
+						if j >= y.size():
+							return false
+						ry.append(y[j])
+						j += 1
+					if op == "ctx" and x[i - 1] != y[j - 1]:
+						return false
+				return rx == x and ry == y
+			var myers_ok := true
+			for case_i in 300:
+				var x := PackedStringArray()
+				var y := PackedStringArray()
+				for _k in rng.randi_range(0, 25):
+					x.append("abcde"[rng.randi_range(0, 4)])
+				for _k in rng.randi_range(0, 25):
+					y.append("abcde"[rng.randi_range(0, 4)])
+				var ops := _line_diff_ops(x, y)
+				var kept := ops.count("ctx")
+				if not rebuilds.call(x, y, ops) or kept != lcs_len.call(x, y):
+					myers_ok = false
+					_log("[selftest] line diff wrong for %s -> %s: %s" % [x, y, ops])
+					break
+			var big_x := PackedStringArray()
+			var big_y := PackedStringArray()
+			for k in LINE_DIFF_MAX_EDITS + 10:
+				big_x.append("x%d" % k)
+				big_y.append("y%d" % k)
+			var capped := _line_diff_ops(big_x, big_y)
+			var cap_ok: bool = rebuilds.call(big_x, big_y, capped) and capped.count("ctx") == 0
+			_log("[selftest] shelves added-file rows=%s %s, line diff shortest=%s, past the cap=%s"
+					% [add_ok, kinds, myers_ok, cap_ok])
+			add_ok = add_ok and myers_ok and cap_ok
+
+			# The dock's menus for changelists with and without a shelf.
+			_populate_context_menu({"type": "cl", "change": "9", "file_count": 2, "shelved_count": 3})
+			var both := _selftest_menu_labels()
+			_populate_context_menu({"type": "cl", "change": "9", "file_count": 0, "shelved_count": 3})
+			var shelf_only := _selftest_menu_labels()
+			_populate_context_menu({"type": "cl", "change": "9", "file_count": 0, "shelved_count": 0})
+			var empty := _selftest_menu_labels()
+			_populate_context_menu({"type": "cl", "change": "default", "file_count": 2})
+			var dflt := _selftest_menu_labels()
+			_populate_context_menu({"type": "shelved_file", "change": "9", "depot_path": "//d/a.gd"})
+			var shelved_row := _selftest_menu_labels()
+			_log("[selftest] shelves menus: both=[%s] shelf-only=[%s] empty=[%s] default=[%s] file=[%s]"
+					% [both, shelf_only, empty, dflt, shelved_row])
+			var menus_ok: bool = both.contains("Update Shelf...") and both.contains("Shelve and Revert...") \
+					and both.contains("Unshelve Files...") and not both.contains("Delete Changelist") \
+					and not shelf_only.contains("Shelve Files...") and not shelf_only.contains("Shelve and Revert") \
+					and not shelf_only.contains("Update Shelf") \
+					and shelf_only.contains("Unshelve Files...") and shelf_only.contains("Delete Shelved Files...") \
+					and not shelf_only.contains("Delete Changelist") \
+					and empty.contains("Delete Changelist") and not empty.contains("helve") \
+					and dflt.contains("Shelve Files...") and not dflt.contains("Unshelve") \
+					and shelved_row.contains("Diff vs Base") and shelved_row.contains("Unshelve This File...")
+
+			# The tree: a changelist's shelf is its own row, under it the files.
+			_rebuild_tree({"available": true, "changelists": [
+				{"change": "default", "desc": "", "files": [], "shelved": []},
+				{"change": "9", "desc": "wip", "files": [{"res_path": "res://a.gd", "depot_path": "//d/a.gd",
+						"action": "edit", "change": "9"}],
+				"shelved": [{"res_path": "res://a.gd", "depot_path": "//d/a.gd", "action": "edit", "rev": 1,
+						"type": "text", "size": 3, "change": "9"},
+						{"res_path": "", "depot_path": "//other/b.gd", "action": "add", "rev": 1,
+						"type": "text", "size": 3, "change": "9"}]}]})
+			var cl9 := tree.get_root().get_child(1)
+			var shelf_row := cl9.get_child(1) if cl9.get_child_count() > 1 else null
+			var tree_ok: bool = shelf_row != null and shelf_row.get_text(0) == "Shelved" \
+					and shelf_row.get_child_count() == 2 \
+					and String(shelf_row.get_child(1).get_text(0)) == "//other/b.gd" \
+					and String(shelf_row.get_child(0).get_metadata(0).type) == "shelved_file" \
+					and int(cl9.get_metadata(0).shelved_count) == 2
+			_log("[selftest] shelves menus=%s tree=%s" % [menus_ok, tree_ok])
+
+			# The Shelves window, filled from the parsed shelves.
+			_build_shelves_window()
+			_shelves_list = shelves
+			_populate_shelves_list("")
+			var listed := _shelves_tree.get_root().get_child_count()
+			var shelf: Dictionary = a.duplicate(true)
+			for f: Dictionary in shelf.files:
+				f["local"] = "" if String(f.depot).ends_with("two.txt") else "C:/nowhere/" + String(f.depot).get_file()
+				f["res_path"] = ""
+			_show_shelf_files(shelf)
+			var nothing_picked := _shelf_diff_button.disabled and _shelf_unshelve_button.text == "Unshelve All..." \
+					and not _shelf_unshelve_button.disabled and _shelf_detail.text.contains("second paragraph")
+			_shelf_files_tree.get_root().get_child(1).select(0)
+			_update_shelf_buttons()
+			var deleted_row := _shelf_diff_button.disabled and _shelf_diff_button.tooltip_text.contains("deletes") \
+					and _shelf_unshelve_button.text == "Unshelve 1 Selected..."
+			_shelf_files_tree.deselect_all()
+			_shelf_files_tree.get_root().get_child(3).select(0)
+			_update_shelf_buttons()
+			var unmapped_row := not _shelf_diff_button.disabled and _shelf_workspace_button.disabled \
+					and _shelf_workspace_button.tooltip_text.contains("isn't part of your workspace")
+			var ui_ok := listed == 2 and nothing_picked and deleted_row and unmapped_row
+			_log("[selftest] shelves window: listed=%d none=%s deleted=%s unmapped=%s"
+					% [listed, nothing_picked, deleted_row, unmapped_row])
+			var ok := parse_ok and report_ok and acts_ok and add_ok and menus_ok and tree_ok and ui_ok
+			_log("[selftest] %s: shelves" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-fs-menu":
 			# Server-independent: folder filtering + the FileSystem-dock action set.
 			var fs_files := _fs_files_only(PackedStringArray(
@@ -1774,6 +1988,270 @@ func _run_cli_self_test_if_requested() -> void:
 			ok = ok and rows_ok and prev_ok and move_ok and across_ok and ws_ok and got_ok \
 					and refused_ok and new_ok and retyped_ok and pending_ok and left == 0
 			_log("[selftest] %s: history-live" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-shelves-live":
+			# Live and DESTRUCTIVE (real submits and shelves; use a throwaway
+			# server with the second user "mate", workspace mate-ws at
+			# $P4TEST_MATE_WS). Your own shelf from the default changelist,
+			# updated, shelved and reverted, unshelved back and submitted; then
+			# a teammate's shelf listed, diffed and unshelved here, onto a file
+			# checked out with your own edits (resolve), a writable file nobody
+			# checked out (refused) and an exclusive file the teammate has open
+			# (refused).
+			_selftest_auto_answer = "confirm"
+			var mate_ws := OS.get_environment("P4TEST_MATE_WS")
+			if mate_ws.is_empty() or not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: shelves-live - needs P4TEST_MATE_WS and nothing opened")
+				get_tree().quit()
+				return
+			await _probe_connection()
+			var dir := "res://p4g_shelf_test"
+			var dir_g := ProjectSettings.globalize_path(dir)
+			DirAccess.make_dir_recursive_absolute(dir_g)
+			var at := func(file_name: String) -> String: return dir_g.path_join(file_name)
+			var write := func(path: String, text: String) -> void:
+				_set_file_writable(path, true)
+				var fw := FileAccess.open(path, FileAccess.WRITE)
+				fw.store_string(text)
+				fw.close()
+			# The workspace's LineEnd is local: CRLF on Windows.
+			var read := func(path: String) -> String:
+				return FileAccess.get_file_as_string(path).replace("\r\n", "\n")
+			write.call(at.call("a.txt"), "a1\na2\na3\n")
+			write.call(at.call("c.txt"), "c1\n")
+			write.call(at.call("d.txt"), "d1\nd2\nd3\nd4\n")
+			write.call(at.call("m.txt"), "m1\n")
+			write.call(at.call("lock.bin"), "LOCK1")
+			await _p4_exec_logged(["add", at.call("a.txt"), at.call("c.txt"), at.call("d.txt"), at.call("m.txt")])
+			await _p4_exec_logged(["add", "-t", "binary+l", at.call("lock.bin")])
+			await _submit_changelist("default", [], "shelves: base")
+			var ok := _last_submit_outcome == "submitted"
+
+			# 1. Shelve from the default changelist: the files move to a new
+			# numbered changelist, are shelved, and stay checked out.
+			await _p4_exec_logged(["edit", at.call("a.txt"), at.call("m.txt")])
+			write.call(at.call("a.txt"), "a1\nA2\na3\n")
+			write.call(at.call("b.txt"), "b1\n")
+			await _p4_exec_logged(["add", at.call("b.txt")])
+			await _p4_exec_logged(["move", at.call("m.txt"), at.call("m2.txt")])
+			var n := await _shelve_changelist("default", false, "shelves: review me\n\nsecond paragraph")
+			var mine := {}
+			if not n.is_empty():
+				mine = await _read_shelf(n)
+			var actions := {}
+			for f: Dictionary in mine.get("files", []):
+				actions[String(f.depot).get_file()] = String(f.action)
+			var model := await _query_pending_model()
+			var in_model := 0
+			for cl in model.changelists:
+				if String(cl.change) == n:
+					in_model = cl.shelved.size()
+			var shelve_ok: bool = not n.is_empty() and (await _opened_in_change(n)).size() == 4 \
+					and actions == {"a.txt": "edit", "b.txt": "add", "m.txt": "move/delete", "m2.txt": "move/add"} \
+					and String(mine.get("desc", "")).contains("second paragraph") and in_model == 4
+			_log("[selftest] shelved #%s: %s, in the dock model=%d" % [n, actions, in_model])
+			# What Shelve and Revert checks before throwing the disk copies
+			# away: an edit made after shelving - the state a failed shelf
+			# update leaves - to a text file and to an added file.
+			var open_files: Array = await _submit_file_list(n, [])
+			var shelved_map := {}
+			for f: Dictionary in (await _read_shelves([n])).get(n, []):
+				shelved_map[String(f.depot)] = f
+			var same_now: Array = await _shelf_differs_from_disk(n, open_files, shelved_map)
+			write.call(at.call("a.txt"), "a1\nA2\na3\nlater\n")
+			write.call(at.call("b.txt"), "b1 later\n")
+			var stale: Array = await _shelf_differs_from_disk(n, open_files, shelved_map)
+			var stale_names: Array = stale.map(func(s: String) -> String: return s.get_file())
+			stale_names.sort()
+			var check_ok: bool = same_now.is_empty() and stale_names == ["a.txt", "b.txt"]
+			_log("[selftest] disk vs shelf: unchanged=%s, edited after shelving=%s" % [same_now, stale_names])
+			# The same comparison in the diff window. The moved file is where
+			# `p4 diff m2.txt@=N` read project.godot's content instead.
+			var own_shelf := await _read_shelf(n)
+			var own := {}
+			for f: Dictionary in own_shelf.files:
+				own[String(f.depot).get_file()] = f
+			var ws_moved := await _shelf_workspace_diff(n, own.get("m2.txt", {}))
+			var ws_added := await _shelf_workspace_diff(n, own.get("b.txt", {}))
+			var ws_ok: bool = not bool(ws_moved.ok) and String(ws_moved.reason).contains("identical") \
+					and bool(ws_added.ok) and String(ws_added.new).contains("b1 later") \
+					and String(ws_added.old).replace("\r\n", "\n") == "b1\n"
+			# And Diff vs Depot on the renamed file, which uses `p4 diff`
+			# without a shelf: the file is unchanged since the rename.
+			diff_window.hide()
+			_selftest_shown.clear()
+			await _diff_path(dir.path_join("m2.txt"))
+			var depot_diff_ok: bool = not diff_window.visible \
+					and _selftest_shown.any(func(t: String) -> bool: return t.contains("identical"))
+			_log("[selftest] workspace vs shelf: moved=%s added=%s; Diff vs Depot on the renamed file=%s %s"
+					% [ws_moved.get("reason", "(a diff)"), ws_added.ok, depot_diff_ok, _selftest_shown])
+			write.call(at.call("b.txt"), "b1\n")
+			# A moved file compared with its base: the file it was moved from.
+			var moved_base := await _shelf_base_diff(n, own.get("m2.txt", {}), own_shelf.files)
+			var moved_base_ok: bool = not bool(moved_base.ok) \
+					and String(moved_base.reason).contains("moved without being changed")
+			# A shelf update p4 aborts - a checked-out file missing from disk -
+			# keeps the old shelf, which has the same files and actions. It must
+			# read as a failure, and Shelve and Revert must revert nothing.
+			var a_text: String = read.call(at.call("a.txt"))
+			_set_file_writable(at.call("a.txt"), true)
+			DirAccess.remove_absolute(at.call("a.txt"))
+			_selftest_shown.clear()
+			var aborted := await _shelve_changelist(n, true)
+			write.call(at.call("a.txt"), a_text)
+			var abort_ok: bool = aborted.is_empty() and (await _opened_in_change(n)).size() == 4 \
+					and FileAccess.file_exists(at.call("b.txt")) \
+					and _selftest_shown.any(func(t: String) -> bool: return t.contains("didn't shelve"))
+			_log("[selftest] moved file vs base=%s (%s); aborted update reverted nothing=%s" \
+					% [moved_base_ok, moved_base.get("reason", ""), abort_ok])
+			shelve_ok = shelve_ok and check_ok and ws_ok and depot_diff_ok and moved_base_ok and abort_ok
+
+			# 2. Shelve and Revert, after another edit (with CRLF line ends,
+			# which the comparison with the shelf has to see past): the shelf
+			# is updated (-r), the workspace goes back to the server's files.
+			write.call(at.call("a.txt"), "a1\r\nA2\r\na3\r\nA4\r\n")
+			_selftest_shown.clear()
+			var again := await _shelve_changelist(n, true)
+			var a_depot := ""
+			for f: Dictionary in (await _read_shelf(n)).get("files", []):
+				if String(f.depot).ends_with("/a.txt"):
+					a_depot = String(f.depot)
+			var shelved_a := await _p4_exec(["print", "-q", "%s@=%s" % [a_depot, n]])
+			var reverted_ok: bool = again == n and (await _opened_in_change(n)).is_empty() \
+					and read.call(at.call("a.txt")) == "a1\na2\na3\n" \
+					and not FileAccess.file_exists(at.call("b.txt")) \
+					and not FileAccess.file_exists(at.call("m2.txt")) and FileAccess.file_exists(at.call("m.txt")) \
+					and String(shelved_a.output[0]).contains("A4") \
+					and _selftest_shown.any(func(t: String) -> bool: return t.contains("Update the shelf"))
+			_log("[selftest] shelve and revert=%s" % reverted_ok)
+
+			# 3. Unshelve it back: b.txt alone into the default changelist, the
+			# rest into the same changelist.
+			var b_depot := a_depot.get_base_dir().path_join("b.txt")
+			var to_default := await _unshelve(await _read_shelf(n), [b_depot], "default")
+			var default_ok: bool = to_default.get("opened", []) == [b_depot] \
+					and (await _opened_in_change("default")).has(b_depot)
+			var rest: Array = (await _read_shelf(n)).files.map(func(f: Dictionary) -> String: return String(f.depot)) \
+					.filter(func(d: String) -> bool: return d != b_depot)
+			var back := await _unshelve(await _read_shelf(n), rest, n)
+			await _p4_exec_logged(["reopen", "-c", n, b_depot])
+			var back_ok: bool = default_ok and back.get("opened", []).size() == 3 and back.get("refused", [1]).is_empty() \
+					and read.call(at.call("a.txt")) == "a1\nA2\na3\nA4\n" and read.call(at.call("b.txt")) == "b1\n" \
+					and FileAccess.file_exists(at.call("m2.txt")) and not FileAccess.file_exists(at.call("m.txt"))
+			_log("[selftest] unshelved back=%s, b.txt into the default changelist=%s (%s)" % [back_ok, default_ok, back])
+
+			# 4. Submit: the confirmation says the shelf goes first, and names
+			# b.txt, reverted off disk, whose only copy is the shelf.
+			await _p4_exec_logged(["revert", "-w", b_depot])
+			_selftest_shown.clear()
+			await _submit_changelist(n, [])
+			var submit_ok: bool = _last_submit_outcome == "submitted" \
+					and _selftest_shown.any(func(t: String) -> bool:
+						return t.contains("shelved file") and t.contains("only copy") and t.contains("b.txt")) \
+					and (await _opened_in_change(n)).is_empty()
+			_log("[selftest] submitted with its shelf deleted first=%s" % submit_ok)
+
+			# 5. A teammate shelves edits to a, c, d and the exclusive file,
+			# and a new file, and keeps them checked out.
+			var as_mate := PackedStringArray(["-u", "mate", "-c", "mate-ws"])
+			var theirs := func(file_name: String) -> String: return mate_ws.path_join("p4g_shelf_test").path_join(file_name)
+			await _p4_exec(as_mate + PackedStringArray(["sync", "//mate-ws/..."]))
+			await _p4_exec(as_mate + PackedStringArray(["edit", theirs.call("a.txt"), theirs.call("c.txt"),
+					theirs.call("d.txt"), theirs.call("lock.bin")]))
+			write.call(theirs.call("a.txt"), "a1\nA2\na3\nA4\nmate5\n")
+			write.call(theirs.call("c.txt"), "c1 mate\n")
+			write.call(theirs.call("d.txt"), "d1\nd2\nd3\nd4 mate\n")
+			write.call(theirs.call("lock.bin"), "LOCK mate")
+			write.call(theirs.call("new.txt"), "new from mate\n")
+			await _p4_exec(as_mate + PackedStringArray(["add", theirs.call("new.txt")]))
+			var x := _created_change_in(await _p4_exec_spec(as_mate + PackedStringArray(["change", "-i"]),
+					"Change: new\n\nDescription:\n\tmate: please review\n\n\tsecond paragraph\n"))
+			await _p4_exec(as_mate + PackedStringArray(["reopen", "-c", x, theirs.call("a.txt"), theirs.call("c.txt"),
+					theirs.call("d.txt"), theirs.call("lock.bin"), theirs.call("new.txt")]))
+			await _p4_exec(as_mate + PackedStringArray(["shelve", "-c", x]))
+			# Here: d checked out with an edit of its own, c writable but not
+			# checked out, with changes nobody told Perforce about.
+			await _p4_exec_logged(["edit", at.call("d.txt")])
+			write.call(at.call("d.txt"), "d1 dev\nd2\nd3\nd4\n")
+			write.call(at.call("c.txt"), "c1 local\n")
+
+			# 6. The list and the shelf.
+			await _show_shelves()
+			var listed_ok: bool = _shelves_list.any(func(s: Dictionary) -> bool:
+				return String(s.change) == x and String(s.user) == "mate")
+			await _open_shelf_number(x)
+			var by_name := {}
+			for f: Dictionary in _shelf.get("files", []):
+				by_name[String(f.depot).get_file()] = f
+			var shelf_ok: bool = listed_ok and String(_shelf.get("change", "")) == x and by_name.size() == 5 \
+					and _shelf_detail.text.contains("second paragraph")
+			_log("[selftest] shelf #%s listed=%s files=%s" % [x, listed_ok, by_name.keys()])
+
+			# 7. Diffs, without unshelving anything.
+			var base_a := await _shelf_base_diff(x, by_name.get("a.txt", {}), _shelf.files)
+			var base_new := await _shelf_base_diff(x, by_name.get("new.txt", {}), _shelf.files)
+			var base_lock := await _shelf_base_diff(x, by_name.get("lock.bin", {}), _shelf.files)
+			var ws_a := await _shelf_workspace_diff(x, by_name.get("a.txt", {}))
+			var diffs_ok: bool = bool(base_a.ok) and String(base_a.old).contains("A4") \
+					and not String(base_a.old).contains("mate5") and String(base_a.new).contains("mate5") \
+					and bool(base_new.ok) and String(base_new.left) == "(new file)" \
+					and not bool(base_lock.ok) and String(base_lock.reason).contains("binary") \
+					and bool(ws_a.ok) and String(ws_a.right).contains("(workspace)")
+			# The window's own button, on the selected row.
+			var a_row: TreeItem = null
+			for item in _shelf_files_tree.get_root().get_children():
+				if String(item.get_text(0)).ends_with("a.txt"):
+					a_row = item
+			_shelf_files_tree.deselect_all()
+			if a_row:
+				a_row.select(0)
+			diff_window.hide()
+			await _on_shelf_diff_pressed()
+			var button_ok: bool = diff_window.visible and _diff_rows.any(func(r: Dictionary) -> bool:
+				return String(r.kind) == "add" and String(r.right) == "mate5")
+			_log("[selftest] shelf diffs=%s window button=%s" % [diffs_ok, button_ok])
+
+			# 8. Unshelve all of it into a new changelist, and combine d.
+			_shelf_files_tree.deselect_all()
+			_selftest_option_picks = [0, 0] # the new changelist; "Combine both versions"
+			var rep := await _unshelve(_shelf)
+			var why := {}
+			for r in rep.get("refused", []):
+				why[String(r.depot).get_file()] = String(r.why)
+			var opened_names: Array = rep.get("opened", []).map(func(d: String) -> String: return d.get_file())
+			opened_names.sort()
+			var spec := await _p4_exec(["change", "-o", String(rep.get("change", "0"))])
+			var d_text: String = read.call(at.call("d.txt"))
+			var unshelve_ok: bool = opened_names == ["a.txt", "d.txt", "new.txt"] \
+					and rep.get("resolve", []).size() == 1 and rep.get("moved", []).size() == 1 \
+					and String(why.get("c.txt", "")).contains("writable") \
+					and String(why.get("lock.bin", "")).contains("mate@mate-ws") \
+					and read.call(at.call("a.txt")).contains("mate5") and read.call(at.call("new.txt")) == "new from mate\n" \
+					and read.call(at.call("c.txt")) == "c1 local\n" \
+					and d_text.contains("d1 dev") and d_text.contains("d4 mate") \
+					and String(spec.output[0]).contains("Review of #%s" % x) \
+					and _unresolved_in(_parse_ztag(await _p4_exec(["-ztag", "resolve", "-n"]))).is_empty()
+			_log("[selftest] unshelved into #%s: opened=%s refused=%s d=%s" % [rep.get("change", ""),
+					opened_names, why.keys(), d_text.c_escape()])
+
+			# Clean up: this workspace's files reverted (the added one off disk),
+			# the review changelist deleted, the teammate's shelf and files gone.
+			var review := String(rep.get("change", ""))
+			await _p4_exec_logged(["revert", "-w", "//%s/..." % _p4_client])
+			if not review.is_empty():
+				await _p4_exec_logged(["change", "-d", review])
+			await _p4_exec_logged(["sync", "-f", at.call("c.txt")])
+			await _p4_exec(as_mate + PackedStringArray(["shelve", "-d", "-c", x]))
+			await _p4_exec(as_mate + PackedStringArray(["revert", "-w", "//mate-ws/..."]))
+			await _p4_exec(as_mate + PackedStringArray(["change", "-d", x]))
+			await _p4_exec_logged(["delete", dir_g.path_join("...")])
+			await _submit_changelist("default", [], "P4Godot selftest: shelves cleanup")
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] opened-after=%d" % left)
+			ok = ok and shelve_ok and reverted_ok and back_ok and submit_ok and shelf_ok and diffs_ok \
+					and button_ok and unshelve_ok and left == 0
+			_log("[selftest] %s: shelves-live" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-moves-live":

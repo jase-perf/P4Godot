@@ -210,8 +210,8 @@ It also tells you about the two things it can't simply download:
   sync"), so this holds even for a file that still looks locked.
 - **A file you have checked out that someone else changed too.** Perforce
   leaves yours alone and expects the two versions to be combined — *resolved*,
-  in Perforce's word. P4Godot names those files; do it in P4V (right-click →
-  **Resolve**) or with `p4 resolve`.
+  in Perforce's word. P4Godot names those files and offers to combine them;
+  right-click one marked "needs resolve" → **Resolve...** to do it later.
 
   For an image, a model or a sound there is nothing to combine: resolving means
   keeping one version and losing the other. Talk to whoever made the other
@@ -303,6 +303,8 @@ From there you can:
   right-click menu.
 - **Diff, revert, sync, and reload** individual files, and open a file's
   **History**.
+- **Shelve** a changelist for review, and unshelve yours or a teammate's
+  (see [Shelving](#shelving-share-work-without-submitting-it)).
 - **Get Latest** the whole project, and **Reconcile** it to find edits, adds,
   and deletes made outside the editor. Read Reconcile's list before accepting:
   files it calls *missing* get deleted for everyone when you submit.
@@ -351,6 +353,64 @@ file renamed last month still shows its earlier revisions under the old name.
 
 Binary files (images, sounds, models) and text files over 1 MB list their
 revisions but can't be shown side by side.
+
+### Shelving: share work without submitting it
+
+A shelf puts copies of a changelist's files on the server without submitting
+them. A teammate can look at them, or unshelve them into their own workspace
+to try them out, and nothing reaches the rest of the team until someone
+submits. It's how a change gets reviewed before it goes in, and how you move
+unfinished work to another computer.
+
+**Your own changelists.** Right-click a changelist in the P4G panel:
+
+- **Shelve Files...** shelves the files in it. Files in the default
+  changelist move to a new numbered changelist first, because Perforce only
+  shelves numbered ones. Once a changelist has a shelf this reads **Update
+  Shelf...**, and the shelf becomes exactly the files open in it now.
+- **Shelve and Revert...** shelves the files, then reverts them, so your
+  workspace goes back to the server's versions and the work waits on the
+  server. Before reverting, P4Godot checks that the shelf holds what is on
+  your disk, and reverts nothing if it doesn't.
+- **Unshelve Files...** puts the shelved files back into the changelist.
+- **Delete Shelved Files...** removes the shelf; your checked-out files are
+  untouched.
+
+A changelist with a shelf shows a **Shelved** row listing the shelved files;
+right-click one to compare it with the revision it was made from or with your
+copy. Submitting deletes the shelf first, because Perforce won't submit a
+changelist while it has one, and the confirmation says so.
+
+The shelf takes what is saved on disk. Save in Godot before shelving, and
+before **Shelve and Revert** in particular: reverting reloads the files, and
+anything unsaved in them is lost. The confirmation lists the changelist's
+files that are open in Godot.
+
+**Everyone's shelves.** **Shelves...** in the P4G panel's toolbar lists the
+newest shelved changelists with files in this project, everyone's or only
+yours, and opens any changelist by its number - the one in a code review or a
+teammate's message. Pick one to see its description and files:
+
+- **Diff vs Base** shows what the shelf changes in a file: the shelved version
+  beside the revision it was made from. Double-clicking a file does the same.
+  Nothing in your workspace changes.
+- **Diff vs Workspace** compares the shelved version with your copy.
+- **Unshelve...** copies the shelved files (all of them, or the ones you
+  selected) into your workspace, checked out in a changelist you pick or in a
+  new one named after the shelf.
+
+Unshelving never throws your work away. A file you have checked out keeps
+your edits, and P4Godot offers to combine them with the shelved version, as
+for a teammate's newer submit. A file that is writable on your computer but
+not checked out is left alone, because it may hold changes Perforce doesn't
+know about. An exclusive-checkout (`+l`) file someone else has open can't be
+unshelved. Afterwards P4Godot says which files came in, which need combining,
+which moved from another of your changelists, and which were left out and
+why.
+
+A shelf made against older versions of its files unshelves at those
+versions. Submitting it then asks you to combine it with the newer ones
+first.
 
 ### Right-click actions in Godot's file browser
 
@@ -474,13 +534,14 @@ contents really changed, P4Godot checks it out afterwards.
   without checkout. Press Refresh to retry sooner.
 - **Single sign-on:** the login prompt asks for a password. With SSO, log in
   once with `p4 login` or P4V, and P4Godot uses that ticket.
-- **Combining two people's edits isn't implemented.** If you and a teammate
-  both changed the same text file, Perforce wants the versions merged
-  (*resolved*) before you can submit. Get Latest tells you which files need
-  it; do the merge in P4V (right-click → **Resolve**) or with `p4 resolve`.
-  For art files, resolving isn't a merge at all — you keep one version and
-  lose the other, so `+l` on art is worth setting up.
-- **Shelving** isn't implemented yet.
+- **Merging the same lines by hand needs P4V.** When you and a teammate
+  changed the same lines of a file, P4Godot's **Resolve** can keep one version
+  or the other but can't combine them line by line; do that in P4V
+  (right-click → **Resolve**). For art files, resolving isn't a merge at all —
+  you keep one version and lose the other, so `+l` on art is worth setting up.
+- **Shelves are compared file by file.** The Shelves window has no diff of a
+  whole shelf at once, and binary files in a shelf can't be shown side by
+  side.
 
 ## Troubleshooting
 
