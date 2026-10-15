@@ -348,6 +348,17 @@ func _safe_sync(targets: PackedStringArray, tracker: P4Progress = null) -> Dicti
 		return {"result": result, "done": done, "notes": notes, "exit_code": exit_code,
 				"cancelled": cancelled}
 	_log("Retrying %d unlocked but unchanged file(s) as read-only..." % stuck.size())
+	# The retry names each stuck file by its local path, which means "the head
+	# revision". A file asked for at a revision (`//depot/f#3`, from the history
+	# window) has to be asked for at that revision again.
+	var asked_rev := {} # depot path -> "#3" / "@1234"
+	for t in targets:
+		var mark := t.find("#") if t.find("#") != -1 else t.find("@")
+		if t.begins_with("//") and mark != -1:
+			asked_rev[t.substr(0, mark)] = t.substr(mark)
+	var depot_of := {} # _path_key(local) -> depot path, from the first pass
+	for rec in _parse_ztag(result):
+		depot_of[_path_key(String(rec.get("clientFile", "")))] = String(rec.get("depotFile", ""))
 	var names: Array = notes.clobbered # parallel to `stuck`
 	var still: Array = []
 	var retry_failed := false
@@ -356,7 +367,8 @@ func _safe_sync(targets: PackedStringArray, tracker: P4Progress = null) -> Dicti
 		var batch := PackedStringArray(["-ztag", "sync", "-s"])
 		for i in range(start, end):
 			_set_file_writable(String(stuck[i]), false)
-			batch.append(String(stuck[i]))
+			var depot := String(depot_of.get(_path_key(String(stuck[i])), ""))
+			batch.append(depot + String(asked_rev[depot]) if asked_rev.has(depot) else String(stuck[i]))
 		var again: Dictionary = await _p4_exec_logged(batch)
 		var again_notes := _sync_notes(again)
 		notes.problems.append_array(again_notes.problems)
@@ -1511,3 +1523,58 @@ func _submit_file_list(change: String, known: Array) -> Array:
 ## How the last _submit_changelist ended: "submitted", "not_submitted" or
 ## "unknown" ("" before any submit). For self-tests; nothing else reads it.
 var _last_submit_outcome: String = ""
+
+
+## Sync res_path to the head revision, or to `revision` (a depot path with
+## #rev, from the history window), and reload it from disk. Shared by the
+## dock's per-row menu, the FileSystem dock and the history window. Returns
+## whether the file on disk was rewritten.
+func _sync_path(res_path: String, revision: String = "") -> bool:
+	var target := revision if not revision.is_empty() else ProjectSettings.globalize_path(res_path)
+	var synced: Dictionary = await _safe_sync([target])
+	var notes: Dictionary = synced.notes
+	_request_refresh()
+	var which := "the newer version" if revision.is_empty() else "revision #%s" % revision.get_slice("#", 1)
+	if not notes.existing.is_empty():
+		await _show_alert("Perforce didn't download '%s'.%s" % [res_path,
+				_kept_existing_text(notes.existing)])
+		return false
+	var refused: Array = notes.modified + notes.clobbered
+	if not refused.is_empty():
+		var next_step := ("Check it out (right-click it in the FileSystem dock and choose " +
+				"\"P4: Check Out\"), then sync it again - Perforce will then ask you to combine " +
+				"the two versions.") if revision.is_empty() else ("To go back to the older " +
+				"version, first throw your change away (right-click the file and choose " +
+				"\"P4: Revert...\"), or check it out and submit it.")
+		await _show_alert(("Perforce didn't download %s of '%s'.\n\nThe file " +
+				"is changed on your disk but not checked out, so Perforce left your version " +
+				"alone instead of throwing it away. %s") % [which, res_path, next_step])
+		return false
+	# Only a sync that rewrote the file changes anything the editor shows ("up
+	# to date", or an opened file getting a resolve scheduled, doesn't).
+	var rewrote: bool = int(synced.exit_code) == 0 and not synced.done.names.is_empty()
+	if not rewrote:
+		# For the head revision "nothing downloaded" usually means "already up to
+		# date". A revision was asked for on purpose, so say what p4 said - the
+		# file being checked out since the history window looked, for one ("is
+		# opened at a later revision - not changed", exit 0).
+		if not revision.is_empty() and not _shutting_down:
+			var said: Array = notes.problems
+			await _show_alert("Perforce didn't download %s of '%s'.%s" % [which, res_path,
+					("\n\nIt said:\n    " + "\n    ".join(said)) if not said.is_empty()
+					else " Press \"Log\" in the P4G panel to see what it said."])
+		return false
+	EditorInterface.get_resource_filesystem().scan()
+	if not _is_open_in_editor(res_path):
+		return true
+	var reload: bool = await _show_confirm_dialog(("Godot just downloaded %s of " +
+			"'%s' from the server, and the file is open in the editor.\n\nShow the " +
+			"downloaded version? Anything you changed but didn't save is lost.\n\nIf you " +
+			"keep what's in the editor instead, saving it later overwrites the version " +
+			"you just downloaded.") % [which, res_path],
+			"Show Downloaded Version", "Keep Editor Version")
+	if reload:
+		await _reload_path(res_path)
+	else:
+		_log("Kept the editor's version of '%s' - saving it would overwrite the synced revision." % res_path)
+	return true

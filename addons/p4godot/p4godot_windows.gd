@@ -482,12 +482,20 @@ func _diff_path(res_path: String) -> void:
 		return
 	var new_text := f.get_as_text()
 	f.close()
+	_show_diff(old_text, new_text, text, "%s#have" % _diff_depot_path(text, res_path),
+			"%s (workspace)" % res_path, res_path)
+
+
+## Show two texts side by side, aligned by `unified` (p4's -du output for the
+## same pair), and pop the diff window up.
+func _show_diff(old_text: String, new_text: String, unified: String,
+		left_label: String, right_label: String, title: String) -> void:
 	_diff_rows = _align_diff(_split_lines(old_text), _split_lines(new_text),
-			_parse_unified_hunks(text))
-	diff_left_label.text = "  %s#have" % _diff_depot_path(text, res_path)
-	diff_right_label.text = "  %s (workspace)" % res_path
+			_parse_unified_hunks(unified))
+	diff_left_label.text = "  " + left_label
+	diff_right_label.text = "  " + right_label
 	_render_diff()
-	diff_window.title = "P4 Diff: %s" % res_path
+	diff_window.title = "P4 Diff: %s" % title
 	diff_window.popup_centered()
 
 
@@ -611,15 +619,19 @@ func _diff_verdict(text: String, exit_code: int) -> String:
 ## downloaded.
 func _diff_have_check(records: Array) -> Dictionary:
 	for rec in records:
-		if not (rec is Dictionary and rec.has("headType")):
-			continue
-		var size := int(rec.get("fileSize", "0"))
-		if not P4_TEXT_TYPES.has(String(rec.headType).get_slice("+", 0)):
-			return {"verdict": "binary", "size": size}
-		if size > DIFF_MAX_BYTES:
-			return {"verdict": "too big", "size": size}
-		return {"verdict": "ok", "size": size}
+		if rec is Dictionary and rec.has("headType"):
+			return _revision_diffable(String(rec.headType), int(rec.get("fileSize", "0")))
 	return {"verdict": "unknown", "size": 0}
+
+
+## Whether a revision of this Perforce filetype and size can be shown side by
+## side: {verdict: "ok" | "binary" | "too big", size}.
+func _revision_diffable(p4_type: String, size: int) -> Dictionary:
+	if not P4_TEXT_TYPES.has(p4_type.get_slice("+", 0)):
+		return {"verdict": "binary", "size": size}
+	if size > DIFF_MAX_BYTES:
+		return {"verdict": "too big", "size": size}
+	return {"verdict": "ok", "size": size}
 
 
 func _diff_too_big_message(res_path: String, size: int) -> String:

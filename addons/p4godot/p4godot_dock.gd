@@ -1,5 +1,5 @@
 @tool
-extends "p4godot_flows.gd"
+extends "p4godot_history.gd"
 
 ## The P4G dock: toolbar, changelist tree, the actions on its rows, and the
 ## FileSystem dock menu and tooltips.
@@ -624,6 +624,7 @@ enum {
 	CTX_DELETE_CL,
 	CTX_DIFF,
 	CTX_RESOLVE,
+	CTX_HISTORY,
 }
 const CTX_MOVE_BASE := 1000
 
@@ -660,6 +661,7 @@ func _populate_context_menu(meta: Dictionary) -> void:
 			context_menu.add_item("Resolve...", CTX_RESOLVE)
 		context_menu.add_item("Open", CTX_OPEN)
 		context_menu.add_item("Diff vs Depot", CTX_DIFF)
+		context_menu.add_item("History...", CTX_HISTORY)
 		context_menu.add_item("Revert This File", CTX_REVERT)
 		context_menu.add_item("Sync This File", CTX_SYNC)
 		context_menu.add_item("Reload From Disk", CTX_RELOAD)
@@ -716,6 +718,9 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		CTX_DIFF:
 			if meta.has("res_path"):
 				await _diff_path(meta.res_path)
+		CTX_HISTORY:
+			if meta.has("res_path"):
+				await _show_history(meta.res_path)
 		CTX_RESOLVE:
 			if meta.has("res_path"):
 				await _resolve_flow([meta.res_path])
@@ -1064,44 +1069,6 @@ func _revert_did_something(text: String, exit_code: int) -> bool:
 	return exit_code == 0 and not text.contains("not reverted") and text.contains(" - was ")
 
 
-## Sync res_path to the head revision and reload it from disk. Shared by the
-## toolbar "Sync Selected File" button and the tree's per-row context menu.
-func _sync_path(res_path: String) -> void:
-	var synced: Dictionary = await _safe_sync([ProjectSettings.globalize_path(res_path)])
-	var notes: Dictionary = synced.notes
-	_request_refresh()
-	if not notes.existing.is_empty():
-		await _show_alert("Perforce didn't download '%s'.%s" % [res_path,
-				_kept_existing_text(notes.existing)])
-		return
-	var refused: Array = notes.modified + notes.clobbered
-	if not refused.is_empty():
-		await _show_alert(("Perforce didn't download the newer version of '%s'.\n\nThe file " +
-				"is changed on your disk but not checked out, so Perforce left your version " +
-				"alone instead of throwing it away. Check it out (right-click it in the " +
-				"FileSystem dock and choose \"P4: Check Out\"), then sync it again - Perforce " +
-				"will then ask you to combine the two versions.") % res_path)
-		return
-	# Only a sync that rewrote the file changes anything the editor shows ("up
-	# to date", or an opened file getting a resolve scheduled, doesn't).
-	var rewrote: bool = int(synced.exit_code) == 0 and not synced.done.names.is_empty()
-	if not rewrote:
-		return
-	EditorInterface.get_resource_filesystem().scan()
-	if not _is_open_in_editor(res_path):
-		return
-	var reload: bool = await _show_confirm_dialog(("Godot just downloaded a newer version of " +
-			"'%s' from the server, and the file is open in the editor.\n\nShow the new " +
-			"version? Anything you changed but didn't save is lost.\n\nIf you keep what's " +
-			"in the editor instead, saving it later overwrites the version you just " +
-			"downloaded - your teammate's work.") % res_path,
-			"Show New Version", "Keep Editor Version")
-	if reload:
-		await _reload_path(res_path)
-	else:
-		_log("Kept the editor's version of '%s' - saving it would overwrite the synced revision." % res_path)
-
-
 ## Confirm-then-reload for the user-initiated Reload actions (toolbar button and
 ## context menu). Reload discards unsaved in-editor changes, so it warns first,
 ## naming the file. Internal reloads (after revert/sync/decline) call _reload_path
@@ -1181,6 +1148,7 @@ func _fs_context_actions() -> Array:
 		{"label": "P4: Mark for Add", "method": "_ctx_add"},
 		{"label": "P4: Get Latest (Sync)", "method": "_ctx_sync"},
 		{"label": "P4: Diff vs Depot", "method": "_ctx_diff"},
+		{"label": "P4: History...", "method": "_ctx_history"},
 		{"label": "P4: Revert...", "method": "_ctx_revert"},
 		{"label": "P4: Show Status in Log", "method": "_ctx_status"},
 	]
@@ -1259,6 +1227,13 @@ func _add_summary_text(by_outcome: Dictionary) -> String:
 			added.size() + int(by_outcome.get("ignored", []).size())
 			+ int(by_outcome.get("tracked", []).size()) + int(by_outcome.get("failed", []).size()),
 			"\n\n".join(parts)]
+
+
+## History opens for the first file selected: it is a window per file.
+func _ctx_history(paths: PackedStringArray) -> void:
+	var files := _fs_files_only(paths)
+	if not files.is_empty():
+		await _show_history(files[0])
 
 
 func _ctx_sync(paths: PackedStringArray) -> void:

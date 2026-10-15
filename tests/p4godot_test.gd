@@ -791,6 +791,95 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] numbered-cl(0): %s" % _selftest_menu_labels())
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-history":
+			# Server-independent: `p4 -Mj -ztag filelog -l -t -i` output captured
+			# from p4d 2026.1 - a file moved from f.txt to g.txt, a description
+			# with a blank line in it (which ends a tagged record early), and the
+			# error object p4 prints for a file that was never submitted.
+			var json := "\n".join([
+				'{"action0":"edit","action1":"move/add","change0":"6","change1":"4","client0":"dev-ws","client1":"dev-ws","depotFile":"//game/main/g.txt","desc0":"para one\\n\\npara two\\n","desc1":"rename","fileSize0":"12","fileSize1":"8","how1,0":"moved from","file1,0":"//game/main/f.txt","srev1,0":"#none","erev1,0":"#2","rev0":"2","rev1":"1","time0":"1792084541","time1":"1792084504","type0":"text","type1":"text","user0":"dev","user1":"dev"}',
+				'{"action0":"edit","action1":"add","change0":"3","change1":"2","client0":"dev-ws","client1":"dev-ws","depotFile":"//game/main/f.txt","desc0":"edit","desc1":"first","fileSize0":"8","fileSize1":"6","how0,0":"moved into","file0,0":"//game/main/g.txt","rev0":"2","rev1":"1","time0":"1792084504","time1":"1792084504","type0":"text","type1":"binary","user0":"dev","user1":"amy"}',
+			])
+			var parsed := _filelog_revisions(json + "\r\n")
+			var revs: Array = parsed.revs
+			var order := revs.map(func(r: Dictionary) -> String: return _history_rev_name(r, String(parsed.depot)))
+			_log("[selftest] history order: %s" % [order])
+			var parse_ok: bool = String(parsed.depot) == "//game/main/g.txt" and not parsed.untracked \
+					and order == ["#2", "#1", "f.txt#2", "f.txt#1"] \
+					and String(revs[0].desc) == "para one\n\npara two" \
+					and String(revs[1].from) == "//game/main/f.txt" and String(revs[2].from) == "" \
+					and int(revs[3].change) == 2 and String(revs[3].user) == "amy"
+			var never := _filelog_revisions('{"code0":554768760,"data":"u.txt - file(s) not on client.\\n","generic":17,"severity":2}')
+			var untracked_ok: bool = never.revs.is_empty() and bool(never.untracked)
+			_log("[selftest] history parse=%s untracked=%s" % [parse_ok, untracked_ok])
+
+			# What each selection allows. Index 2 is from before the move; 3 is
+			# the first revision.
+			var cur := String(parsed.depot)
+			var one := _history_actions(revs, [0], cur, true)
+			var two := _history_actions(revs, [3, 1], cur, true)
+			var old := _history_actions(revs, [2], cur, true)
+			var first := _history_actions(revs, [3], cur, true)
+			var gone := _history_actions(revs, [1], cur, false)
+			var none := _history_actions(revs, [], cur, true)
+			var deleted: Array = revs.duplicate(true)
+			deleted[1].action = "delete"
+			var del := _history_actions(deleted, [0], cur, true)
+			var have := _history_actions(revs, [0], cur, true, 2)
+			var cut := _history_actions(revs, [3], cur, true, 0, true)
+			var purged: Array = revs.duplicate(true)
+			purged[1].action = "purge"
+			var pur := _history_actions(purged, [0], cur, true)
+			var more_ok: bool = not have.get.ok and String(have.get.reason).contains("already have") \
+					and have.workspace.ok \
+					and not cut.diff.ok and String(cut.diff.reason).contains("earliest revision shown") \
+					and not pur.diff.ok and String(pur.diff.reason).contains("purged") \
+					and int(parsed.most) == 2
+			_log("[selftest] history have/cut-short/purged/most=%s" % more_ok)
+			var acts_ok: bool = more_ok and one.diff.ok and one.diff.older == 1 and one.diff.newer == 0 \
+					and one.workspace.ok and one.get.ok \
+					and two.diff.ok and two.diff.older == 3 and two.diff.newer == 1 \
+					and not two.workspace.ok and not two.get.ok \
+					and old.diff.ok and not old.workspace.ok and not old.get.ok \
+					and String(old.get.reason).contains("f.txt#2") \
+					and not first.diff.ok and String(first.diff.reason).contains("first revision") \
+					and not gone.workspace.ok and gone.get.ok \
+					and not none.diff.ok \
+					and not del.diff.ok and String(del.diff.reason).contains("deleted")
+			_log("[selftest] history actions=%s" % acts_ok)
+
+			var ident_ok := _diff2_identical("==== //a#2 (text) - //b#1 (text) ==== identical\r\n") \
+					and not _diff2_identical("==== //a#1 (text) - //a#2 (text) ==== content\n@@ -1 +1 @@\n-a\n+b\n")
+			# 2026-10-15 17:15 UTC, shown at UTC-7.
+			var date_ok := _history_date(1792084504, -420) == "2026-10-15 10:15"
+			_log("[selftest] history identical=%s date=%s (%s)" % [ident_ok, date_ok, _history_date(1792084504, -420)])
+
+			# The window itself, filled from the parsed revisions.
+			_build_history_window()
+			_history_res_path = "res://g.txt"
+			_history_depot_path = cur
+			_history_revs = revs
+			_history_have_rev = 1
+			_populate_history()
+			var rows := _history_tree.get_root().get_child_count()
+			var have_ok := _history_tree.get_root().get_child(1).get_text(0) == "#1  (you have)"
+			var first_selected := _history_selected() == [0]
+			var detail_ok := _history_detail.text.contains("para two")
+			_history_tree.get_root().get_child(2).select(0)
+			_update_history_buttons()
+			var two_rows := _history_diff_button.text == "Diff Selected" and _history_get_button.disabled
+			_history_tree.deselect_all()
+			_history_tree.get_root().get_child(2).select(0)
+			_update_history_buttons()
+			var old_row := not _history_diff_button.disabled and _history_get_button.disabled \
+					and _history_get_button.tooltip_text.contains("before the file was moved")
+			var ui_ok := rows == 4 and have_ok and first_selected and detail_ok and two_rows and old_row
+			_log("[selftest] history window: rows=%d have=%s selected=%s detail=%s two=%s old=%s"
+					% [rows, have_ok, first_selected, detail_ok, two_rows, old_row])
+			var ok := parse_ok and untracked_ok and acts_ok and ident_ok and date_ok and ui_ok
+			_log("[selftest] %s: history" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-fs-menu":
 			# Server-independent: folder filtering + the FileSystem-dock action set.
 			var fs_files := _fs_files_only(PackedStringArray(
@@ -801,7 +890,8 @@ func _run_cli_self_test_if_requested() -> void:
 				labels.append(String(action.label))
 			_log("[selftest] fs-menu: %s" % " | ".join(labels))
 			var ok := fs_files.size() == 2 and ("res://a.gd" in fs_files) \
-					and not ("res://sub/" in fs_files) and labels.size() == 6
+					and not ("res://sub/" in fs_files) and labels.size() == 7 \
+				and labels.has("P4: History...")
 			_log("[selftest] %s: fs-menu" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
@@ -1532,6 +1622,158 @@ func _run_cli_self_test_if_requested() -> void:
 			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
 			_log("[selftest] opened-after=%d" % left)
 			_log("[selftest] %s: submit-behind-live" % ("PASS" if ok and left == 0 else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-history-live":
+			# Live and DESTRUCTIVE (five real submits; use a throwaway server): the
+			# history window on a file with two revisions before a move and two
+			# after, one of them described in two paragraphs. Drives the window's
+			# own button handlers and checks the diff window, the alerts, the
+			# file on disk and the revision p4 says this workspace has.
+			_selftest_auto_answer = "confirm"
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: history-live - files already opened; needs a clean workspace")
+				get_tree().quit()
+				return
+			await _probe_connection()
+			var dir := "res://p4g_history_test"
+			var dir_g := ProjectSettings.globalize_path(dir)
+			DirAccess.make_dir_recursive_absolute(dir_g)
+			var a_g := dir_g.path_join("a.txt")
+			var b_g := dir_g.path_join("b.txt")
+			var write := func(path: String, text: String) -> void:
+				_set_file_writable(path, true)
+				var fw := FileAccess.open(path, FileAccess.WRITE)
+				fw.store_string(text)
+				fw.close()
+			write.call(a_g, "one\ntwo\nthree\n")
+			await _p4_exec_logged(["add", a_g])
+			await _submit_changelist("default", [], "history: first")
+			var ok := _last_submit_outcome == "submitted"
+			await _p4_exec_logged(["edit", a_g])
+			write.call(a_g, "one\nTWO\nthree\nfour\n")
+			await _submit_changelist("default", [], "history: second\n\nwith a second paragraph")
+			ok = ok and _last_submit_outcome == "submitted"
+			await _p4_exec_logged(["edit", a_g])
+			await _p4_exec_logged(["move", a_g, b_g])
+			await _submit_changelist("default", [], "history: move")
+			ok = ok and _last_submit_outcome == "submitted"
+			await _p4_exec_logged(["edit", b_g])
+			write.call(b_g, "one\nTWO\nthree\nfour\nfive\n")
+			await _submit_changelist("default", [], "history: third")
+			ok = ok and _last_submit_outcome == "submitted"
+			_log("[selftest] four submits=%s" % ok)
+
+			var b_res := dir.path_join("b.txt")
+			await _show_history(b_res)
+			var names: Array = _history_revs.map(func(r: Dictionary) -> String:
+				return _history_rev_name(r, _history_depot_path))
+			var rows_ok: bool = names == ["#2", "#1", "a.txt#2", "a.txt#1"] \
+					and String(_history_revs[2].desc).contains("second paragraph") \
+					and _history_have_rev == 2 and history_window.visible
+			_log("[selftest] history rows %s, have #%d, second paragraph kept=%s" \
+					% [names, _history_have_rev, String(_history_revs[2].desc).contains("second paragraph")])
+			var pick := func(rows: Array) -> void:
+				_history_tree.deselect_all()
+				for i: int in rows:
+					_history_tree.get_root().get_child(i).select(0)
+				_update_history_buttons()
+			var added := func(line: String) -> bool:
+				return _diff_rows.any(func(r: Dictionary) -> bool:
+					return String(r.kind) == "add" and String(r.right) == line)
+
+			# 1. The newest revision against the one before it.
+			pick.call([0])
+			diff_window.hide()
+			await _on_history_diff_pressed()
+			var prev_ok: bool = diff_window.visible and added.call("five") \
+					and diff_left_label.text.contains("b.txt#1")
+			# 2. The move itself changed nothing.
+			pick.call([1])
+			diff_window.hide()
+			_selftest_shown.clear()
+			await _on_history_diff_pressed()
+			var move_ok: bool = not diff_window.visible \
+					and _selftest_shown.any(func(t: String) -> bool: return t.contains("same content"))
+			# 3. Two revisions on either side of the move.
+			pick.call([0, 3])
+			await _on_history_diff_pressed()
+			var across_ok: bool = diff_window.visible and diff_left_label.text.contains("a.txt#1") \
+					and diff_right_label.text.contains("b.txt#2") and added.call("four")
+			# 4. Against the workspace (which has #2, so "five" is the change).
+			pick.call([1])
+			diff_window.hide()
+			await _on_history_workspace_pressed()
+			var ws_ok: bool = diff_window.visible and added.call("five") \
+					and diff_right_label.text.contains("(workspace)")
+			_log("[selftest] diff: previous=%s move=%s across-move=%s workspace=%s" % [prev_ok, move_ok, across_ok, ws_ok])
+
+			# 5. Get revision #1, then refuse it on a checked-out file. The file
+			# is writable but unchanged first: `sync -s` refuses that ("can't
+			# clobber"), and _safe_sync's retry once fetched the head revision
+			# instead of the one asked for.
+			_set_file_writable(b_g, true)
+			pick.call([1])
+			await _on_history_get_pressed()
+			# The workspace's LineEnd is local: CRLF on Windows.
+			var on_disk := FileAccess.get_file_as_string(b_g).replace("\r\n", "\n")
+			var got_ok: bool = on_disk == "one\nTWO\nthree\nfour\n" and _history_have_rev == 1 \
+					and _history_tree.get_root().get_child(1).get_text(0) == "#1  (you have)"
+			await _p4_exec_logged(["edit", b_g])
+			pick.call([0])
+			_selftest_shown.clear()
+			await _on_history_get_pressed()
+			var refused_ok: bool = _selftest_shown.any(func(t: String) -> bool: return t.contains("is checked out")) \
+					and int((await _fetch_fstat_record(b_res)).get("haveRev", "0")) == 1
+			await _p4_exec_logged(["revert", b_g])
+			_log("[selftest] get: revision #1 on disk=%s (%s, have #%d), refused while checked out=%s" % [got_ok, on_disk.c_escape(), _history_have_rev, refused_ok])
+
+			# 6. A file that was never submitted.
+			write.call(dir_g.path_join("new.txt"), "new\n")
+			_selftest_shown.clear()
+			await _show_history(dir.path_join("new.txt"))
+			var new_ok: bool = _selftest_shown.any(func(t: String) -> bool: return t.contains("never been submitted"))
+			_log("[selftest] never-submitted file told=%s" % new_ok)
+
+			# 7. The filetype changed between two revisions (text -> utf8). Without
+			# `diff2 -t` p4 says only "files differ", and the window showed
+			# every line as unchanged.
+			var c_g := dir_g.path_join("c.txt")
+			var c_res := dir.path_join("c.txt")
+			write.call(c_g, "alpha\nbeta\n")
+			await _p4_exec_logged(["add", "-t", "text", c_g])
+			await _submit_changelist("default", [], "history: c as text")
+			await _p4_exec_logged(["edit", "-t", "utf8", c_g])
+			write.call(c_g, "alpha\nbeta\ngamma\n")
+			await _submit_changelist("default", [], "history: c as utf8")
+			await _show_history(c_res)
+			pick.call([0])
+			diff_window.hide()
+			await _on_history_diff_pressed()
+			var retyped_ok: bool = diff_window.visible and added.call("gamma")
+			# 8. A rename that isn't submitted yet: its history is under the old
+			# name, and the window says so rather than "never submitted".
+			var d_g := dir_g.path_join("d.txt")
+			await _p4_exec_logged(["edit", c_g])
+			await _p4_exec_logged(["move", c_g, d_g])
+			_selftest_shown.clear()
+			await _show_history(dir.path_join("d.txt"))
+			var pending_ok: bool = _selftest_shown.is_empty() and _history_revs.size() == 2 \
+					and _history_heading.text.contains("renamed from") \
+					and _history_rev_name(_history_revs[0], _history_depot_path) == "c.txt#2"
+			await _p4_exec_logged(["revert", c_g, d_g])
+			_log("[selftest] filetype change diffed=%s, unsubmitted rename shows old history=%s (%s)" \
+					% [retyped_ok, pending_ok, _history_heading.text.strip_edges()])
+
+			await _p4_exec_logged(["sync", b_g, c_g])
+			await _p4_exec_logged(["delete", b_g, c_g])
+			await _submit_changelist("default", [], "P4Godot selftest: history cleanup")
+			DirAccess.remove_absolute(dir_g.path_join("new.txt"))
+			var left := _parse_ztag(await _p4_exec(["-ztag", "opened"])).size()
+			_log("[selftest] opened-after=%d" % left)
+			ok = ok and rows_ok and prev_ok and move_ok and across_ok and ws_ok and got_ok \
+					and refused_ok and new_ok and retyped_ok and pending_ok and left == 0
+			_log("[selftest] %s: history-live" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-moves-live":

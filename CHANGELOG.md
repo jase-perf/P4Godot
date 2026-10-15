@@ -4,9 +4,16 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
-- **The addon is now six scripts instead of one.** `p4godot.gd` is still the
+- **File history.** Right-click a file → **P4: History...** (in the
+  FileSystem dock or the P4G panel) lists every submitted revision with its
+  changelist, author, date and full description, following the file back
+  through moves. Compare a revision with the one before it, two revisions with
+  each other, or a revision with the file on your computer, in the same
+  side-by-side view as Diff vs Depot. **Get This Revision** puts an older
+  revision on your computer without changing anything on the server.
+- **The addon is now seven scripts instead of one.** `p4godot.gd` is still the
   plugin `plugin.cfg` names; the code it held is split by job into
-  `p4godot_core.gd`, `_files`, `_windows`, `_flows` and `_dock`. Nothing
+  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history` and `_dock`. Nothing
   changes for users: updating by replacing the `addons/p4godot` folder picks
   up the new files. The self-tests moved out of the addon into
   `tests/p4godot_test.gd`, so the shipped plugin is about 3,000 lines lighter.

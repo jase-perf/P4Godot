@@ -17,7 +17,8 @@ from every later layer with no wiring between them:
 | `p4godot_core.gd` | Connection and login, settings, running `p4` (the worker thread, streamed transfers, the save-path connect check), the changelist model, the confirmation dialog |
 | `p4godot_files.gd` | What happens to files in the editor: checkout on edit and on save, failed-save rescue, Reconcile and Revert Unchanged, changes made outside Godot, delete / move / rename from the FileSystem dock |
 | `p4godot_windows.gd` | The transfer progress window and the diff viewer |
-| `p4godot_flows.gd` | Get Latest, resolve, changelist create / edit / move, Submit |
+| `p4godot_flows.gd` | Get Latest, resolve, changelist create / edit / move, Submit, syncing one file |
+| `p4godot_history.gd` | The file history window: revisions, diffs between them, Get This Revision |
 | `p4godot_dock.gd` | The P4G dock, its changelist tree and actions, and the FileSystem dock's tooltips and right-click menu |
 | `p4godot.gd` | The plugin entry point named in `plugin.cfg`: an overview comment, `_enter_tree` and `_exit_tree` |
 

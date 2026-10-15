@@ -78,6 +78,8 @@ by hand:
 | 37 | Have a teammate check out a file whose type is exclusive (`+l`), then rename that file in the FileSystem dock and accept **Record Move**. | "Perforce didn't record the move of ...", with Perforce's reason and a sentence about the exclusive lock. Nothing new is in the panel. |
 | 38 | On a test `ssl:` server this computer already trusts, have the admin replace the certificate (`p4d -Gc` with an empty `P4SSLDIR`, then restart). Press **Refresh**. | A warning naming the server, the fingerprint you trusted before and the new one. **Cancel**: nothing changes and the toolbar stays "Not connected". Refresh again and choose **Trust New Fingerprint**: it connects, and `p4 trust -l` lists the new fingerprint. |
 | 39 | Right-click a text file over 1 MB that you changed → **P4: Diff vs Depot**. Then the same on a changed `.png`. | The first says the file is too large to show and names P4V. The second says the file is stored as binary. Neither freezes the editor. |
+| 40 | Right-click a script that has several submitted revisions, one of them a rename → **P4: History...**. Resize the window, hover a long description, select two rows, then select a row from before the rename. | Columns stay readable and the description column takes the spare width; the hover shows the whole description and the panel below shows it with its blank lines. Two rows turn the first button into **Diff Selected**. On the pre-rename row, **Diff vs Workspace** and **Get This Revision...** are greyed out and their tooltips say why. |
+| 41 | Open a scene, then in its history pick an older revision → **Get This Revision...** → confirm. | The prompt names the revision and says nothing on the server changes. Godot then asks whether to show the downloaded version; **Show Downloaded Version** reloads the scene at that revision, and the row reads "(you have)". |
 
 ## Screenshots for the README
 
@@ -92,4 +94,5 @@ crop to the relevant area. The README placeholders are HTML comments marked 📷
 | `submit-confirm.png` | The submit confirmation listing files and the description. |
 | `filesystem-dock.png` | The FileSystem dock with the P4 context menu open, plus a hover tooltip like `//depot/...#3 (head #5 - out of date) opened for edit`. Two shots side by side is fine. |
 | `diff-viewer.png` | The side-by-side diff window on a file with a few added and removed lines. |
+| `history.png` | The history window on a file with five or six revisions, one of them a rename, a row selected so the full description shows below. |
 | `connection-setup.png` | Optional: the workspace-suggestion dialog from connection setup. |

@@ -301,7 +301,8 @@ From there you can:
   changelist's description turns it into a numbered changelist.
 - **Drag and drop files between changelists**, or move them from the
   right-click menu.
-- **Diff, revert, sync, and reload** individual files.
+- **Diff, revert, sync, and reload** individual files, and open a file's
+  **History**.
 - **Get Latest** the whole project, and **Reconcile** it to find edits, adds,
   and deletes made outside the editor. Read Reconcile's list before accepting:
   files it calls *missing* get deleted for everyone when you submit.
@@ -332,11 +333,30 @@ unknown, with what to do next.
 <!-- 📷 SCREENSHOT: the submit confirmation dialog listing files + description.
      Suggested file: docs/images/submit-confirm.png -->
 
+### A file's history
+
+Right-click a file → **P4: History...** (in the FileSystem dock or the P4G
+panel) lists every submitted revision: who, when, which changelist, and the
+whole description. It follows the file back through moves and renames, so a
+file renamed last month still shows its earlier revisions under the old name.
+
+- **Diff vs Previous** compares a revision with the one before it. Select two
+  revisions and it becomes **Diff Selected**. Double-clicking a revision does
+  the same.
+- **Diff vs Workspace** compares a revision with the file on your computer.
+- **Get This Revision...** puts an older revision on your computer in place of
+  the one there. Nothing on the server changes, and **Get Latest** brings the
+  file back up to date. It refuses a checked-out file: submit or revert it
+  first.
+
+Binary files (images, sounds, models) and text files over 1 MB list their
+revisions but can't be shown side by side.
+
 ### Right-click actions in Godot's file browser
 
 - **Right-click P4 actions** on any file (not folders): **P4: Check Out**,
   **P4: Mark for Add**, **P4: Get Latest (Sync)**, **P4: Diff vs Depot**,
-  **P4: Revert...**, and **P4: Show Status in Log**. Checking out an imported
+  **P4: History...**, **P4: Revert...**, and **P4: Show Status in Log**. Checking out an imported
   asset also checks out its `.import` file, which holds its import settings.
   The menu is hidden while Perforce isn't connected.
 - **Hover tooltips** show each file's Perforce status: the revision you have
