@@ -2,6 +2,168 @@
 
 Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
+## Unreleased
+
+- **The addon is now six scripts instead of one.** `p4godot.gd` is still the
+  plugin `plugin.cfg` names; the code it held is split by job into
+  `p4godot_core.gd`, `_files`, `_windows`, `_flows` and `_dock`. Nothing
+  changes for users: updating by replacing the `addons/p4godot` folder picks
+  up the new files. The self-tests moved out of the addon into
+  `tests/p4godot_test.gd`, so the shipped plugin is about 3,000 lines lighter.
+- **Saving no longer freezes Godot when the server is out of reach.** With
+  the VPN down or the server offline, the first save that needed Perforce
+  froze the editor for about 21 seconds (the operating system's connection
+  timeout, which p4 has no setting to shorten). P4Godot now checks that the
+  server answers at all, giving up after 2 seconds, before it runs p4 on a
+  save.
+- **A server whose SSL certificate changed can be trusted again inside
+  Godot.** The warning now shows the fingerprint you trusted before and the
+  one the server shows now, and **Trust New Fingerprint** installs exactly
+  that one. It used to send you to a terminal.
+- **Diff vs Depot on a very large or binary file says so** instead of
+  downloading it. Files over 1 MB, on either side, are left to P4V; a file
+  Perforce stores as binary is named as such before anything is fetched.
+
+- **Resolve, inside Godot.** When a teammate submits a newer version of a
+  file you have checked out, the two versions have to be combined before
+  you can submit. P4Godot now does that: per file you choose **Combine both
+  versions** (text files, when you didn't both change the same lines),
+  **Keep mine** or **Take theirs**. Files that need it are marked "needs
+  resolve" in the P4G panel with **Resolve...** on their right-click menu,
+  Get Latest leads into it, and so does a Submit that finds out-of-date
+  files. It used to end at "do it in P4V". Merging the same lines by hand
+  still needs P4V.
+
+- **P4Godot checks that Perforce skips Godot's `.godot` folder.** At
+  startup, if no ignore rule covers it, P4Godot offers to add `.godot/` to
+  the ignore file - checking the file out, or creating it. It also notices
+  when this computer's `P4IGNORE` setting names a different file, which
+  silently puts the project's `.p4ignore` out of force, and says so.
+- **The automatic check for changes made outside Godot is faster on large
+  projects.** It now reads a file's content only when its modification time
+  has changed, where it used to read every file each time. The
+  **Reconcile...** button still compares everything.
+- **A moved file keeps its history even when you also changed it.** Moves
+  are now recorded by naming both paths to Perforce (`p4 edit` +
+  `p4 move -k`). Before, Perforce was left to match the old and new file by
+  content, and for a binary file that had been moved and changed it recorded
+  a delete and an unrelated add. If Perforce can't record a move - a
+  teammate holds an exclusive lock on the file, or the new name is taken -
+  P4Godot now says which files stayed behind and why.
+- **A rename that only changes capital letters is explained.** A server
+  that ignores case can't record `Hero.png` → `hero.png`; it refused without
+  an error and the rename stayed on your disk only. P4Godot now says so, why
+  it matters on macOS, Linux and in exports, and how to do it in two steps.
+- **Submit names out-of-date files before sending anything.** If a teammate
+  submitted a newer version of a file in your changelist, the dialog lists
+  those files and what to do, before it asks for a description. It used to
+  be the server's refusal after the fact.
+- **Diff vs Depot no longer calls a changed file identical.** For a file
+  changed on disk but not checked out - the files Reconcile finds - the
+  dialog said it was identical to the server's version. It now shows the
+  differences. The same wrong answer came up with an external diff tool
+  configured (`P4DIFF`), and for a file deleted from disk; both fixed. A
+  file that isn't on the server yet says so, and an answer from Perforce
+  that P4Godot can't read is reported as such instead of as "identical".
+- **Reverting a moved file undoes the move.** Reverting the old path of a
+  move used to do nothing and say nothing: Perforce refuses it without
+  reporting an error. Reverting either path now asks "Undo the move of A to
+  B?" and puts the file back, together with its `.import` or `.uid`.
+- **Revert works on a file that isn't checked out.** If it was changed or
+  deleted on your computer, Revert offers to put back the version you
+  downloaded. If it matches, it says there is nothing to throw away.
+- **Deleting a file you had just moved** now marks the original for delete.
+  It used to bring the file back under its old name.
+- **Mark for Add explains itself.** A file your ignore rules leave out used
+  to be skipped silently; now a message names the rule. A file already in
+  Perforce says so. Adding several files gives one summary.
+- **An expired password can be changed inside Godot.** When the server
+  refuses everything because your password has expired, or an admin asked
+  for it to be changed, P4Godot asks for the current password and a new one,
+  changes it and logs you in. Before, every action failed with the server's
+  message in the Log and nothing else, and the login prompt could not get
+  past it.
+- For contributors: `tools/run-live-tests.sh` starts a throwaway Perforce
+  server on this machine (`tools/p4-test-server.sh`, a pinned `p4d` download
+  checked against Perforce's published checksum) and runs the tests that need
+  a real server there, as an ordinary user. This includes two cases that had
+  never been run: a submit that waits at a slow server trigger, and Cancel
+  pressed after every file was sent - the server finishes that submit
+  alone, and P4Godot reports "too late to cancel" with the change number.
+
+- **Submit and Get Latest show their progress, and can be cancelled.** A
+  window shows how many files and how much data have moved, the file in
+  hand, and the time taken. It isn't modal: the editor stays usable, and
+  closing the window leaves the transfer running.
+  - It works when the server transfers files in parallel, which is where
+    `p4`'s documented progress option goes silent. P4Godot uses the same
+    progress reporting P4V does (`p4 --progress=debug`, in clients from 2021.1
+    on); with an older `p4` the bar shows activity without a percentage.
+  - **No more time limit on a transfer.** `p4` used to be given up on after
+    2 minutes of silence (10 for a submit). A long submit or download now runs
+    as long as it needs. If nothing has been reported for a minute the window
+    says so, says that isn't a failure, and leaves the choice to you.
+  - **Cancel on a submit** stops `p4`, then reports what the server says
+    happened: cancelled in time, or too late and already submitted. When a
+    file was part-way up, that takes a few seconds. It needs no special
+    access on the server; all of this was tested as an ordinary user.
+  - **Cancel on Get Latest** stops the download and removes the unfinished
+    files it leaves behind. Left alone, those empty files made every later
+    download refuse them. Files that had finished are kept and reloaded.
+  - Files sent by Delta Transfer (`binary+F`, where only the changed parts
+    travel) report in different units, or not at all on a download; the bar
+    handles both and fills in at the end.
+  - When the server reports it, the Log (for a submit) or the final report
+    (for Get Latest) says how much data crossed the network, and notes when
+    that is well under the size of the files. The server doesn't report it
+    for parallel transfers.
+  - Closing the editor during a transfer leaves `p4` running to finish, where
+    it used to wait for it.
+  - If you close the progress window, a **Transfer running...** button in the
+    P4G toolbar brings it back, since the window holds the only Cancel.
+  - One transfer at a time: starting a submit while a download runs (or the
+    reverse) is refused with an explanation.
+
+- **Get Latest and Sync This File can no longer overwrite an edit Perforce
+  doesn't know about.** They ran a plain `p4 sync`, which replaces any
+  read-only file without looking at it. A file can be changed and still
+  read-only: on macOS and Linux Godot saves by renaming a temporary file over
+  the target, which a read-only target doesn't stop. A plain sync then replaced
+  that edit with the server's version and reported only "updating"
+  (reproduced on Windows against a 2025.2 server, with a file edited and set
+  back to read-only). Both now run `p4 sync -s`, which compares each file with
+  the revision you have and leaves a changed one alone.
+  - The refused files are named before the download (the preview predicts
+    them), in the report afterwards, and when they are the only thing newer on
+    the server, where the old answer would have been "already up to date".
+  - A file that is unlocked but unchanged used to be reported as "would not
+    overwrite" with advice to Reconcile, which found nothing to do, so it
+    stayed behind the server for good. Those are now set back to read-only and
+    downloaded. The second pass is a safe sync too.
+  - Cost: `sync -s` reads every file it is about to replace, once for the
+    preview and once for the download.
+
+- **A failed submit no longer says "nothing was sent" without checking.** When
+  the connection drops partway through, the server may still finish the
+  submit. P4Godot now asks the server what became of the changelist before it
+  says anything, and reports one of three things: it was submitted (and as
+  which number), it was not, or it can't tell and you shouldn't submit again
+  yet.
+  - The default changelist is submitted as a numbered changelist carrying your
+    description, because the number is what makes the question askable. After
+    a refused submit your files are in that changelist, which the message
+    names.
+  - `p4 submit` no longer has a time limit, so a slow server-side check
+    isn't cut off (see the progress entry above).
+
+- **You can change the server, user, or workspace after setup.** The gear menu
+  has a new **Connection settings...** item, and the workspace picker shows
+  which server and user it is listing workspaces for, with a **Change Server
+  or User...** button. Until now the only route back was clicking the
+  connection status, which offered the workspace list and nothing else, and a
+  P4PORT pointing at another project's server looked the same as having no
+  workspace. Emptying a box goes back to your normal Perforce settings.
+
 ## 0.15.0 — 2026-09-24
 
 - **New "Get Latest..." button downloads the whole project.** Until now

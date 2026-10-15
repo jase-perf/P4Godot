@@ -1,0 +1,33 @@
+name: Install Godot and p4
+description: Download the Godot editor and the p4 command line for this runner, and put p4 on PATH.
+outputs:
+  godot:
+    description: Path to the Godot binary that prints to the console.
+    value: ${{ steps.install.outputs.godot }}
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/tools"
+        cd "$RUNNER_TEMP/tools"
+        case "$RUNNER_OS" in
+          Windows)
+            curl -fsSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_win64.exe.zip"
+            unzip -q godot.zip
+            curl -fsSL -o p4.exe "https://ftp.perforce.com/perforce/${P4_RELEASE}/bin.ntx64/p4.exe"
+            godot="$RUNNER_TEMP/tools/Godot_v${GODOT_VERSION}_win64_console.exe" ;;
+          Linux)
+            curl -fsSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+            unzip -q godot.zip
+            curl -fsSL -o p4 "https://ftp.perforce.com/perforce/${P4_RELEASE}/bin.linux26x86_64/p4"
+            chmod +x p4 "Godot_v${GODOT_VERSION}_linux.x86_64"
+            godot="$RUNNER_TEMP/tools/Godot_v${GODOT_VERSION}_linux.x86_64" ;;
+          *)
+            echo "No install recipe for $RUNNER_OS"; exit 1 ;;
+        esac
+        echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+        PATH="$RUNNER_TEMP/tools:$PATH" p4 -V | tail -1
+        "$godot" --version
+        echo "godot=$godot" >> "$GITHUB_OUTPUT"

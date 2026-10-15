@@ -205,7 +205,9 @@ It also tells you about the two things it can't simply download:
 
 - **A file you changed without checking it out.** Perforce refuses to
   overwrite it, which is the point: your work isn't thrown away. P4Godot names
-  those files and tells you to Reconcile them first.
+  those files before it downloads anything and again afterwards, and tells
+  you to Reconcile them. It checks each file's contents to find them (a "safe
+  sync"), so this holds even for a file that still looks locked.
 - **A file you have checked out that someone else changed too.** Perforce
   leaves yours alone and expects the two versions to be combined — *resolved*,
   in Perforce's word. P4Godot names those files; do it in P4V (right-click →
@@ -270,7 +272,13 @@ flow opens at startup and asks only for what's missing:
 - **Login**, if your ticket is missing or expired. If the ticket expires
   mid-session, a re-login prompt appears right away.
 - **Workspace**, suggested from your existing workspaces on the server,
-  ranked by whether their root contains this project.
+  ranked by whether their root contains this project. The list says which
+  server and user it is for. If that's the wrong server, press **Change
+  Server or User...** instead of picking.
+
+To change any of this later, open the settings menu in the P4G toolbar and
+choose **Connection settings...**. It asks for the server and user, then the
+workspace. Emptying a box goes back to your normal Perforce settings.
 
 Before it asks anything, P4Godot uses the Perforce configuration you already
 have: `P4CONFIG` files, values saved with `p4 set`, and login tickets. On
@@ -309,6 +317,18 @@ Submitting always shows a confirmation that lists the files and the
 description first. That list comes from the server as you press Submit, so it
 includes files in the same changelist that live outside the Godot project.
 
+While a submit or **Get Latest** runs, a progress window shows how many files
+and how much data have moved, and how long it has taken. You can keep working,
+or close the window; the transfer carries on. **Cancel** stops it. A cancelled
+download keeps the files that had finished and removes the unfinished ones. A
+cancelled submit is checked with the server, and you're told whether it
+stopped in time.
+
+If a submit doesn't finish cleanly, P4Godot asks the server what happened
+before telling you. A dropped connection can leave a submit that went through
+anyway, so the message says which it was: submitted, not submitted, or
+unknown, with what to do next.
+
 <!-- 📷 SCREENSHOT: the submit confirmation dialog listing files + description.
      Suggested file: docs/images/submit-confirm.png -->
 
@@ -324,11 +344,14 @@ includes files in the same changelist that live outside the Godot project.
   hover over a file starts the lookup in the background, and the status shows
   from the next hover, so hovering never waits on the server.
 - **Delete, move, and rename tracking.** Deleting a file offers to open it
-  for delete. Moving or renaming offers to record a history-preserving move
-  (`p4 reconcile -M`, which falls back to delete + add if the content changed
-  during the move). The `.import` and `.uid` files Godot moves along with an
-  asset are recorded too. These actions prompt by default, or apply silently
-  with the "Auto add/edit/delete" setting.
+  for delete. Moving or renaming offers to record a Perforce move, so the
+  file keeps its history under the new name even if you also changed it
+  (`p4 edit` + `p4 move -k`). The `.import` and `.uid` files Godot moves
+  along with an asset are recorded too, and reverting a moved file undoes the
+  move for all of them. A rename that only changes capital letters
+  (`Hero.png` → `hero.png`) can't be recorded on a server that ignores case;
+  P4Godot says so and explains the two-step way round. These actions prompt
+  by default, or apply silently with the "Auto add/edit/delete" setting.
 
 ### Files you edited in Photoshop, Blender, or anywhere else
 
@@ -422,7 +445,9 @@ contents really changed, P4Godot checks it out afterwards.
   `.import` files before reimporting.
 - **An unreachable server costs one long wait.** If the server stops
   answering mid-command, p4 gives up after 2 minutes (30 seconds for the
-  checks right before a save). But connecting to a server that's
+  checks right before a save). Submit and Get Latest have no limit; their
+  progress window tells you when nothing is moving and has a Cancel button.
+  But connecting to a server that's
   unreachable, for example after a VPN drop, takes the operating system's
   connect timeout (about 21 seconds on Windows). After one such failure,
   saves and status checks skip the server for a minute and saves go ahead
@@ -472,9 +497,10 @@ contents really changed, P4Godot checks it out afterwards.
   folders on macOS — that fallback exists because apps launched from the macOS
   Dock don't see your shell's `PATH`. If your copy is somewhere else again, set
   **Editor Settings → Perforce → Executable Path** to its full path.
-- **Wrong workspace.** Click the connection status in the toolbar (it shows
-  `user @ workspace`) and pick a different workspace. The choice is stored per
-  project. If you'd rather use a `P4CONFIG` file in the workspace root, it
+- **Wrong workspace, server, or user.** Open the settings menu in the P4G
+  toolbar and choose **Connection settings...**. Clicking the connection
+  status (it shows `user @ workspace`) goes straight to the workspace list.
+  The choice is stored per project. If you'd rather use a `P4CONFIG` file in the workspace root, it
   works as long as you haven't picked a workspace in P4Godot's setup for this
   project.
 - **A Load Error writing `project.godot` when the project opens.** Godot

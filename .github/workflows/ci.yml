@@ -1,6 +1,7 @@
 name: CI
 
-# Every push and pull request runs the checks that need no Perforce server.
+# Every push and pull request runs the self-tests and the live tests (against
+# a throwaway Perforce server) on Windows and Linux.
 # Pushing a tag like v0.15.0 runs them too, then publishes a GitHub release
 # with the p4godot-v0.15.0.zip the README tells people to download.
 
@@ -19,33 +20,58 @@ env:
 
 jobs:
   selftests:
-    # Windows, because that is where the plugin has been verified by hand.
-    name: Self-tests (Windows, Godot 4.7)
-    runs-on: windows-latest
+    # The checks that need no Perforce server. Windows is where the plugin has
+    # been verified by hand; Linux is where nothing else tests it.
+    name: Self-tests (${{ matrix.os }}, Godot 4.7)
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: Windows, runner: windows-latest }
+          - { os: Linux, runner: ubuntu-latest }
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Godot and the p4 command line
-        run: |
-          mkdir -p "$RUNNER_TEMP/tools"
-          cd "$RUNNER_TEMP/tools"
-          curl -fsSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_win64.exe.zip"
-          unzip -q godot.zip
-          curl -fsSL -o p4.exe "https://ftp.perforce.com/perforce/${P4_RELEASE}/bin.ntx64/p4.exe"
-          ./p4.exe -V
-          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
-
+      - uses: ./.github/actions/install-godot-p4
+        id: tools
       - name: Run the self-tests against a clean install
-        run: sh tools/run-selftests.sh "$RUNNER_TEMP/tools/Godot_v${GODOT_VERSION}_win64_console.exe"
+        run: VERBOSE=1 sh tools/run-selftests.sh "${{ steps.tools.outputs.godot }}"
+
+  live-tests:
+    # The checks that need a real server, against a throwaway p4d started on
+    # the runner (tools/p4-test-server.sh), as an ordinary user.
+    name: Live tests (${{ matrix.os }}, Godot 4.7)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: Windows, runner: windows-latest }
+          - { os: Linux, runner: ubuntu-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/install-godot-p4
+        id: tools
+      - name: Cache the pinned p4d
+        uses: actions/cache@v4
+        with:
+          path: .cache/p4d
+          key: p4d-${{ runner.os }}-${{ hashFiles('tools/p4-test-server.sh') }}
+      - name: Run the live tests
+        run: sh tools/run-live-tests.sh "${{ steps.tools.outputs.godot }}"
 
   release:
     name: Publish the release zip
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: selftests
+    needs: [selftests, live-tests]
     runs-on: ubuntu-latest
     permissions:
       contents: write

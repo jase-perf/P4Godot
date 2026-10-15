@@ -3,7 +3,9 @@
 # addon is unpacked from `git archive HEAD` - the same files a release zip
 # ships - into a throwaway Godot project. CI runs this; so can you.
 #
-#   tools/run-selftests.sh [path-to-godot]      (or set GODOT)
+#   tools/run-selftests.sh [path-to-godot] [test ...]   (or set GODOT)
+#
+# Name tests to run only those. VERBOSE=1 prints each test's [selftest] lines.
 #
 # On Windows pass the ..._console.exe build; the GUI binary prints nothing.
 # Needs `p4` on PATH (exec-quoting runs `p4 -V`). Tests the committed HEAD,
@@ -11,9 +13,11 @@
 cd "$(dirname "$0")/.." || exit 1
 
 GODOT="${1:-${GODOT:-godot}}"
-TESTS="parse-ztag sync-report save-guards prewrite unchanged-save exec-quoting
+[ $# -gt 0 ] && shift
+TESTS="parse-ztag sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
 diff-align dismiss-dialog build-change-spec fs-menu fstat-summary delete-action
-connection-store breaker"
+connection-store connection-dialogs progress streamed-exec breaker dial"
+[ $# -gt 0 ] && TESTS="$*"
 
 if ! "$GODOT" --version >/dev/null 2>&1; then
 	echo "FAIL: can't run Godot at '$GODOT'. Pass its path as the first argument."
@@ -58,6 +62,14 @@ if [ -n "$stray" ] || [ ! -f "$proj/addons/p4godot/plugin.cfg" ]; then
 fi
 echo "ok: archive holds only addons/p4godot/ ($(find "$proj" -type f | wc -l | tr -d ' ') files)"
 
+# The self-tests are not part of the addon. They run as the plugin: a script
+# beside it that extends it, named by this copy's plugin.cfg.
+git show HEAD:tests/p4godot_test.gd > "$proj/addons/p4godot/p4godot_test.gd" || exit 1
+sed 's/^script="p4godot.gd"$/script="p4godot_test.gd"/' "$proj/addons/p4godot/plugin.cfg" > "$work/plugin.cfg" \
+	&& mv "$work/plugin.cfg" "$proj/addons/p4godot/plugin.cfg" || exit 1
+grep -q '^script="p4godot_test.gd"' "$proj/addons/p4godot/plugin.cfg" \
+	|| { echo "FAIL: couldn't point plugin.cfg at the self-tests"; exit 1; }
+
 # Godot skips warnings under res://addons unless asked, and people do ask.
 cat > "$proj/project.godot" <<'EOF'
 config_version=5
@@ -88,7 +100,7 @@ run() {
 failed=""
 
 run 180 "$GODOT" --headless --path "$proj" --check-only \
-		--script res://addons/p4godot/p4godot.gd > "$work/logs/check.log" 2>&1
+		--script res://addons/p4godot/p4godot_test.gd > "$work/logs/check.log" 2>&1
 code=$?
 if [ "$code" -ne 0 ] || grep -q "SCRIPT ERROR" "$work/logs/check.log"; then
 	echo "FAIL: parse/warnings check (exit $code)"
@@ -111,6 +123,7 @@ for t in $TESTS; do
 	# [[:space:]]* because Godot's lines end in CRLF on Windows.
 	if grep -q "\[selftest\] PASS: $t[[:space:]]*\$" "$log" && ! grep -q "\[selftest\] FAIL" "$log"; then
 		echo "ok: $t"
+		[ -n "${VERBOSE:-}" ] && grep "\[selftest\]" "$log" | sed "s/^/    /"
 	else
 		echo "FAIL: $t (attempt $attempt)"
 		cat "$log"
