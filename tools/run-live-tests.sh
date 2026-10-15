@@ -55,6 +55,10 @@ fi
 
 # A small project, submitted by dev the way a team's first check-in would be.
 cp -r addons "$proj"/ || exit 1
+# The self-tests run as the plugin: a script beside it that extends it.
+cp tests/p4godot_test.gd "$proj/addons/p4godot/" || exit 1
+sed 's/^script="p4godot.gd"$/script="p4godot_test.gd"/' "$proj/addons/p4godot/plugin.cfg" > "$work/plugin.cfg" \
+	&& mv "$work/plugin.cfg" "$proj/addons/p4godot/plugin.cfg" || exit 1
 cat > "$proj/project.godot" <<'EOF'
 config_version=5
 

@@ -62,6 +62,14 @@ if [ -n "$stray" ] || [ ! -f "$proj/addons/p4godot/plugin.cfg" ]; then
 fi
 echo "ok: archive holds only addons/p4godot/ ($(find "$proj" -type f | wc -l | tr -d ' ') files)"
 
+# The self-tests are not part of the addon. They run as the plugin: a script
+# beside it that extends it, named by this copy's plugin.cfg.
+git show HEAD:tests/p4godot_test.gd > "$proj/addons/p4godot/p4godot_test.gd" || exit 1
+sed 's/^script="p4godot.gd"$/script="p4godot_test.gd"/' "$proj/addons/p4godot/plugin.cfg" > "$work/plugin.cfg" \
+	&& mv "$work/plugin.cfg" "$proj/addons/p4godot/plugin.cfg" || exit 1
+grep -q '^script="p4godot_test.gd"' "$proj/addons/p4godot/plugin.cfg" \
+	|| { echo "FAIL: couldn't point plugin.cfg at the self-tests"; exit 1; }
+
 # Godot skips warnings under res://addons unless asked, and people do ask.
 cat > "$proj/project.godot" <<'EOF'
 config_version=5
@@ -92,7 +100,7 @@ run() {
 failed=""
 
 run 180 "$GODOT" --headless --path "$proj" --check-only \
-		--script res://addons/p4godot/p4godot.gd > "$work/logs/check.log" 2>&1
+		--script res://addons/p4godot/p4godot_test.gd > "$work/logs/check.log" 2>&1
 code=$?
 if [ "$code" -ne 0 ] || grep -q "SCRIPT ERROR" "$work/logs/check.log"; then
 	echo "FAIL: parse/warnings check (exit $code)"

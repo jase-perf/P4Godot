@@ -4,6 +4,12 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **The addon is now six scripts instead of one.** `p4godot.gd` is still the
+  plugin `plugin.cfg` names; the code it held is split by job into
+  `p4godot_core.gd`, `_files`, `_windows`, `_flows` and `_dock`. Nothing
+  changes for users: updating by replacing the `addons/p4godot` folder picks
+  up the new files. The self-tests moved out of the addon into
+  `tests/p4godot_test.gd`, so the shipped plugin is about 3,000 lines lighter.
 - **Saving no longer freezes Godot when the server is out of reach.** With
   the VPN down or the server offline, the first save that needed Perforce
   froze the editor for about 21 seconds (the operating system's connection

@@ -8,9 +8,29 @@ is usually enough to find the cause.
 
 ## Layout
 
-Everything is in `addons/p4godot/p4godot.gd`. It's one large GDScript file on
-purpose: the plugin is a single `EditorPlugin`, and keeping it in one file
-keeps a drop-in install a folder copy with nothing to wire up.
+The plugin is one `EditorPlugin` split across a chain of scripts, each of
+which `extends` the one before it, so every function and variable is reachable
+from every later layer with no wiring between them:
+
+| File | What it holds |
+|---|---|
+| `p4godot_core.gd` | Connection and login, settings, running `p4` (the worker thread, streamed transfers, the save-path connect check), the changelist model, the confirmation dialog |
+| `p4godot_files.gd` | What happens to files in the editor: checkout on edit and on save, failed-save rescue, Reconcile and Revert Unchanged, changes made outside Godot, delete / move / rename from the FileSystem dock |
+| `p4godot_windows.gd` | The transfer progress window and the diff viewer |
+| `p4godot_flows.gd` | Get Latest, resolve, changelist create / edit / move, Submit |
+| `p4godot_dock.gd` | The P4G dock, its changelist tree and actions, and the FileSystem dock's tooltips and right-click menu |
+| `p4godot.gd` | The plugin entry point named in `plugin.cfg`: an overview comment, `_enter_tree` and `_exit_tree` |
+
+A layer may call down the chain but not up it. The two exceptions,
+`_request_refresh` and `_update_conn_status`, are declared as stubs in core
+and overridden in the dock. Put new code in the lowest layer that has
+everything it uses.
+
+The self-tests are not in the addon. `tests/p4godot_test.gd` extends
+`p4godot.gd` and overrides `_run_cli_self_test_if_requested`. The test scripts
+copy it into a throwaway project's `addons/p4godot/` and point that copy's
+`plugin.cfg` at it. It has to sit in the addon folder, because the plugin finds
+its own folder from its script's path.
 
 `addons/p4godot/README.md` is generated from the root `README.md` by
 `tools/sync-addon-readme.sh`, which rewrites `docs/` links to absolute URLs
@@ -19,7 +39,8 @@ README and re-run the script; don't edit the copy.
 
 ## Self-tests
 
-The plugin has built-in self-tests, run headless:
+The self-tests run headless, in a project whose plugin is the test script (see
+Layout above; the two scripts below set that up for you):
 
 ```
 godot --headless --editor --path <project> -- --p4-selftest-<name>
@@ -44,7 +65,7 @@ and run it again.
 One command runs all of them, plus the warnings check below:
 
 ```
-tools/run-selftests.sh <path-to-godot>
+tools/run-selftests.sh <path-to-godot> [test ...]
 ```
 
 It unpacks the addon from `git archive HEAD` into a throwaway project, so it
@@ -60,10 +81,11 @@ rights (the access a P4Godot user has):
 tools/run-live-tests.sh <path-to-godot> [test ...]
 ```
 
-It downloads Perforce's `p4d` once into `.cache/` (checked against a pinned
-checksum), tests your working tree, and deletes the server afterwards.
-`tools/p4-test-server.sh start <dir>` gives you the same server to poke at by
-hand. So far this has only been run on Windows.
+It downloads Perforce's `p4d` once into `.cache/` (checked against the
+`SHA256SUMS` file Perforce publishes beside it), tests your working tree, and
+deletes the server afterwards. `tools/p4-test-server.sh start <dir>` gives you
+the same server to poke at by hand. CI runs it on Windows and Linux; it has not
+been run on macOS.
 
 Against your own workspace: read-only ones — `probe`, `list-opened`,
 `reconcile-report`, `reconcile-preview` — are safe to run against a workspace
@@ -73,16 +95,18 @@ change the workspace: some clean up after themselves, some need a clean
 workspace and say so, and some need staging beforehand (`get-latest` explains
 its own in a comment above it).
 
-`_run_cli_self_test_if_requested` has the full list.
+`_run_cli_self_test_if_requested` in `tests/p4godot_test.gd` has the full list.
 `docs/manual-tests.md` covers the checks that need a real editor window,
 because no headless test can see a dialog's layout or a tooltip.
 
 ## Before sending a change
 
 - Run the server-independent tests.
-- Check for GDScript warnings. Godot excludes `res://addons` from warnings by
-  default, so you have to ask for them. Copy the addon into a throwaway
-  project whose `project.godot` contains at least:
+- Check for GDScript warnings. `tools/run-selftests.sh` does this first; to
+  do it by hand, note that Godot excludes `res://addons` from warnings by
+  default, so you have to ask for them. Copy the addon and
+  `tests/p4godot_test.gd` into a throwaway project whose `project.godot`
+  contains at least:
 
   ```
   [debug]
@@ -97,8 +121,10 @@ because no headless test can see a dialog's layout or a tooltip.
   Then:
 
   ```
-  godot --headless --path <project> --check-only --script res://addons/p4godot/p4godot.gd
+  godot --headless --path <project> --check-only --script res://addons/p4godot/p4godot_test.gd
   ```
+
+  Checking the test script parses the whole chain under it.
 
   It exits 1 and prints a `SCRIPT ERROR:` line for both a parse error and a
   warning-turned-error, naming the identifier (measured on Godot 4.7). The
