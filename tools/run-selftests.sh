@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 GODOT="${1:-${GODOT:-godot}}"
 [ $# -gt 0 ] && shift
-TESTS="parse-ztag history shelves editor-menus sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
+TESTS="parse-ztag history shelves editor-menus watch sync-report submit-verdict p4-answers save-guards prewrite unchanged-save exec-quoting
 diff-align dismiss-dialog build-change-spec fs-menu fstat-summary delete-action
 connection-store connection-dialogs progress streamed-exec breaker dial"
 [ $# -gt 0 ] && TESTS="$*"

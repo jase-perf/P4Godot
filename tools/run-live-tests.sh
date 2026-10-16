@@ -18,7 +18,7 @@ GODOT="${1:-${GODOT:-godot}}"
 [ $# -gt 0 ] && shift
 ALL="probe ignore-check-live file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
 special-names history-live shelves-live submit-behind-live resolve-live submit-verdict-live submit-cancel submit-slow-trigger-live
-external-scan"
+watch-live allwrite-live"
 TESTS="${*:-$ALL}"
 
 if ! "$GODOT" --version >/dev/null 2>&1; then
@@ -39,7 +39,12 @@ trap 'exit 130' INT TERM HUP
 
 sh tools/p4-test-server.sh start "$srv" || exit 1
 . "$srv/env.sh"
-proj="$P4TEST_WS"
+# The project sits in a folder of the workspace, with a file beside it, as
+# in a team's workspace that holds art sources next to the game. Tests that
+# use the second user's workspace get its matching folder.
+proj="$P4TEST_WS/game"
+export P4TEST_MATE_WS="$P4TEST_MATE_WS/game"
+mkdir -p "$proj" "$P4TEST_WS/art" || exit 1
 # Server, user and workspace on the command line, where no stray settings
 # file can override them.
 p4t() { p4 -p "$P4PORT" -u "$P4USER" -c "$P4CLIENT" "$@"; }
@@ -85,10 +90,12 @@ if grep -q "SCRIPT ERROR" "$work/logs/check.log"; then
 	exit 1
 fi
 printf '.godot/\n*.log\n%s\n' "$P4CONFIG" > "$proj/.p4ignore"
+printf '%s\n' "$P4CONFIG" > "$P4TEST_WS/.p4ignore"
 printf 'extends Node\n' > "$proj/main.gd"
+printf 'Art source, outside the Godot project\n' > "$P4TEST_WS/art/readme.txt"
 (
 	cd "$proj" || exit 1
-	p4t add .p4ignore project.godot main.gd >/dev/null &&
+	p4t add ../.p4ignore ../art/readme.txt .p4ignore project.godot main.gd >/dev/null &&
 		p4t reconcile -a addons/... >/dev/null &&
 		p4t submit -d "First check-in of the test project" >/dev/null
 ) || { echo "FAIL: couldn't submit the test project"; exit 1; }
@@ -140,7 +147,7 @@ for t in $TESTS; do
 	if [ -n "$left" ]; then
 		echo "FAIL: $t left files opened:"; echo "$left"
 		failed="$failed $t-left-open"
-		(cd "$proj" && p4t revert ./... >/dev/null 2>&1)
+		(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1)
 	fi
 done
 

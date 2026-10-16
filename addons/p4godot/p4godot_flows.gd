@@ -1091,7 +1091,7 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	# instead of after a numbered changelist exists and the submit has failed.
 	var opened_recs := _parse_ztag(await _p4_exec(["-ztag", "fstat", "-Ro",
 			"-e", change, "-T", "depotFile,clientFile,headRev,haveRev,action,unresolved",
-			_project_scope() if change == "default" else "//%s/..." % _p4_client]))
+			_workspace_scope()]))
 	var behind := _out_of_date_in(opened_recs)
 	if not behind.is_empty():
 		var labels := {}
@@ -1274,8 +1274,8 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 
 ## What a submit of `files` (entries from _submit_file_list) will transfer:
 ## every file except the ones being deleted, with the size of each one whose
-## local path is known. Files outside the Godot project have no local path
-## here; the tracker takes their sizes from p4's own progress lines.
+## local path is known. A file known only by its depot path gets its size
+## from p4's own progress lines instead.
 func _submit_tracker(files: Array) -> P4Progress:
 	var tracker := P4Progress.new()
 	for f in files:
@@ -1283,7 +1283,7 @@ func _submit_tracker(files: Array) -> P4Progress:
 			continue
 		tracker.total_files += 1
 		var label := String(f.label)
-		if not label.begins_with("res://"):
+		if label.begins_with("//"):
 			continue
 		var local := ProjectSettings.globalize_path(label)
 		var handle := FileAccess.open(local, FileAccess.READ)
@@ -1538,18 +1538,16 @@ func _out_of_date_in(records: Array) -> Array:
 	return behind
 
 
-## The files a submit will include, queried fresh: the default changelist's
-## files under this project (the scope a default submit covers), or every file
-## in a numbered changelist - including any outside the project, which
-## `submit -c` takes along. Each entry: {depot_path, action, label}, where the
-## label is the res:// path when known, else the depot path.
+## The files a submit will include, queried fresh: every file in the
+## changelist, including any outside the Godot project - the dock lists those
+## too, and `submit -c` takes them along. Each entry: {depot_path, action,
+## label}, where the label is the dock's name for the file when known, else
+## the depot path.
 func _submit_file_list(change: String, known: Array) -> Array:
 	var res_by_depot := {}
 	for f in known:
 		res_by_depot[String(f.depot_path)] = String(f.res_path)
 	var args: PackedStringArray = ["-ztag", "opened", "-c", change]
-	if change == "default":
-		args.append(_project_scope())
 	var out: Array = []
 	for rec in _parse_ztag(await _p4_exec(args)):
 		var depot := String(rec.get("depotFile", ""))

@@ -287,6 +287,11 @@ func _apply_changes() -> void:
 	if checkout_on_save_checkbox.button_pressed:
 		var failures: Array = []
 		for res_path: String in _pending_save_checkout.keys():
+			if FileAccess.open(ProjectSettings.globalize_path(res_path), FileAccess.READ_WRITE) != null:
+				# Already writable (an allwrite workspace, a +w file): the write
+				# can't fail, so the save doesn't wait on the server. The
+				# post-save handlers check it out once it has landed.
+				continue
 			_log("Checking out '%s' before saving..." % res_path)
 			var result: Dictionary = _do_checkout_sync(res_path)
 			if not result.ok:
@@ -1720,129 +1725,12 @@ func _check_plugin_tracked() -> void:
 			"plugin the next time they download the project."))
 
 
-## The scan is a full reconcile preview of the project, so it costs real work
-## on a large workspace. One every few seconds is plenty for "the user just
-## alt-tabbed back".
-const EXTERNAL_SCAN_MIN_INTERVAL_MSEC := 5000
-## How long an unfinished scan blocks the next one before it's written off.
-const EXTERNAL_SCAN_STUCK_MSEC := 300000
-
-var _external_scan_inflight: bool = false
-var _external_scan_started_msec: int = 0
-var _external_scan_last_msec: int = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
-
-
-func _notification(what: int) -> void:
-	if what == NOTIFICATION_APPLICATION_FOCUS_IN:
-		_scan_for_external_changes("Godot regained focus")
-
-
-func _detect_external_changes() -> bool:
-	return detect_external_checkbox != null and detect_external_checkbox.button_pressed
-
-
-## Look for files changed outside Godot and offer to open them. Silent when
-## there's nothing to report. `reason` shows only in the verbose log.
-func _scan_for_external_changes(reason: String) -> void:
-	if not _detect_external_changes() or _shutting_down:
-		return
-	if _external_scan_inflight:
-		# A scan waits on dialogs, and a dialog that is freed without
-		# answering leaves its awaiting coroutine parked forever. Without this
-		# release, one such dialog would turn external-change detection off
-		# for the rest of the session with nothing said about it.
-		if Time.get_ticks_msec() - _external_scan_started_msec < EXTERNAL_SCAN_STUCK_MSEC:
-			return
-		_log("The last external-change scan never finished - starting a new one.")
-	if _identity_checked and not _p4_available:
-		return # p4 was unavailable at startup - the plugin is inert.
-	if _server_unreachable():
-		return # The breaker is open; don't spend another timeout on a scan.
-	var now := Time.get_ticks_msec()
-	if now - _external_scan_last_msec < EXTERNAL_SCAN_MIN_INTERVAL_MSEC:
-		return
-	_external_scan_inflight = true
-	_external_scan_started_msec = now
-	await _scan_for_external_changes_inner(reason)
-	# Time from the END of the scan, so a slow one can't immediately re-fire.
-	_external_scan_last_msec = Time.get_ticks_msec()
-	_external_scan_inflight = false
-
-
-func _scan_for_external_changes_inner(reason: String) -> void:
-	if not await _ensure_identity():
-		return
-	if _verbose_log:
-		_log("Scanning for changes made outside Godot (%s)..." % reason)
-	# -m: only read a file's content when its modification time differs from
-	# the one Perforce recorded. Without it every file in the project is read
-	# and hashed on each scan (measured: twice as long on 450 MB from a warm
-	# disk cache, and the gap grows with the project). The cost: a file whose
-	# content changed while its time stayed exactly the same is missed here.
-	# An older or newer time is caught (measured), so an Explorer or Finder
-	# copy is. The Reconcile button still does the full comparison.
-	var result: Dictionary = await _p4_exec(["-ztag", "reconcile", "-n", "-m", _project_scope()])
-	await _offer_external_changes(_summarize_reconcile(_parse_ztag(result)), _refusals(result))
-
-
-## Ask about a set of externally changed files and open the ones the user
-## agreed to. Split out from the scan so the decision - including "don't ask
-## about this same set again" - can be exercised on a known list.
-func _offer_external_changes(found: Dictionary, refused: Dictionary) -> void:
-	var names: Array = found.names
-	if names.is_empty():
-		# Nothing outstanding: forget any set the user waved away, so the same
-		# files can be offered again if they change later.
-		_external_scan_dismissed = ""
-		if int(refused.count) > 0 and _verbose_log:
-			_log("Perforce won't open %d changed file(s); press Reconcile for details." % refused.count)
-		return
-
-	var signature := _external_scan_signature(found.locals, names)
-	if signature == _external_scan_dismissed:
-		return # Already asked about exactly this state and was told no.
-	_external_scan_dismissed = ""
-
-	# "Auto add/edit/delete" is about the user's own edits, so it doesn't get
-	# to silently act on a project-wide scan they didn't start when the scan
-	# wants to open files for DELETE - that would quietly stage the removal of
-	# anything an incomplete sync left missing.
-	if _auto_open() and int(found.deletes) == 0:
-		_log("%d file(s) changed outside Godot - opening them in Perforce." % names.size())
-		await _reconcile_paths(found.locals, names, signature)
-		return
-
-	if not await _confirm_reconcile(found, refused, "Check Out", "Not Now"):
-		_external_scan_dismissed = signature
-		_log("Left %d externally changed file(s) unopened." % names.size())
-		return
-	await _reconcile_paths(found.locals, names, signature)
-
-
-## What the user was shown, as a string that changes when the files do. Paths
-## alone aren't enough: someone who says "Not Now" and then re-exports the
-## same file has to be asked again, and a path-only signature would silence
-## that second change for the rest of the session.
-func _external_scan_signature(locals: Array, names: Array) -> String:
-	var parts := PackedStringArray()
-	for i in names.size():
-		var local := String(locals[i])
-		var stamp := 0
-		if FileAccess.file_exists(local):
-			stamp = FileAccess.get_modified_time(local)
-		parts.append("%s:%d" % [String(names[i]), stamp])
-	return "\n".join(parts)
-
-
 ## Open exactly the files that were listed, naming each one on the command
 ## line rather than re-running reconcile over the whole project: a second
 ## whole-project pass would also open anything that changed while the dialog
 ## was up, which the user never saw and never agreed to. Long lists go out in
-## batches so the command line can't overflow.
-##
-## `signature`, when given, is remembered if Perforce refuses anything, so a
-## file locked by someone else doesn't re-ask on every alt-tab.
-func _reconcile_paths(locals: Array, names: Array, signature: String = "") -> void:
+## batches so the command line can't overflow. Returns the refusals.
+func _reconcile_paths(locals: Array, names: Array) -> Dictionary:
 	const BATCH := 50
 	var refused := {"count": 0, "lines": [], "locked": false}
 	var start := 0
@@ -1857,11 +1745,10 @@ func _reconcile_paths(locals: Array, names: Array, signature: String = "") -> vo
 		start += BATCH
 	_request_refresh()
 	if int(refused.count) == 0:
-		return
-	if not signature.is_empty():
-		_external_scan_dismissed = signature
+		return refused
 	_log("Perforce refused %d of the %d file(s)." % [refused.count, names.size()])
 	await _show_alert(_refusal_alert_text(refused))
+	return refused
 
 
 func _on_revert_unchanged_pressed() -> void:
@@ -1958,8 +1845,11 @@ func _open_editor_files() -> Dictionary:
 ## Reloads res_path from disk, discarding any in-editor unsaved changes.
 ## Returns true when the editor's copy of the file demonstrably matches disk
 ## again - callers use that to decide whether they still have to suppress
-## checkout prompts for the file.
+## checkout prompts for the file. A file outside the project (a local path)
+## is never loaded in the editor, so there is nothing to reload.
 func _reload_path(res_path: String) -> bool:
+	if not res_path.begins_with("res://"):
+		return true
 	# reload_scene_from_path() internally calls EditorUndoRedoManager.
 	# clear_history(), which emits history_changed - suppress our own handler
 	# so the reload can't re-trigger the prompt it was just declining. Cleared

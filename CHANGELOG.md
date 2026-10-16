@@ -4,6 +4,38 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **P4Godot watches your whole workspace for changes made by any program**,
+  including art folders beside the Godot project, and checks out what was
+  edited without asking: no more dialog on every alt-tab. It looks when Godot
+  regains focus and every half minute or so. New and missing files, and edits
+  Perforce refused (a teammate's exclusive lock), are listed at the top of
+  the P4G panel under **Changed, not checked out**, each with its own
+  action. A new setting, **Check out changed files automatically**, lists
+  edits there too instead. Each file's modification time is remembered once
+  Perforce has confirmed it, so after the first look only files that changed
+  are checked. On 20,000 small files with a local server, the first look
+  took 30 seconds (nearly two minutes on a cold disk cache) and later ones
+  about a second. The setting formerly
+  called "Detect external changes" is now **Watch the workspace for
+  changes**.
+- **Changelists stay consistent with the disk.** A file marked for add and
+  then deleted is taken out of its changelist; before, the submit failed on
+  it with "can't find the file". A file marked for delete that comes back is
+  put back as it was when unchanged, and checked out in the same changelist
+  when it changed. A rename whose new name is deleted becomes a delete of
+  the old name. Submit runs the same check first. Only changes P4Godot saw
+  happen count, so `p4 delete -k` and virtual integrates are left alone.
+- **Leave workspace files writable.** A setting switches the workspace to
+  `allwrite`, so Godot's own rewrites never hit a read-only file, and sets
+  the files on disk to match; P4Godot offers it once in a read-only
+  workspace. Get Latest still never overwrites a file you changed without
+  checking it out. Switching back leaves changed, unopened files writable.
+  In an `allwrite` workspace a save no longer waits for a checkout first.
+- **The P4G panel lists files outside the Godot project** that are opened in
+  the same workspace, as `../art/hero.psd`, and submitting the default
+  changelist sends them too. They used to be left out of the panel, though a
+  numbered changelist's submit already took them along.
+
 - **P4 in the editor's other right-click menus.** Scene tabs, script tabs and
   the code editor have a **P4** submenu with the FileSystem dock's actions;
   a scene tree node has one for the scene it is an instance of and one for
@@ -31,9 +63,9 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
   each other, or a revision with the file on your computer, in the same
   side-by-side view as Diff vs Depot. **Get This Revision** puts an older
   revision on your computer without changing anything on the server.
-- **The addon is now nine scripts instead of one.** `p4godot.gd` is still the
+- **The addon is now ten scripts instead of one.** `p4godot.gd` is still the
   plugin `plugin.cfg` names; the code it held is split by job into
-  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history`, `_shelves`, `_dock` and `_menus`. Nothing
+  `p4godot_core.gd`, `_files`, `_windows`, `_flows`, `_history`, `_shelves`, `_dock`, `_menus` and `_watch`. Nothing
   changes for users: updating by replacing the `addons/p4godot` folder picks
   up the new files. The self-tests moved out of the addon into
   `tests/p4godot_test.gd`, so the shipped plugin is about 3,000 lines lighter.

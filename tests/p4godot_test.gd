@@ -1094,6 +1094,129 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: shelves" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
+		if arg == "--p4-selftest-watch":
+			# Server-independent: the decisions behind the workspace watcher -
+			# which files a pass asks Perforce about, what to do with opened
+			# files whose disk state contradicts the open, the allwrite spec
+			# edit, and the dock's "Changed, not checked out" rows.
+			var checks := {}
+			var now := 1000000
+			var walked := {
+				"a": ["A", now - 100], # new: never checked
+				"b": ["B", now - 100], # same time, checked well after its write: trusted
+				"c": ["C", now - 100], # its time changed
+				"d": ["D", now - 100], # checked within the settle window of its write
+				"e": ["E", now - 1],   # still being written
+				"f": ["F", now - 100], # opened: Perforce already tracks it
+			}
+			var cache := {
+				"b": ["B", now - 100, now - 50, ""],
+				"c": ["C", now - 200, now - 150, ""],
+				"d": ["D", now - 100, now - 99, ""],
+				"g": ["G", now - 300, now - 250, ""],       # gone from disk: asked once
+				"h": ["H", -1, now - 250, "delete"],        # known gone, asked lately: not asked again
+				"i": ["I", -1, now - WATCH_MISSING_RECHECK_SEC - 10, "delete"], # known gone, asked long ago
+				"f": ["F", now - 300, now - 250, "edit"],
+			}
+			var plan := _watch_candidates(walked, cache, {"f": true}, now)
+			var check: Array = plan.check.duplicate()
+			check.sort()
+			_log("[selftest] candidates: %s unsettled=%s" % [check, plan.unsettled])
+			checks["candidates are new, changed, too-soon and gone files"] = check == ["A", "C", "D", "G", "I"] \
+					and bool(plan.unsettled)
+			checks["a settled, quiet workspace checks nothing"] = (_watch_candidates({"b": ["B", now - 100]},
+					{"b": ["B", now - 100, now - 50, "edit"]}, {}, now).check as Array).is_empty()
+
+			var on_disk := {"C:/w/added_here.txt": true, "C:/w/del_back.txt": true, "C:/w/kept.txt": true}
+			var exists := func(p: String) -> bool: return on_disk.has(p)
+			var records := [
+				{"depotFile": "//d/added_gone.txt", "clientFile": "C:/w/added_gone.txt", "action": "add", "change": "default"},
+				{"depotFile": "//d/added_here.txt", "clientFile": "C:/w/added_here.txt", "action": "add", "change": "default"},
+				{"depotFile": "//d/del_back.txt", "clientFile": "C:/w/del_back.txt", "action": "delete", "change": "7", "headType": "text+w"},
+				{"depotFile": "//d/del_gone.txt", "clientFile": "C:/w/del_gone.txt", "action": "delete", "change": "7"},
+				{"depotFile": "//d/new.txt", "clientFile": "C:/w/new.txt", "action": "move/add", "change": "8", "movedFile": "//d/old.txt"},
+				{"depotFile": "//d/old.txt", "clientFile": "C:/w/old.txt", "action": "move/delete", "change": "8"},
+				{"depotFile": "//d/edited.txt", "clientFile": "C:/w/edited.txt", "action": "edit", "change": "default"},
+				# Deliberate states, which must be left alone: an add of a file that
+				# never existed, a virtual branch, a `delete -k`.
+				{"depotFile": "//d/never.txt", "clientFile": "C:/w/never.txt", "action": "add", "change": "default"},
+				{"depotFile": "//d/virtual.txt", "clientFile": "C:/w/virtual.txt", "action": "branch", "change": "default"},
+				{"depotFile": "//d/kept.txt", "clientFile": "C:/w/kept.txt", "action": "delete", "change": "default"},
+			]
+			var seen := {"c:/w/added_gone.txt": true, "c:/w/added_here.txt": true, "c:/w/del_back.txt": false,
+					"c:/w/del_gone.txt": false, "c:/w/new.txt": true, "c:/w/never.txt": false,
+					"c:/w/virtual.txt": true, "c:/w/kept.txt": true}
+			var tidy := {}
+			for step: Dictionary in _tidy_plan(records, exists, seen):
+				tidy[String(step.local)] = step
+			_log("[selftest] tidy plan: %s" % [tidy.keys()])
+			checks["nothing is tidied without an earlier look"] = _tidy_plan(records, exists, {}).is_empty()
+			checks["tidy plan names the three changes seen, not the deliberate states"] = tidy.size() == 3 \
+					and String(tidy.get("C:/w/added_gone.txt", {}).get("kind", "")) == "add gone" \
+					and String(tidy.get("C:/w/del_back.txt", {}).get("kind", "")) == "delete back" \
+					and String(tidy.get("C:/w/del_back.txt", {}).get("change", "")) == "7" \
+					and String(tidy.get("C:/w/del_back.txt", {}).get("type", "")) == "text+w" \
+					and String(tidy.get("C:/w/new.txt", {}).get("kind", "")) == "move gone" \
+					and String(tidy.get("C:/w/new.txt", {}).get("source", "")) == "C:/w/old.txt"
+
+			var spec := "# A comment\nClient:\tdev-ws\n\nOptions:\tnoallwrite noclobber nocompress unlocked nomodtime normdir\n\nRoot:\tC:/w\n"
+			var spec_on := _spec_with_allwrite(spec, true)
+			checks["allwrite spec flips only that word, and back"] = spec_on.contains(
+					"Options:\tallwrite noclobber nocompress unlocked nomodtime normdir") \
+					and _spec_with_allwrite(spec_on, false) == spec \
+					and _spec_with_allwrite("Client:\tx\n", true) == "Client:\tx\n"
+			checks["+w filetypes"] = _type_is_writable("text+w") and _type_is_writable("binary+lw") \
+					and not _type_is_writable("text") and not _type_is_writable("binary+l") \
+					and not _type_is_writable("xtext")
+			var chunks := _path_chunks(["aaaa", "bbbb", "cccc", "a-path-longer-than-the-budget"], 15)
+			checks["path chunks stay under budget"] = chunks.size() == 3 and (chunks[0] as Array).size() == 2 \
+					and (chunks[2] as Array) == ["a-path-longer-than-the-budget"]
+			checks["nothing-to-do answers"] = _reconcile_had_nothing({"exit_code": 1, "output": [
+					"Path 'C:/x' is not under client's root 'C:/w'.\nNo file(s) to reconcile.\n"]}) \
+					and not _reconcile_had_nothing({"exit_code": 1, "output": [
+					"Perforce client error:\n\tConnect to server failed; check $P4PORT.\n"]}) \
+					and not _reconcile_had_nothing({"exit_code": 1, "output": [""]})
+
+			var project := ProjectSettings.globalize_path("res://").replace("\\", "/").trim_suffix("/")
+			var outside := project.get_base_dir().path_join("art/hero.psd")
+			checks["labels"] = _tree_label("res://scenes/a.tscn") == "scenes/a.tscn" \
+					and _tree_label(outside) == "../art/hero.psd"
+			checks["row verbs"] = _detected_verb("edit") == "Check Out" and _detected_verb("add") == "Mark for Add" \
+					and _detected_verb("delete") == "Mark for Delete"
+
+			# The dock: a listed file gets a group row at the top; once opened
+			# it is left out.
+			var key := _path_key(outside)
+			_watch_detected = [{"key": key, "local": outside, "mtime": now, "action": "edit"}]
+			var model := {"available": true, "changelists": [{"change": "default", "desc": "",
+					"files": [], "shelved": []}]}
+			_rebuild_tree(model)
+			var top := tree.get_root().get_first_child()
+			var row := null if top == null else top.get_first_child()
+			checks["group row and file row"] = top != null and (top.get_metadata(0) as Dictionary).get("type") == "detected_group" \
+					and row != null and row.get_text(0) == "../art/hero.psd" \
+					and (row.get_metadata(0) as Dictionary).get("type") == "detected"
+			if row != null:
+				_populate_context_menu(row.get_metadata(0))
+				checks["edit row menu"] = _selftest_menu_labels() == "Check Out | Show in File Manager | Diff vs Depot | History... |  | Refresh"
+				_log("[selftest] edit row menu: %s" % _selftest_menu_labels())
+			_populate_context_menu({"type": "detected", "action": "delete", "local": outside, "res_path": outside})
+			checks["delete row menu"] = _selftest_menu_labels() == "Mark for Delete | History... |  | Refresh"
+			model.changelists[0].files = [{"res_path": outside, "depot_path": "//d/art/hero.psd",
+					"action": "edit", "change": "default", "type": "binary"}]
+			_rebuild_tree(model)
+			var first_row := tree.get_root().get_first_child()
+			checks["opened file leaves the group"] = first_row != null \
+					and (first_row.get_metadata(0) as Dictionary).get("type") == "cl"
+			_watch_detected = []
+
+			var ok := true
+			for name: String in checks:
+				_log("[selftest] %s: %s" % [name, checks[name]])
+				ok = ok and bool(checks[name])
+			_log("[selftest] %s: watch" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-editor-menus":
 			# Server-independent: the P4 submenus on scene tabs, script tabs, the
 			# code editor and the scene tree, and the pieces behind "Who Changed
@@ -3673,73 +3796,281 @@ func _run_cli_self_test_if_requested() -> void:
 				_log("[selftest] PASS: get-latest (%s)" % outcome)
 			get_tree().quit()
 			return
-		if arg == "--p4-selftest-external-scan":
-			# Live: a file another program dropped into the workspace must be
-			# found by the focus-in scan and offered for checkout, and a set
-			# the user declined must not ask again. Self-cleaning: it adds its
-			# own scratch file, then reverts and deletes it.
-			var rel := "res://p4godot_external_%d.txt" % Time.get_unix_time_from_system()
-			var global := ProjectSettings.globalize_path(rel)
-			var f := FileAccess.open(rel, FileAccess.WRITE)
-			f.store_string("written by a program that knows nothing about Perforce\n")
-			f.close()
-			detect_external_checkbox.set_pressed_no_signal(true)
-			auto_open_checkbox.set_pressed_no_signal(false)
-
-			# The focus notification is what drives the scan in normal use, and
-			# a headless session never gets a real one. Propagating it by hand
-			# at least proves it reaches this plugin node and starts a scan
-			# (the scan stamps _external_scan_last_msec when it finishes).
-			_selftest_auto_answer = "cancel"
-			_external_scan_last_msec = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
-			var stamp_before := _external_scan_last_msec
-			get_tree().root.propagate_notification(NOTIFICATION_APPLICATION_FOCUS_IN)
-			await _selftest_drain_frames()
-			var focus_scanned := _external_scan_last_msec != stamp_before
-			_log("[selftest] focus notification started a scan: %s" % focus_scanned)
-			_external_scan_dismissed = ""
-
-			# The scan reconciles everything it finds, and this workspace can
-			# hold unrelated changes - narrow it to our own file.
-			var preview := await _reconcile_preview()
-			var found := false
-			for rec in preview:
-				if _local_to_res(String(rec.get("clientFile", ""))) == rel:
-					found = true
-			_log("[selftest] reconcile preview saw the new file: %s" % found)
-
-			var one_file := {"locals": [global], "names": [rel],
-					"adds": 1, "edits": 0, "deletes": 0}
-			var no_refusals := {"count": 0, "lines": [], "locked": false}
-
-			# Decline once: the file stays unopened and the set is remembered,
-			# so the same set can't ask again on every alt-tab.
-			_selftest_auto_answer = "cancel"
-			await _offer_external_changes(one_file, no_refusals)
-			await _selftest_drain_frames()
-			var opened_after_decline := not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
-			var remembered := not _external_scan_dismissed.is_empty()
-
-			# Asked again with the identical set: the dialog must not reappear,
-			# so even a "confirm" answer leaves the file unopened.
+		if arg == "--p4-selftest-watch-live":
+			# Live, through tools/run-live-tests.sh, which puts the project in a
+			# folder of the workspace with art/readme.txt beside it. Covers the
+			# watcher end to end: the verified-mtime cache, an outside-project
+			# edit checked out automatically, the listed-instead mode and its
+			# dock row, a submit made elsewhere clearing a listing, the opened-
+			# file cleanup (vanished add, a delete come back unchanged or
+			# changed, a vanished rename), and the cleanup before a submit.
+			# Self-cleaning; leaves its scratch files submitted as deleted.
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: watch-live - needs a workspace with nothing opened")
+				get_tree().quit()
+				return
 			_selftest_auto_answer = "confirm"
-			await _offer_external_changes(one_file, no_refusals)
-			await _selftest_drain_frames()
-			var still_unopened := _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
+			detect_external_checkbox.set_pressed_no_signal(true)
+			auto_checkout_detected_checkbox.set_pressed_no_signal(true)
+			auto_open_checkbox.set_pressed_no_signal(false)
+			var checks := {}
 
-			# A fresh set does ask, and accepting opens the file for add.
-			_external_scan_dismissed = ""
-			await _offer_external_changes(one_file, no_refusals)
-			await _selftest_drain_frames()
-			var opened := not _parse_ztag(await _p4_exec(["-ztag", "opened", global])).is_empty()
+			# Two tracked scratch files for the delete cases.
+			var back1 := ProjectSettings.globalize_path("res://p4g_watch_back1.txt")
+			var back2 := ProjectSettings.globalize_path("res://p4g_watch_back2.txt")
+			for p: String in [back1, back2]:
+				var fw := FileAccess.open(p, FileAccess.WRITE)
+				fw.store_string("tracked by the watch self-test\n")
+				fw.close()
+			await _p4_exec_logged(["add", back1, back2])
+			# The workspace started with nothing opened, so the default
+			# changelist holds just these (submit takes one file argument).
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: watch scratch files"])
 
-			await _p4_exec_logged(["revert", global])
-			DirAccess.remove_absolute(global)
-			_log("[selftest] preview-found=%s opened-after-decline=%s remembered=%s still-unopened-on-repeat=%s opened-after-accept=%s"
-					% [found, opened_after_decline, remembered, still_unopened, opened])
-			var ok: bool = found and focus_scanned and not opened_after_decline \
-					and remembered and still_unopened and opened
-			_log("[selftest] %s: external-scan" % ("PASS" if ok else "FAIL"))
+			# 1. The first pass checks every file; later passes only changed ones,
+			#    and the cache survives a restart.
+			await _selftest_settle()
+			await _selftest_watch_pass()
+			var first := _watch_last_checked.size()
+			await _selftest_settle()
+			await _selftest_watch_pass()
+			await _selftest_watch_pass()
+			var again := _watch_last_checked.size()
+			_save_watch_cache(true)
+			_watch_cache = {}
+			_watch_cache_path_loaded = ""
+			await _selftest_watch_pass()
+			var reloaded := _watch_last_checked.size()
+			_log("[selftest] checked: first pass %d, a later one %d, after reloading the cache %d" % [first, again, reloaded])
+			checks["first pass checks every file, later ones none"] = first > 5 and again == 0
+			checks["reloaded cache needs no checks"] = reloaded == 0
+
+			# 2. An edit outside the project, made by another program, is
+			#    checked out and shows in the dock under its "../" name.
+			var art := _client_root.path_join("art/readme.txt")
+			await _selftest_overwrite(art, "changed by another program\n")
+			await _selftest_watch_pass()
+			checks["outside-project edit checked out"] = await _selftest_action(art) == "edit"
+			var model := await _query_pending_model()
+			var labelled := ""
+			for cl in model.changelists:
+				for f in cl.files:
+					if _path_key(ProjectSettings.globalize_path(String(f.res_path))) == _path_key(art):
+						labelled = _tree_label(String(f.res_path))
+			_log("[selftest] outside-project file in the dock as '%s'" % labelled)
+			checks["outside-project file listed as ../art/readme.txt"] = labelled == "../art/readme.txt"
+			await _p4_exec_logged(["revert", art])
+
+			# 3. With automatic checkout off the edit is listed instead: a dock
+			#    row whose action opens it; a submit made elsewhere clears it.
+			auto_checkout_detected_checkbox.set_pressed_no_signal(false)
+			var gd := ProjectSettings.globalize_path("res://main.gd")
+			await _selftest_overwrite(gd, "extends Node\n# edited by another program\n")
+			await _selftest_watch_pass()
+			var listed := _selftest_listed(gd)
+			checks["edit listed, not opened"] = not listed.is_empty() and await _selftest_action(gd) == ""
+			# Built here, not by _refresh_changelists: that returns at once when
+			# a refresh is already running.
+			_rebuild_tree(await _query_pending_model())
+			var top := tree.get_root().get_first_child()
+			_log("[selftest] top row: '%s' with %d row(s)" % ["" if top == null else top.get_text(0),
+					0 if top == null else top.get_child_count()])
+			var top_meta: Variant = null if top == null else top.get_metadata(0)
+			var row_meta: Variant = null
+			if top != null:
+				for child in top.get_children():
+					var m: Variant = child.get_metadata(0)
+					if m is Dictionary and _path_key(String(m.get("local", ""))) == _path_key(gd):
+						row_meta = m
+			checks["dock shows the group and row"] = top_meta is Dictionary \
+					and top_meta.get("type") == "detected_group" and row_meta is Dictionary \
+					and row_meta.get("type") == "detected" and row_meta.get("action") == "edit"
+			if row_meta is Dictionary:
+				_populate_context_menu(row_meta)
+				_log("[selftest] row menu: %s" % _selftest_menu_labels())
+				checks["row menu offers Check Out and Diff"] = _selftest_menu_labels().contains("Check Out") \
+						and _selftest_menu_labels().contains("Diff vs Depot")
+			if not listed.is_empty():
+				await _open_detected_rows([listed])
+			checks["row action checks it out"] = await _selftest_action(gd) == "edit"
+			await _selftest_watch_pass()
+			checks["opened file no longer listed"] = _selftest_listed(gd).is_empty()
+			# Listed again, then opened and submitted outside the plugin.
+			await _p4_exec_logged(["revert", "-k", gd])
+			await _selftest_overwrite(gd, "extends Node\n# edited by another program, again\n")
+			await _selftest_watch_pass()
+			var relisted := not _selftest_listed(gd).is_empty()
+			await _p4_exec_logged(["edit", gd])
+			await _selftest_watch_pass()
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: an edit made outside Godot", gd])
+			await _selftest_watch_pass()
+			checks["submitted elsewhere, no longer listed"] = relisted and _selftest_listed(gd).is_empty()
+
+			# 4. Opened for add, then deleted from disk: out of the changelist.
+			var gone := ProjectSettings.globalize_path("res://p4g_watch_gone.txt")
+			await _selftest_overwrite(gone, "about to vanish\n")
+			await _p4_exec_logged(["add", gone])
+			await _selftest_watch_pass() # as the timer would, between the add and the delete
+			DirAccess.remove_absolute(gone)
+			await _selftest_watch_pass()
+			checks["vanished add reverted"] = await _selftest_action(gone) == ""
+
+			# 5. Opened for delete, then back unchanged: the delete is undone and
+			#    the file is read-only again, as a sync leaves it.
+			var original := FileAccess.get_file_as_string(back1)
+			await _p4_exec_logged(["delete", back1])
+			var removed := not FileAccess.file_exists(back1)
+			await _selftest_watch_pass()
+			await _selftest_overwrite(back1, original)
+			await _selftest_watch_pass()
+			checks["unchanged delete undone, read-only"] = removed and await _selftest_action(back1) == "" \
+					and _selftest_is_read_only(back1)
+
+			# 5b. `delete -k` keeps the file on disk on purpose: left alone.
+			await _p4_exec_logged(["delete", "-k", back1])
+			await _selftest_watch_pass()
+			await _selftest_watch_pass()
+			checks["delete -k left alone"] = await _selftest_action(back1) == "delete"
+			await _p4_exec_logged(["revert", "-k", back1])
+
+			# 6. Opened for delete in a numbered changelist, back changed: opened
+			#    for edit in that changelist instead.
+			var cl := await _create_selftest_change("P4Godot selftest: watch", "")
+			await _p4_exec_logged(["delete", "-c", cl, back2])
+			await _selftest_watch_pass()
+			await _selftest_overwrite(back2, "came back different\n")
+			await _selftest_watch_pass()
+			var back2_rec := await _selftest_fstat(back2)
+			checks["changed delete becomes an edit in its changelist"] = String(back2_rec.get("action", "")) == "edit" \
+					and String(back2_rec.get("change", "")) == cl
+			await _p4_exec_logged(["revert", back2])
+
+			# 7. A rename whose new name is deleted: the changelist deletes the
+			#    old name instead.
+			var moved := ProjectSettings.globalize_path("res://p4g_watch_moved.txt")
+			await _p4_exec_logged(["edit", "-c", cl, back1])
+			await _p4_exec_logged(["move", back1, moved])
+			await _selftest_watch_pass()
+			DirAccess.remove_absolute(moved)
+			await _selftest_watch_pass()
+			var back1_rec := await _selftest_fstat(back1)
+			checks["vanished rename becomes a delete"] = String(back1_rec.get("action", "")) == "delete" \
+					and String(back1_rec.get("change", "")) == cl and await _selftest_action(moved) == ""
+			await _p4_exec_logged(["revert", back1])
+			await _p4_exec_logged(["change", "-d", cl])
+
+			# 8. A submit first takes out an add whose file is gone - before this,
+			#    the whole submit failed on it.
+			var keep := ProjectSettings.globalize_path("res://p4g_watch_submitted.txt")
+			var gone2 := ProjectSettings.globalize_path("res://p4g_watch_gone2.txt")
+			await _selftest_overwrite(keep, "submitted by the watch self-test\n")
+			await _selftest_overwrite(gone2, "about to vanish\n")
+			await _p4_exec_logged(["add", keep, gone2])
+			await _selftest_watch_pass()
+			DirAccess.remove_absolute(gone2)
+			await _submit_changelist("default", [], "P4Godot selftest: submit after a vanished add")
+			var keep_rec := await _selftest_fstat(keep)
+			checks["submit went through without the vanished add"] = String(keep_rec.get("headAction", "")) == "add" \
+					and await _selftest_action(gone2) == ""
+
+			# Clean up: the scratch files leave the depot.
+			await _p4_exec_logged(["delete", back1, back2, keep])
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: watch cleanup"])
+			for p: String in [art, gd]:
+				var rec := await _selftest_fstat(p)
+				if not rec.has("action") and FileAccess.file_exists(p):
+					await _p4_exec_logged(["sync", "-f", p])
+
+			var ok := true
+			for name: String in checks:
+				_log("[selftest] %s: %s" % [name, checks[name]])
+				ok = ok and bool(checks[name])
+			_log("[selftest] %s: watch-live" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-watch-time":
+			# Manual benchmark, not in any runner: time the watcher's first pass
+			# (every file checked) and the one after (cache hits) on whatever
+			# workspace this project sits in. Changes nothing: automatic opens
+			# are off.
+			detect_external_checkbox.set_pressed_no_signal(true)
+			auto_checkout_detected_checkbox.set_pressed_no_signal(false)
+			auto_open_checkbox.set_pressed_no_signal(false)
+			var t0 := Time.get_ticks_msec()
+			await _selftest_watch_pass()
+			var first_ms := Time.get_ticks_msec() - t0
+			var first_n := _watch_last_checked.size()
+			t0 = Time.get_ticks_msec()
+			await _selftest_watch_pass()
+			_log("[selftest] watch-time: first pass checked %d file(s) in %d ms; the next checked %d in %d ms; %d listed"
+					% [first_n, first_ms, _watch_last_checked.size(), Time.get_ticks_msec() - t0, _watch_detected.size()])
+			_log("[selftest] PASS: watch-time")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-allwrite-live":
+			# Live, through tools/run-live-tests.sh: switch the workspace to
+			# allwrite and back. Files follow the switch; a save of a writable
+			# file doesn't wait on a checkout; an edit made while allwrite is
+			# found; switching back leaves a changed, unopened file writable and
+			# listed. Leaves the workspace noallwrite, as it found it.
+			if not _parse_ztag(await _p4_exec(["-ztag", "opened"])).is_empty():
+				_log("[selftest] FAIL: allwrite-live - needs a workspace with nothing opened")
+				get_tree().quit()
+				return
+			_selftest_auto_answer = "confirm"
+			detect_external_checkbox.set_pressed_no_signal(true)
+			auto_checkout_detected_checkbox.set_pressed_no_signal(true)
+			auto_open_checkbox.set_pressed_no_signal(false)
+			var checks := {}
+			var gd := ProjectSettings.globalize_path("res://main.gd")
+			var art := _client_root.path_join("art/readme.txt")
+			checks["starts read-only"] = not await _workspace_is_allwrite() and _selftest_is_read_only(gd)
+
+			await _switch_allwrite(true, false)
+			_client_allwrite = null
+			checks["switched to allwrite"] = await _workspace_is_allwrite() and not _selftest_is_read_only(gd) \
+					and not _selftest_is_read_only(art)
+
+			# A pending save of a writable file isn't checked out first.
+			_pending_save_checkout["res://main.gd"] = true
+			checkout_on_save_checkbox.set_pressed_no_signal(true)
+			_apply_changes()
+			checks["save of a writable file doesn't block on a checkout"] = await _selftest_action(gd) == ""
+			_pending_save_checkout.erase("res://main.gd")
+
+			# An edit made while allwrite - no chmod needed - is checked out.
+			var fw := FileAccess.open(art, FileAccess.WRITE)
+			var wrote := fw != null
+			if wrote:
+				fw.store_string("edited with no checkout, in an allwrite workspace\n")
+				fw.close()
+			await _selftest_settle()
+			await _selftest_watch_pass()
+			checks["allwrite edit checked out"] = wrote and await _selftest_action(art) == "edit"
+			await _p4_exec_logged(["revert", art])
+			checks["revert leaves it writable"] = not _selftest_is_read_only(art)
+
+			# Back to read-only: an unopened edit stays writable and listed.
+			auto_checkout_detected_checkbox.set_pressed_no_signal(false)
+			fw = FileAccess.open(art, FileAccess.WRITE)
+			if fw:
+				fw.store_string("changed, not checked out, when switching back\n")
+				fw.close()
+			await _selftest_settle()
+			await _switch_allwrite(false, false)
+			while _external_scan_inflight: # the listing pass the switch starts
+				await get_tree().process_frame
+			_client_allwrite = null
+			checks["switched back"] = not await _workspace_is_allwrite() and _selftest_is_read_only(gd)
+			checks["unopened edit stays writable and listed"] = not _selftest_is_read_only(art) \
+					and not _selftest_listed(art).is_empty()
+			await _p4_exec_logged(["sync", "-f", art])
+
+			var ok := true
+			for name: String in checks:
+				_log("[selftest] %s: %s" % [name, checks[name]])
+				ok = ok and bool(checks[name])
+			_log("[selftest] %s: allwrite-live" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg.begins_with("--p4-selftest-history-gate="):
@@ -3954,3 +4285,44 @@ func _selftest_report_opened(path: String) -> void:
 		_log("[selftest] PASS: '%s' is opened for edit in our workspace." % path)
 	else:
 		_log("[selftest] FAIL: '%s' is NOT opened in our workspace." % path)
+
+
+## Self-tests only: one watcher pass now, whatever the throttle says.
+func _selftest_watch_pass() -> void:
+	_external_scan_last_msec = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
+	await _scan_for_external_changes("self-test")
+
+
+## Self-tests only: long enough that files written before it count as
+## settled (WATCH_SETTLE_SEC, and one-second file times).
+func _selftest_settle() -> void:
+	await get_tree().create_timer(WATCH_SETTLE_SEC + 1.2).timeout
+
+
+## Self-tests only: write a file as another program would (clearing a
+## read-only bit first), then wait for it to settle.
+func _selftest_overwrite(local: String, text: String) -> void:
+	if FileAccess.file_exists(local):
+		_set_file_writable(local, true)
+	var f := FileAccess.open(local, FileAccess.WRITE)
+	f.store_string(text)
+	f.close()
+	await _selftest_settle()
+
+
+func _selftest_fstat(local: String) -> Dictionary:
+	var recs := _parse_ztag(await _p4_exec(["-ztag", "fstat", local]))
+	return {} if recs.is_empty() else recs[0]
+
+
+## Self-tests only: what `local` is opened for here, or "".
+func _selftest_action(local: String) -> String:
+	return String((await _selftest_fstat(local)).get("action", ""))
+
+
+## Self-tests only: the watcher's dock row for `local`, or {}.
+func _selftest_listed(local: String) -> Dictionary:
+	for row: Dictionary in _watch_detected:
+		if String(row.key) == _path_key(local):
+			return row
+	return {}

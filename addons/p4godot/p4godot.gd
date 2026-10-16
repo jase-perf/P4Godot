@@ -1,5 +1,5 @@
 @tool
-extends "p4godot_menus.gd"
+extends "p4godot_watch.gd"
 
 ## Perforce (P4) integration for the Godot editor. Requires Godot 4.7+.
 ##
@@ -93,6 +93,7 @@ func _enter_tree() -> void:
 	_sweep_cache_dir()
 	_register_filesystem_hooks()
 	_register_editor_menus()
+	_start_watching()
 	# Fire-and-forget coroutine: anything that needs the identity awaits
 	# _ensure_identity() instead of assuming this has resolved.
 	_detect_p4_identity()
@@ -101,12 +102,14 @@ func _enter_tree() -> void:
 	# Also fire-and-forget; they wait on the identity themselves.
 	_check_plugin_tracked()
 	_check_godot_cache_ignored()
+	_offer_allwrite_once()
 
 
 func _exit_tree() -> void:
 	_shutting_down = true
 	_unregister_filesystem_hooks()
 	_unregister_editor_menus()
+	_stop_watching()
 	var efs := EditorInterface.get_resource_filesystem()
 	if efs:
 		if efs.resources_reimporting.is_connected(_on_resources_reimporting):

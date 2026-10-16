@@ -15,13 +15,14 @@ from every later layer with no wiring between them:
 | File | What it holds |
 |---|---|
 | `p4godot_core.gd` | Connection and login, settings, running `p4` (the worker thread, streamed transfers, the save-path connect check), the changelist model, the confirmation dialog |
-| `p4godot_files.gd` | What happens to files in the editor: checkout on edit and on save, failed-save rescue, Reconcile and Revert Unchanged, changes made outside Godot, delete / move / rename from the FileSystem dock |
+| `p4godot_files.gd` | What happens to files in the editor: checkout on edit and on save, failed-save rescue, Reconcile and Revert Unchanged, delete / move / rename from the FileSystem dock |
 | `p4godot_windows.gd` | The transfer progress window and the diff viewer |
 | `p4godot_flows.gd` | Get Latest, resolve, changelist create / edit / move, Submit, syncing one file |
 | `p4godot_history.gd` | The file history window: revisions, diffs between them, Get This Revision, Who Changed This Line |
 | `p4godot_shelves.gd` | Shelving: your changelists' shelve, update, shelve and revert, unshelve and delete, and the Shelves window for everyone's shelves |
 | `p4godot_dock.gd` | The P4G dock, its changelist tree and actions, and the FileSystem dock's tooltips and right-click menu |
 | `p4godot_menus.gd` | The P4 submenus on scene tabs, script tabs, the code editor and the scene tree, and the changed-line marks in the code editor |
+| `p4godot_watch.gd` | Watching the whole workspace for changes made by any program (the threaded walk and the verified-mtime cache), the dock's "Changed, not checked out" group, keeping opened files consistent with the disk, and the allwrite switch |
 | `p4godot.gd` | The plugin entry point named in `plugin.cfg`: an overview comment, `_enter_tree` and `_exit_tree` |
 
 A layer may call down the chain but not up it. The two exceptions,

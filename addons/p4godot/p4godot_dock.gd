@@ -191,11 +191,18 @@ func _build_dock() -> void:
 	settings_row.add_child(auto_open_checkbox)
 
 	detect_external_checkbox = CheckBox.new()
-	detect_external_checkbox.text = "Detect external changes"
-	detect_external_checkbox.tooltip_text = "When Godot regains focus, look for files changed by other programs (Photoshop, Blender, a text editor) and offer to check them out."
+	detect_external_checkbox.text = "Watch the workspace for changes"
+	detect_external_checkbox.tooltip_text = WATCH_TOOLTIP
 	detect_external_checkbox.button_pressed = true
 	detect_external_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(detect_external_checkbox)
+
+	auto_checkout_detected_checkbox = CheckBox.new()
+	auto_checkout_detected_checkbox.text = "Check out changed files automatically"
+	auto_checkout_detected_checkbox.tooltip_text = AUTO_CHECKOUT_DETECTED_TOOLTIP
+	auto_checkout_detected_checkbox.button_pressed = true
+	auto_checkout_detected_checkbox.toggled.connect(_on_setting_toggled)
+	settings_row.add_child(auto_checkout_detected_checkbox)
 
 	_build_tree()
 
@@ -218,8 +225,12 @@ func _build_dock() -> void:
 	_request_refresh()
 
 
-## Menu id of the one settings-menu item that isn't a checkbox (ids 0-4 are).
+## Menu id of the one settings-menu item that isn't a checkbox (ids 0-5 are).
 const SETTINGS_MENU_CONNECTION := 10
+const SETTINGS_MENU_CHECKBOXES := 6
+
+const WATCH_TOOLTIP := "Look for files changed by any program (Photoshop, Blender, a text editor) anywhere in the workspace - when Godot regains focus, and every half minute or so."
+const AUTO_CHECKOUT_DETECTED_TOOLTIP := "Check out edited files the watcher finds, without asking. When off, they are listed in the P4G panel under \"Changed, not checked out\", to check out one by one. New and deleted files are always listed (new ones are added automatically with \"Auto add/edit/delete\")."
 
 
 ## The gear menu fronting the setting checkboxes. Checkable popup items
@@ -239,13 +250,16 @@ func _build_settings_menu(parent: Control) -> void:
 	popup.add_check_item("Checkout on edit", 0)
 	popup.add_check_item("Checkout on save", 1)
 	popup.add_check_item("Auto add/edit/delete", 2)
-	popup.add_check_item("Detect external changes", 3)
+	popup.add_check_item("Watch the workspace for changes", 3)
+	popup.add_check_item("Check out changed files automatically", 5)
 	popup.add_check_item("Verbose log", 4)
-	popup.set_item_tooltip(0, "Offer to check out a file the moment it is first modified in the editor.")
-	popup.set_item_tooltip(1, "Automatically check out edited files right before the editor writes them.")
-	popup.set_item_tooltip(2, "Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs.")
-	popup.set_item_tooltip(3, "When Godot regains focus, look for files changed by other programs and offer to check them out.")
-	popup.set_item_tooltip(4, "Log read-only status probes too, not just state-changing commands.")
+	for pair in [[0, "Offer to check out a file the moment it is first modified in the editor."],
+			[1, "Automatically check out edited files right before the editor writes them."],
+			[2, "Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs."],
+			[3, WATCH_TOOLTIP],
+			[5, AUTO_CHECKOUT_DETECTED_TOOLTIP],
+			[4, "Log read-only status probes too, not just state-changing commands."]]:
+		popup.set_item_tooltip(popup.get_item_index(int(pair[0])), String(pair[1]))
 	popup.add_separator()
 	popup.add_item("Connection settings...", SETTINGS_MENU_CONNECTION)
 	popup.set_item_tooltip(popup.get_item_index(SETTINGS_MENU_CONNECTION),
@@ -262,12 +276,13 @@ func _settings_menu_checkbox(id: int) -> CheckBox:
 		2: return auto_open_checkbox
 		3: return detect_external_checkbox
 		4: return verbose_log_checkbox
+		5: return auto_checkout_detected_checkbox
 	return null
 
 
 func _sync_settings_menu() -> void:
 	var popup := settings_menu.get_popup()
-	for id in 5:
+	for id in SETTINGS_MENU_CHECKBOXES:
 		var cb := _settings_menu_checkbox(id)
 		popup.set_item_checked(popup.get_item_index(id), cb != null and cb.button_pressed)
 
@@ -492,15 +507,13 @@ func _rebuild_tree(model: Dictionary) -> void:
 			cl_item.set_icon_modulate(0, P4_ACCENT) # the P4 brand touch
 		for f in cl.files:
 			var f_item := tree.create_item(cl_item)
-			# res:// is implied for everything in the tree; dropping it leaves
-			# more room for the paths themselves. Tooltip keeps the full story.
-			f_item.set_text(0, String(f.res_path).trim_prefix("res://"))
+			f_item.set_text(0, _tree_label(String(f.res_path)))
 			f_item.set_tooltip_text(0, "%s\n%s" % [f.res_path, f.depot_path])
 			if bool(f.get("unresolved", false)):
 				# Another version - a teammate's newer one, or a shelf
 				# unshelved onto this one - is waiting to be combined with
 				# it; the server refuses the submit until it is.
-				f_item.set_text(0, "%s  (needs resolve)" % String(f.res_path).trim_prefix("res://"))
+				f_item.set_text(0, "%s  (needs resolve)" % _tree_label(String(f.res_path)))
 				f_item.set_custom_color(0, ACTION_DELETE_COLOR)
 				f_item.set_tooltip_text(0, ("%s\n%s\nAnother version of this file - a teammate's, " +
 						"or a shelf you unshelved - is waiting to be combined with yours. Right-click " +
@@ -552,6 +565,38 @@ func _rebuild_tree(model: Dictionary) -> void:
 						"depot_path": s.depot_path, "action": s.action, "change": cl.change})
 
 
+## A file's name in the tree. res:// is implied for project files; dropping
+## it leaves more room for the paths themselves. A file elsewhere in the
+## workspace is shown relative to the project folder ("../art/hero.psd"), so
+## it reads as the neighbour it is. The tooltip keeps the full story.
+func _tree_label(key: String) -> String:
+	if key.begins_with("res://"):
+		return key.trim_prefix("res://")
+	return _relative_to_project(key)
+
+
+## `local` relative to the project folder, climbing out with "../" as far as
+## needed; unchanged when the two share no folder (another drive).
+func _relative_to_project(local: String) -> String:
+	var project := ProjectSettings.globalize_path("res://").replace("\\", "/").trim_suffix("/")
+	var a := project.split("/")
+	var b := local.replace("\\", "/").split("/")
+	var fold := OS.get_name() in ["Windows", "macOS"]
+	var common := 0
+	while common < a.size() and common < b.size() - 1:
+		var same := a[common].to_lower() == b[common].to_lower() if fold else a[common] == b[common]
+		if not same:
+			break
+		common += 1
+	if common == 0:
+		return local
+	var parts := PackedStringArray()
+	for i in a.size() - common:
+		parts.append("..")
+	parts.append_array(b.slice(common))
+	return "/".join(parts)
+
+
 func _editor_bold_font() -> Font:
 	var base := EditorInterface.get_base_control()
 	if base and base.has_theme_font("bold", "EditorFonts"):
@@ -579,6 +624,11 @@ func _on_tree_item_activated() -> void:
 
 
 func _open_res_path(res_path: String) -> void:
+	if not res_path.begins_with("res://"):
+		# Outside the project Godot can't edit it. Shown in the file manager,
+		# not opened: opening a .bat, .js or .exe would run it.
+		OS.shell_show_in_file_manager(res_path)
+		return
 	var ext := res_path.get_extension().to_lower()
 	if ext == "tscn" or ext == "scn":
 		EditorInterface.open_scene_from_path(res_path)
@@ -1053,8 +1103,7 @@ func _revert_path(res_path: String) -> void:
 				"anything unsaved in the editor - and this can't be undone.") % [old_res, new_res]
 	if not companions.is_empty():
 		question += "\n\nThe same goes for %s, which Godot keeps beside it." % " and ".join(companions)
-	if not old_res.is_empty() and old_res.begins_with("res://") \
-			and FileAccess.file_exists(ProjectSettings.globalize_path(old_res)):
+	if not old_res.is_empty() and FileAccess.file_exists(ProjectSettings.globalize_path(old_res)):
 		# Measured: p4 writes the old file back over whatever is there, without
 		# its usual refusal to overwrite a writable file.
 		await _show_alert(("There is a file at '%s' now, where the moved file used to be. " +

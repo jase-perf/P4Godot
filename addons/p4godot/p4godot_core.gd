@@ -179,6 +179,7 @@ signal identity_checked
 var log_box: TextEdit
 var auto_checkout_checkbox: CheckBox
 var detect_external_checkbox: CheckBox
+var auto_checkout_detected_checkbox: CheckBox
 var checkout_on_save_checkbox: CheckBox
 var verbose_log_checkbox: CheckBox
 var auto_open_checkbox: CheckBox
@@ -217,6 +218,9 @@ var _shutting_down: bool = false
 var _p4_user: String = ""
 var _p4_client: String = ""
 var _p4_port: String = ""
+# The workspace's root folder on this computer (`p4 info` clientRoot, forward
+# slashes), which can hold more than the Godot project.
+var _client_root: String = ""
 
 # Optional per-project connection overrides (persisted in editor metadata,
 # chosen via connection setup). Passed to every command as p4 global flags
@@ -392,6 +396,7 @@ func _probe_connection() -> String:
 			return "not logged in"
 		return "no client"
 	_p4_client = client
+	_client_root = root.replace("\\", "/").trim_suffix("/")
 	return "ok"
 
 
@@ -725,7 +730,7 @@ func _reset_connection_state() -> void:
 	_prewrite_eligible_cache.clear()
 	_fstat_cache.clear()
 	_fstat_failed.clear()
-	_external_scan_dismissed = ""
+	_client_root = ""
 	_unreachable_until_msec = 0
 	_p4_available = false
 	_update_conn_status()
@@ -1104,6 +1109,8 @@ func _load_settings() -> void:
 			SETTINGS_SECTION, "auto_open_no_prompt", false)
 	detect_external_checkbox.button_pressed = settings.get_project_metadata(
 			SETTINGS_SECTION, "detect_external_changes", true)
+	auto_checkout_detected_checkbox.button_pressed = settings.get_project_metadata(
+			SETTINGS_SECTION, "auto_checkout_detected", true)
 	_verbose_log = verbose_log_checkbox.button_pressed
 	_load_connection_overrides()
 
@@ -1120,6 +1127,8 @@ func _on_setting_toggled(_pressed: bool) -> void:
 			auto_open_checkbox.button_pressed)
 	settings.set_project_metadata(SETTINGS_SECTION, "detect_external_changes",
 			detect_external_checkbox.button_pressed)
+	settings.set_project_metadata(SETTINGS_SECTION, "auto_checkout_detected",
+			auto_checkout_detected_checkbox.button_pressed)
 	_verbose_log = verbose_log_checkbox.button_pressed
 
 
@@ -1220,6 +1229,12 @@ func _project_scope() -> String:
 	return root + "..."
 
 
+## The whole workspace, in client syntax: every file it maps, wherever on
+## disk the Godot project sits inside it.
+func _workspace_scope() -> String:
+	return "//%s/..." % _p4_client
+
+
 ## An indented one-per-line listing of paths for confirmation dialogs, capped
 ## so a huge file set can't grow the dialog past the screen.
 func _file_listing(paths: Array, cap: int = 15) -> String:
@@ -1230,9 +1245,6 @@ func _file_listing(paths: Array, cap: int = 15) -> String:
 	if paths.size() > shown.size():
 		listing += "    ... and %d more\n" % (paths.size() - shown.size())
 	return listing.rstrip("\n")
-## The set of changes the user last answered "Not Now" to, so the same set
-## doesn't ask again on every alt-tab. Cleared as soon as the set changes.
-var _external_scan_dismissed: String = ""
 
 
 ## The files with a merge waiting, from `p4 -ztag resolve -n` records:
@@ -1249,8 +1261,7 @@ func _unresolved_in(records: Array) -> Array:
 		var local := String(rec.get("clientFile", ""))
 		if local.is_empty():
 			continue
-		var res := _local_to_res(local)
-		var entry: Dictionary = by_local.get(local, {"res_path": res if not res.is_empty() else local,
+		var entry: Dictionary = by_local.get(local, {"res_path": _local_key(local),
 				"local": local, "binary": false, "special": false, "shelf": ""})
 		# Set when the other version is a shelf unshelved onto this file
 		# rather than a newer submitted revision.
@@ -1592,16 +1603,14 @@ func _query_pending_model() -> Dictionary:
 		for f: Dictionary in files:
 			if not depot_paths.has(String(f.depot)):
 				depot_paths.append(String(f.depot))
-	if not depot_paths.is_empty():
+	for chunk: Array in _path_chunks(Array(depot_paths), WATCH_CHUNK_CHARS):
 		var where_args: PackedStringArray = ["-ztag", "where"]
-		where_args.append_array(depot_paths)
+		where_args.append_array(PackedStringArray(chunk))
 		for wrec in _parse_ztag(await _p4_exec(where_args)):
 			# Exclusionary client mappings emit multiple records per file; keep
 			# the one that actually carries a local `path`.
 			if wrec.has("path") and not String(wrec["path"]).is_empty():
-				var res_path := _local_to_res(String(wrec["path"]))
-				if not res_path.is_empty():
-					depot_to_res[String(wrec.get("depotFile", ""))] = res_path
+				depot_to_res[String(wrec.get("depotFile", ""))] = _local_key(String(wrec["path"]))
 
 	# 2b. Which of them have a merge waiting. Only asked when something is
 	#     opened: the answer is empty otherwise.
@@ -1635,7 +1644,7 @@ func _query_pending_model() -> Dictionary:
 		var depot := String(rec.get("depotFile", ""))
 		var res_path: String = depot_to_res.get(depot, "")
 		if res_path.is_empty():
-			continue # Outside the project, or unmapped by `where`.
+			continue # Unmapped by `where`.
 		var change_key := String(rec.get("change", "default"))
 		if not by_change.has(change_key):
 			# Opened in a numbered CL that `changes` didn't return - synthesize a
@@ -1657,6 +1666,38 @@ func _query_pending_model() -> Dictionary:
 		"opened_ok": int(opened_result.get("exit_code", 1)) == 0,
 		"changelists": cls,
 	}
+
+
+## How the dock and its actions name a file: its res:// path inside the
+## project, and its local path (forward slashes) elsewhere in the workspace.
+## ProjectSettings.globalize_path returns a local path unchanged, so actions
+## that globalize what they're given work on both.
+func _local_key(local_path: String) -> String:
+	var res := _local_to_res(local_path)
+	return res if not res.is_empty() else local_path.replace("\\", "/")
+
+
+## Characters of paths per command when a list is spread over several. Windows
+## caps a whole command line at 32,767; this leaves room for the connection
+## flags.
+const WATCH_CHUNK_CHARS := 24000
+
+
+## Paths grouped so each group's characters stay under `budget`.
+static func _path_chunks(paths: Array, budget: int) -> Array:
+	var chunks: Array = []
+	var current: Array = []
+	var used := 0
+	for p: String in paths:
+		if not current.is_empty() and used + p.length() + 3 > budget:
+			chunks.append(current)
+			current = []
+			used = 0
+		current.append(p)
+		used += p.length() + 3
+	if not current.is_empty():
+		chunks.append(current)
+	return chunks
 
 
 ## Map a local OS path (from `p4 where`'s `path`) to a res:// path, or "" if the
