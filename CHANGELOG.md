@@ -5,13 +5,18 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 ## Unreleased
 
 - **P4Godot watches your whole workspace for changes made by any program**,
-  including art folders beside the Godot project, and checks out what was
-  edited without asking: no more dialog on every alt-tab. It looks when Godot
-  regains focus and every half minute or so. New and missing files, and edits
-  Perforce refused (a teammate's exclusive lock), are listed at the top of
-  the P4G panel under **Changed, not checked out**, each with its own
-  action. A new setting, **Check out changed files automatically**, lists
-  edits there too instead. Each file's modification time is remembered once
+  including art folders beside the Godot project, and opens them in Perforce
+  without asking: edits, new files, deleted files (only ones it saw on disk
+  before), and renames as moves. No more dialog on every alt-tab. It looks
+  when Godot regains focus and every half minute or so. When a teammate's
+  exclusive lock stops a checkout, it asks at once: **Revert My Change**, or
+  **Keep It** - kept changes are listed with who holds the lock and checked
+  out as soon as the lock goes. A new setting, **Check out changed files
+  automatically**, instead lists everything under **Changed, not checked
+  out** in the P4G panel to open one by one. Folders the workspace doesn't
+  map, and folders the ignore file leaves out (build output), aren't walked.
+  A delete is opened only at the second look that finds the file missing,
+  and more than 20 new or deleted files at once are asked about first. Each file's modification time is remembered once
   Perforce has confirmed it, so after the first look only files that changed
   are checked. On 20,000 small files with a local server, the first look
   took 30 seconds (nearly two minutes on a cold disk cache) and later ones
@@ -27,8 +32,8 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
   happen count, so `p4 delete -k` and virtual integrates are left alone.
 - **Leave workspace files writable.** A setting switches the workspace to
   `allwrite`, so Godot's own rewrites never hit a read-only file, and sets
-  the files on disk to match; P4Godot offers it once in a read-only
-  workspace. Get Latest still never overwrites a file you changed without
+  the files on disk to match; P4Godot offers it once per workspace, at
+  startup and when connection setup connects one. Get Latest still never overwrites a file you changed without
   checking it out. Switching back leaves changed, unopened files writable.
   In an `allwrite` workspace a save no longer waits for a checkout first.
 - **The P4G panel lists files outside the Godot project** that are opened in

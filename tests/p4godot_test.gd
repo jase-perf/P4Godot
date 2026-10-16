@@ -1198,10 +1198,36 @@ func _run_cli_self_test_if_requested() -> void:
 					and (row.get_metadata(0) as Dictionary).get("type") == "detected"
 			if row != null:
 				_populate_context_menu(row.get_metadata(0))
-				checks["edit row menu"] = _selftest_menu_labels() == "Check Out | Show in File Manager | Diff vs Depot | History... |  | Refresh"
+				checks["edit row menu"] = _selftest_menu_labels() == "Check Out | Show in File Manager | Diff vs Depot | History... | Revert My Change... |  | Refresh"
 				_log("[selftest] edit row menu: %s" % _selftest_menu_labels())
 			_populate_context_menu({"type": "detected", "action": "delete", "local": outside, "res_path": outside})
-			checks["delete row menu"] = _selftest_menu_labels() == "Mark for Delete | History... |  | Refresh"
+			checks["delete row menu"] = _selftest_menu_labels() == "Mark for Delete | History... | Revert My Change... |  | Refresh"
+			_populate_context_menu({"type": "detected", "action": "move/add", "local": outside, "res_path": outside})
+			checks["moved-to row menu"] = _selftest_menu_labels() == "Record the Move | Show in File Manager |  | Refresh"
+
+			# Answers p4 2026.1 gave (copied 2026-10-16), and what is made of them.
+			var probe_text := ("//game/main/build/__p4godot_folder_probe__#1 - opened for add\n" +
+					"C:/ws/dev\\build\\__p4godot_folder_probe__ - ignored file can't be added.\n" +
+					"//game/main/src/__p4godot_folder_probe__#1 - opened for add\n" +
+					"C:/ws/view/other/__p4godot_folder_probe__ - file(s) not in client view.\n")
+			var probed := _probe_verdicts_in(probe_text)
+			checks["folder probe answers"] = bool(probed.answered) and probed.verdicts.size() == 2 \
+					and String(probed.verdicts.get("c:/ws/dev/build", "")) == "ignored" \
+					and String(probed.verdicts.get("c:/ws/view/other", "")) == "unmapped" \
+					and not bool(_probe_verdicts_in("Perforce client error:\n\tConnect to server failed\n").answered)
+			checks["under a left-out folder"] = _under_any("c:/w/build/x/y.o", ["c:/w/build"]) \
+					and not _under_any("c:/w/buildings/a.png", ["c:/w/build"])
+			var lock_lines := ["//d/art/hero.psd - can't edit exclusive file already opened",
+					"//d/art/hero.psd - also opened by mate@mate-ws"]
+			checks["lock holder named"] = _refusal_reason(lock_lines, "c:/w/art/hero.psd", "//d/art/hero.psd") \
+					== "locked by mate@mate-ws" \
+					and _refusal_reason(lock_lines, "c:/w/art/other.psd", "//d/art/other.psd").begins_with("Perforce didn't")
+			checks["a refused preview still counts as a change"] = _preview_refusals(lock_lines) \
+					== {"//d/art/hero.psd": "edit"} and _preview_refusals([
+					"//d/x.png - can't delete exclusive file already opened"]) == {"//d/x.png": "delete"}
+			checks["clean gets raw names"] = Array(_escape_path_args(["clean", "-e", "C:/w/x@2.txt"])) 					== ["clean", "-e", "C:/w/x@2.txt"]
+			checks["revert flags"] = _clean_flag("edit") == "-e" and _clean_flag("delete") == "-d" \
+					and _clean_flag("move/delete") == "-d" and _clean_flag("add") == "" and _clean_flag("move/add") == ""
 			model.changelists[0].files = [{"res_path": outside, "depot_path": "//d/art/hero.psd",
 					"action": "edit", "change": "default", "type": "binary"}]
 			_rebuild_tree(model)
@@ -3813,6 +3839,11 @@ func _run_cli_self_test_if_requested() -> void:
 			detect_external_checkbox.set_pressed_no_signal(true)
 			auto_checkout_detected_checkbox.set_pressed_no_signal(true)
 			auto_open_checkbox.set_pressed_no_signal(false)
+			# Every pass here is the test's own: the timer's and the follow-ups'
+			# would make "the first look" a matter of timing.
+			if _watch_timer:
+				_watch_timer.stop()
+			_watch_followup_queued = true
 			var checks := {}
 
 			# Two tracked scratch files for the delete cases.
@@ -3860,6 +3891,130 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] outside-project file in the dock as '%s'" % labelled)
 			checks["outside-project file listed as ../art/readme.txt"] = labelled == "../art/readme.txt"
 			await _p4_exec_logged(["revert", art])
+
+			# 2b. The files Godot itself wrote (the .uid beside each script) go
+			#     in first, as a team's would, so the automatic steps below see
+			#     only what they make.
+			auto_checkout_detected_checkbox.set_pressed_no_signal(false)
+			await _selftest_watch_pass()
+			var baseline: Array = _watch_detected.filter(func(r: Dictionary) -> bool: return r.action == "add") \
+					.map(func(r: Dictionary) -> String: return String(r.local))
+			_log("[selftest] files Godot wrote: %s" % [baseline])
+			if not baseline.is_empty():
+				var add_args: PackedStringArray = ["add"]
+				add_args.append_array(PackedStringArray(baseline))
+				await _p4_exec_logged(add_args)
+				await _p4_exec_logged(["submit", "-d", "P4Godot selftest: files Godot wrote"])
+			auto_checkout_detected_checkbox.set_pressed_no_signal(true)
+
+			# 2c. Checking out automatically covers a new file, a deleted one
+			#     and a renamed one (recorded as a move) as well as edits.
+			var fresh := ProjectSettings.globalize_path("res://p4g_auto_new.txt")
+			var renamed := ProjectSettings.globalize_path("res://p4g_watch_back1_renamed.txt")
+			await _selftest_overwrite(fresh, "new, from another program\n")
+			_set_file_writable(back2, true)
+			DirAccess.remove_absolute(back2)
+			_set_file_writable(back1, true)
+			DirAccess.rename_absolute(back1, renamed)
+			await _selftest_settle()
+			await _selftest_watch_pass()
+			# A delete waits one look (and the new name with it, to pair up).
+			var waited := await _selftest_action(back2) == "" and await _selftest_action(renamed) == ""
+			await _selftest_watch_pass()
+			checks["a delete waits for a second look"] = waited
+			var auto_actions := [await _selftest_action(fresh), await _selftest_action(back2),
+					await _selftest_action(back1), await _selftest_action(renamed)]
+			_log("[selftest] opened automatically: %s" % [auto_actions])
+			checks["automatic: add, delete and move opened"] = auto_actions == ["add", "delete", "move/delete", "move/add"]
+			await _p4_exec_logged(["revert", fresh, back2, back1, renamed])
+			for p: String in [fresh, renamed]:
+				if FileAccess.file_exists(p):
+					DirAccess.remove_absolute(p)
+			checks["put back after the automatic steps"] = FileAccess.file_exists(back1) and FileAccess.file_exists(back2)
+			await _selftest_settle()
+			await _selftest_watch_pass()
+
+			# 2e. Many new files at once are asked about, not opened silently.
+			var many_dir := ProjectSettings.globalize_path("res://p4g_many")
+			DirAccess.make_dir_recursive_absolute(many_dir)
+			var many: Array = []
+			for i in WATCH_BULK_ASK + 1:
+				var path := many_dir.path_join("f%d.txt" % i)
+				var fw := FileAccess.open(path, FileAccess.WRITE)
+				fw.store_string("one of many
+")
+				fw.close()
+				many.append(path)
+			await _selftest_settle()
+			_selftest_auto_answer = "cancel"
+			await _selftest_watch_pass()
+			await _selftest_wait_asked()
+			var silent := 0
+			for path: String in many:
+				if await _selftest_action(path) != "":
+					silent += 1
+			var listed_many := many.all(func(p: String) -> bool: return not _selftest_listed(p).is_empty())
+			_selftest_auto_answer = "confirm"
+			await _open_detected_rows(_watch_detected.filter(func(r: Dictionary) -> bool:
+				return String(r.local).contains("p4g_many")))
+			var opened_many := 0
+			for path: String in many:
+				if await _selftest_action(path) == "add":
+					opened_many += 1
+			checks["many new files: asked, listed, opened on request"] = silent == 0 and listed_many 					and opened_many == many.size()
+			var revert_many: PackedStringArray = ["revert"]
+			revert_many.append_array(PackedStringArray(many))
+			await _p4_exec_logged(revert_many)
+			for path: String in many:
+				DirAccess.remove_absolute(path)
+			DirAccess.remove_absolute(many_dir)
+			await _selftest_settle()
+			await _selftest_watch_pass()
+
+			# 2d. Ignored folders: one with nothing tracked isn't walked; one
+			#     holding a tracked file is, and an edit there is found; a "!"
+			#     rule switches the leaving-out off.
+			var root_ignore := _client_root.path_join(".p4ignore")
+			await _p4_exec_logged(["edit", root_ignore])
+			var ignore_text := FileAccess.get_file_as_string(root_ignore)
+			var out_dir := ProjectSettings.globalize_path("res://build_out")
+			var keep_dir := ProjectSettings.globalize_path("res://build_keep")
+			var kept_file := keep_dir.path_join("k.txt")
+			DirAccess.make_dir_recursive_absolute(out_dir.path_join("sub"))
+			DirAccess.make_dir_recursive_absolute(keep_dir)
+			for p: String in [out_dir.path_join("a.o"), out_dir.path_join("sub/b.o"), kept_file]:
+				var fw := FileAccess.open(p, FileAccess.WRITE)
+				fw.store_string("built\n")
+				fw.close()
+			await _p4_exec_logged(["add", "-I", kept_file])
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: a tracked file in an ignored folder", kept_file])
+			await _selftest_overwrite(root_ignore, ignore_text + "build_out/\nbuild_keep/\n")
+			await _selftest_watch_pass()
+			await _selftest_watch_pass()
+			var out_verdict := String((_watch_dirs.get(_path_key(out_dir), ["?"]) as Array)[0])
+			var keep_verdict := String((_watch_dirs.get(_path_key(keep_dir), ["?"]) as Array)[0])
+			await _selftest_overwrite(out_dir.path_join("a.o"), "rebuilt\n")
+			await _selftest_watch_pass()
+			var looked_in_build := _watch_last_checked.any(func(p: String) -> bool:
+				return _path_key(p).begins_with(_path_key(out_dir) + "/"))
+			await _selftest_overwrite(kept_file, "edited\n")
+			await _selftest_watch_pass()
+			_log("[selftest] folder verdicts: build_out '%s', build_keep '%s'; looked in build_out: %s" % [
+					out_verdict, keep_verdict, looked_in_build])
+			checks["ignored folder left out"] = out_verdict == "ignored" and not looked_in_build
+			checks["ignored folder holding a tracked file still watched"] = keep_verdict == "" \
+					and await _selftest_action(kept_file) == "edit"
+			await _selftest_overwrite(root_ignore, ignore_text + "build_out/\nbuild_keep/\n!build_out/keep_me.txt\n")
+			await _selftest_watch_pass()
+			checks["a ! rule keeps ignored folders watched"] = String(
+					(_watch_dirs.get(_path_key(out_dir), ["?"]) as Array)[0]) == ""
+			await _p4_exec_logged(["revert", kept_file, root_ignore])
+			for p: String in [out_dir.path_join("sub/b.o"), out_dir.path_join("a.o")]:
+				DirAccess.remove_absolute(p)
+			DirAccess.remove_absolute(out_dir.path_join("sub"))
+			DirAccess.remove_absolute(out_dir)
+			await _selftest_settle()
+			await _selftest_watch_pass()
 
 			# 3. With automatic checkout off the edit is listed instead: a dock
 			#    row whose action opens it; a submit made elsewhere clears it.
@@ -3973,8 +4128,44 @@ func _run_cli_self_test_if_requested() -> void:
 			checks["submit went through without the vanished add"] = String(keep_rec.get("headAction", "")) == "add" \
 					and await _selftest_action(gone2) == ""
 
+			# 9. A teammate's lock stops the automatic checkout: asked at once.
+			#    Keep leaves the change, listed with who holds the lock, and it
+			#    is checked out when they let go; Revert puts back the version
+			#    you had.
+			auto_checkout_detected_checkbox.set_pressed_no_signal(true)
+			var locked := ProjectSettings.globalize_path("res://p4g_locked.bin")
+			var mate_ws := OS.get_environment("P4TEST_MATE_WS")
+			await _selftest_overwrite(locked, "v1\n")
+			await _p4_exec_logged(["add", "-t", "binary+l", locked])
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: a file only one person can change", locked])
+			var as_mate := PackedStringArray(["-u", "mate", "-c", "mate-ws"])
+			var theirs := mate_ws.path_join("p4g_locked.bin")
+			await _p4_exec(as_mate + PackedStringArray(["sync", "//mate-ws/..."]))
+			await _p4_exec(as_mate + PackedStringArray(["edit", theirs]))
+			_selftest_auto_answer = "cancel"
+			await _selftest_overwrite(locked, "my change\n")
+			await _selftest_watch_pass()
+			await _selftest_wait_asked()
+			var why := String(_watch_refused.get(_path_key(locked), ""))
+			_log("[selftest] refused: %s" % why)
+			checks["lock: kept, listed with who holds it"] = await _selftest_action(locked) == "" \
+					and FileAccess.get_file_as_string(locked) == "my change\n" \
+					and not _selftest_listed(locked).is_empty() and why.contains("mate@mate-ws")
+			await _p4_exec(as_mate + PackedStringArray(["revert", theirs]))
+			await _selftest_watch_pass()
+			checks["lock: checked out once the teammate lets go"] = await _selftest_action(locked) == "edit"
+			await _p4_exec_logged(["revert", locked])
+			await _p4_exec(as_mate + PackedStringArray(["edit", theirs]))
+			_selftest_auto_answer = "confirm"
+			await _selftest_overwrite(locked, "my second change\n")
+			await _selftest_watch_pass()
+			await _selftest_wait_asked()
+			checks["lock: revert puts back the version you had"] = await _selftest_action(locked) == "" \
+					and FileAccess.get_file_as_string(locked) == "v1\n" and _selftest_listed(locked).is_empty()
+			await _p4_exec(as_mate + PackedStringArray(["revert", theirs]))
+
 			# Clean up: the scratch files leave the depot.
-			await _p4_exec_logged(["delete", back1, back2, keep])
+			await _p4_exec_logged(["delete", back1, back2, keep, kept_file, locked])
 			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: watch cleanup"])
 			for p: String in [art, gd]:
 				var rec := await _selftest_fstat(p)
@@ -4287,8 +4478,11 @@ func _selftest_report_opened(path: String) -> void:
 		_log("[selftest] FAIL: '%s' is NOT opened in our workspace." % path)
 
 
-## Self-tests only: one watcher pass now, whatever the throttle says.
+## Self-tests only: one watcher pass now, whatever the throttle says. A pass
+## the timer started first is waited out, or this one would return at once.
 func _selftest_watch_pass() -> void:
+	while _external_scan_inflight:
+		await get_tree().process_frame
 	_external_scan_last_msec = -EXTERNAL_SCAN_MIN_INTERVAL_MSEC
 	await _scan_for_external_changes("self-test")
 
@@ -4326,3 +4520,12 @@ func _selftest_listed(local: String) -> Dictionary:
 		if String(row.key) == _path_key(local):
 			return row
 	return {}
+
+
+## Self-tests only: until the question about refused files is answered and
+## acted on (it is asked without the pass waiting for it).
+func _selftest_wait_asked() -> void:
+	await get_tree().process_frame
+	var deadline := Time.get_ticks_msec() + 20000
+	while _watch_asking and Time.get_ticks_msec() < deadline:
+		await get_tree().process_frame

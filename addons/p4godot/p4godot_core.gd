@@ -512,6 +512,7 @@ func _offer_connection_setup() -> void:
 			_log("Perforce connected: user %s, client %s, server %s." \
 					% [_p4_user, _p4_client, _p4_port])
 			_request_refresh()
+			_on_workspace_connected()
 			break
 		if status == "p4 missing":
 			await _show_alert("Couldn't find the p4 command-line client.\n\n" +
@@ -1883,6 +1884,11 @@ static func _escape_path_args(args: PackedStringArray) -> PackedStringArray:
 	if cmd_idx == -1:
 		return args
 	var out := PackedStringArray(args)
+	if args[cmd_idx] == "clean":
+		# `clean` is `reconcile -w` and, measured, also wants raw local names:
+		# with %40 for an @ it answers "no file(s) to reconcile", exit 0, and
+		# puts nothing back. It takes no -f.
+		return out
 	if args[cmd_idx] == "reconcile":
 		# Like add, `reconcile -f` takes RAW local names (verified: with escaped
 		# names it finds nothing) and without -f it skips such files entirely -
@@ -2826,4 +2832,11 @@ func _request_refresh() -> void:
 
 ## Show the connection state in the dock's toolbar. The dock overrides this.
 func _update_conn_status() -> void:
+	pass
+
+
+## Connection setup just connected a workspace (on first setup, or after the
+## user picked another one). The watch layer overrides this to offer
+## leaving the workspace's files writable.
+func _on_workspace_connected() -> void:
 	pass

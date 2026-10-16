@@ -230,7 +230,7 @@ const SETTINGS_MENU_CONNECTION := 10
 const SETTINGS_MENU_CHECKBOXES := 6
 
 const WATCH_TOOLTIP := "Look for files changed by any program (Photoshop, Blender, a text editor) anywhere in the workspace - when Godot regains focus, and every half minute or so."
-const AUTO_CHECKOUT_DETECTED_TOOLTIP := "Check out edited files the watcher finds, without asking. When off, they are listed in the P4G panel under \"Changed, not checked out\", to check out one by one. New and deleted files are always listed (new ones are added automatically with \"Auto add/edit/delete\")."
+const AUTO_CHECKOUT_DETECTED_TOOLTIP := "Open what the watcher finds in Perforce without asking: edits, new files, deleted files and renames. When off, they are listed in the P4G panel under \"Changed, not checked out\", to open one by one."
 
 
 ## The gear menu fronting the setting checkboxes. Checkable popup items

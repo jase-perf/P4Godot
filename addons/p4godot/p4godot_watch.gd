@@ -9,9 +9,12 @@ extends "p4godot_menus.gd"
 ##   opened for edit when changed.
 ## - Changed files are found by comparing each file's modification time with
 ##   the one Perforce last vouched for, so only files that changed since are
-##   reconciled. Edits are checked out automatically (a setting lists them
-##   instead); new and missing files are listed in the dock under "Changed,
-##   not checked out".
+##   reconciled. Edits, new files, deleted files and moves are opened in
+##   Perforce automatically; a setting lists them in the dock under "Changed,
+##   not checked out" instead. Folders the workspace doesn't map, and folders
+##   the ignore rules leave out with nothing tracked in them, aren't walked.
+## - A teammate's lock that stops an automatic checkout is reported at once,
+##   with the choice to revert the change or keep it until the lock goes.
 ## - The workspace can be switched to `allwrite`, which leaves files
 ##   writable, so Godot's own rewrites (every .import on a reimport) never
 ##   fail on a read-only file.
@@ -39,7 +42,17 @@ const WATCH_SKIP_DIRS := [".godot", ".git", ".svn", ".hg"]
 ## A walk stops after this many files; the cache would otherwise grow past
 ## what is worth keeping in memory.
 const WATCH_MAX_FILES := 400000
-const WATCH_CACHE_VERSION := 2
+const WATCH_CACHE_VERSION := 3
+## A folder left out of the walk is asked about again this often, so a
+## changed client view brings it back.
+const WATCH_PRUNE_RECHECK_SEC := 600
+## The made-up file name `add -n` is asked about to learn whether a folder is
+## ignored or unmapped. No extension, so a rule like "*.tmp" can't match it.
+const WATCH_PROBE_NAME := "__p4godot_folder_probe__"
+## More new and deleted files than this at once - a first look at a workspace
+## full of untracked files, or a folder deleted by mistake - are asked about
+## before anything is opened.
+const WATCH_BULK_ASK := 20
 const WATCH_SAVE_INTERVAL_MSEC := 120000
 ## How often a file listed as missing is asked about again.
 const WATCH_MISSING_RECHECK_SEC := 300
@@ -54,6 +67,7 @@ const CTX_DETECTED_OPEN_ALL := 901
 const CTX_DETECTED_DIFF := 902
 const CTX_DETECTED_SHOW := 903
 const CTX_DETECTED_HISTORY := 904
+const CTX_DETECTED_REVERT := 905
 const SETTINGS_MENU_ALLWRITE := 11
 
 # Per file, keyed by _path_key: [local path, modification time (-1: missing
@@ -75,8 +89,26 @@ var _watch_opened_prev: Dictionary = {}
 var _watch_attempted: Dictionary = {}
 # key -> why Perforce refused to open it, for the dock row.
 var _watch_refused: Dictionary = {}
-# Keys whose refusal the user has been told about this session.
+# Key -> the pass (_watch_generation) that first found the file deleted. A
+# delete is opened on a later pass only.
+var _watch_delete_first: Dictionary = {}
+# Keys whose refusal the user has been asked about this session.
 var _watch_alerted: Dictionary = {}
+# Whether the revert-or-keep question is on screen.
+var _watch_asking: bool = false
+# Folder key -> [verdict, unix time asked]: "" walked, "ignored" or
+# "unmapped" skipped. Saved with the cache.
+var _watch_dirs: Dictionary = {}
+# The ignore files' names and times when _watch_dirs' "ignored" verdicts were
+# made; they are asked about again when it changes. Saved with the cache.
+var _watch_ignore_stamp: String = ""
+# Where those ignore files are, so an edit to one is noticed before the walk
+# skips the folders it decided about. Saved with the cache.
+var _watch_ignore_files: Array = []
+# P4IGNORE's file names, lower case; null until read.
+var _watch_ignore_names: Variant = null
+# P4IGNORE's entries that are full paths.
+var _watch_ignore_fixed: Array = []
 # Local key -> whether an opened file was on disk when last looked at. The
 # opened-file cleanup acts only on a change it saw happen (see _tidy_plan).
 var _watch_seen: Dictionary = {}
@@ -161,7 +193,13 @@ func _reset_connection_state() -> void:
 	_watch_attempted = {}
 	_watch_refused = {}
 	_watch_alerted = {}
+	_watch_delete_first = {}
+	_watch_asking = false
 	_watch_seen = {}
+	_watch_dirs = {}
+	_watch_ignore_stamp = ""
+	_watch_ignore_files = []
+	_watch_ignore_names = null
 	_watch_detected = []
 	_client_allwrite = null
 
@@ -221,8 +259,12 @@ func _scan_for_external_changes_inner(reason: String) -> void:
 			opened[_path_key(local)] = true
 
 	var root := _watch_root()
+	_load_watch_cache()
+	_forget_ignored_if_rules_changed()
+	var skip := _pruned_dirs(int(Time.get_unix_time_from_system()))
+	var dirs: Array = []
 	var started := Time.get_ticks_msec()
-	var walked: Dictionary = await _walk_workspace(root)
+	var walked: Dictionary = await _walk_workspace(root, skip, dirs)
 	if _watch_gone(epoch):
 		return
 	var walk_sec := (Time.get_ticks_msec() - started) / 1000.0
@@ -232,7 +274,10 @@ func _scan_for_external_changes_inner(reason: String) -> void:
 		_log(("The workspace has more than %d files; P4Godot watches only the first %d it " +
 				"finds. Narrow the workspace view or ignore large folders.") % [WATCH_MAX_FILES, WATCH_MAX_FILES])
 
-	_load_watch_cache()
+	await _classify_dirs(dirs, walked)
+	if _watch_gone(epoch):
+		return
+	_drop_pruned(walked)
 	# A file that stopped being opened was submitted or reverted somewhere;
 	# what was known about it before it was opened no longer holds.
 	for key: String in _watch_opened_prev:
@@ -326,28 +371,69 @@ static func _watch_candidates(walked: Dictionary, cache: Dictionary, opened: Dic
 	return {"check": check, "unsettled": unsettled}
 
 
-## `reconcile -n` on exactly these paths, in chunks. Returns key -> action
-## for each file Perforce would open, or null when the server didn't answer
-## (so nothing is recorded as checked).
+## `reconcile -n -M` on exactly these paths, in chunks. Returns key ->
+## action ("edit", "add", "delete", "move/add", "move/delete") for each file
+## Perforce would open, or null when the server didn't answer (so nothing is
+## recorded as checked). -M pairs a deleted file with a new one of the same
+## content as a move, when both are in one chunk.
 func _reconcile_preview_paths(paths: Array) -> Variant:
 	var verdicts := {}
 	for chunk: Array in _path_chunks(paths, WATCH_CHUNK_CHARS):
-		var args: PackedStringArray = ["-ztag", "reconcile", "-n"]
+		var args: PackedStringArray = ["-ztag", "reconcile", "-n", "-M"]
 		for p: String in chunk:
 			args.append(p)
 		var result := await _p4_exec(args)
 		if _shutting_down:
 			return null
 		var recs := _parse_ztag(result)
-		if recs.is_empty() and int(result.exit_code) != 0 and not _reconcile_had_nothing(result):
+		var refused := _preview_refusals(_refusals(result).lines)
+		if recs.is_empty() and refused.is_empty() and int(result.exit_code) != 0 \
+				and not _reconcile_had_nothing(result):
 			return null
+		# A file Perforce won't open (a teammate's exclusive lock) gets no
+		# record, only a refusal naming its depot path - measured on 2026.1.
+		# It is still changed, and has to be reported as such.
+		if not refused.is_empty():
+			var local_of := await _locals_of_depots(refused.keys())
+			for depot: String in refused:
+				if local_of.has(depot.to_lower()):
+					verdicts[_path_key(String(local_of[depot.to_lower()]))] = String(refused[depot])
 		for rec in recs:
 			var local := String(rec.get("clientFile", ""))
 			var action := String(rec.get("action", ""))
 			if local.is_empty() or action.is_empty():
 				continue
-			verdicts[_path_key(local)] = action.trim_prefix("move/")
+			# A move is reported as a delete and an add first, then paired:
+			# the last record for a file is the one that counts.
+			verdicts[_path_key(local)] = action
 	return verdicts
+
+
+## Depot path, as p4 spelled it -> what reconcile wanted to open it for,
+## from its refusal lines ("//d/f - can't edit exclusive file already
+## opened"). The spelling is kept for `where`: a case-sensitive server
+## doesn't find a lower-cased path.
+static func _preview_refusals(lines: Array) -> Dictionary:
+	var out := {}
+	for line: String in lines:
+		for pair in [["can't edit", "edit"], ["can't delete", "delete"], ["can't add", "add"]]:
+			var at := line.find(" - " + String(pair[0]))
+			if at > 0 and line.begins_with("//"):
+				out[line.substr(0, at)] = String(pair[1])
+	return out
+
+
+## Depot paths -> local paths in this workspace, via `where`; keyed by the
+## depot path in lower case.
+func _locals_of_depots(depots: Array) -> Dictionary:
+	var out := {}
+	for chunk: Array in _path_chunks(depots, WATCH_CHUNK_CHARS):
+		var args: PackedStringArray = ["-ztag", "where"]
+		args.append_array(PackedStringArray(chunk))
+		for w in _parse_ztag(await _p4_exec(args)):
+			if w.has("path") and w.has("depotFile"):
+				out[String(w.depotFile).to_lower()] = String(w.path)
+	return out
 
 
 ## Whether a failed reconcile answer only means "nothing to do". Measured on
@@ -372,14 +458,46 @@ static func _reconcile_had_nothing(result: Dictionary) -> bool:
 func _act_on_detected(opened: Dictionary, epoch: int) -> void:
 	var detected := _watch_detected_rows(opened)
 	var to_open: Array = []
+	var automatic := auto_checkout_detected_checkbox != null and auto_checkout_detected_checkbox.button_pressed
+	var held_delete := false
 	for row: Dictionary in detected:
-		if _watch_attempted.has(row.key) and int(_watch_attempted[row.key]) == int(row.mtime):
+		# A change kept after a refusal is tried on every pass, so it is
+		# checked out as soon as the teammate's lock goes.
+		var kept := _watch_refused.has(row.key)
+		if not kept and _watch_attempted.has(row.key) \
+				and int(_watch_attempted[row.key]) == int(row.mtime):
 			continue
-		if row.action == "edit" and auto_checkout_detected_checkbox != null \
-				and auto_checkout_detected_checkbox.button_pressed:
-			to_open.append(row)
-		elif row.action == "add" and _auto_open():
-			to_open.append(row)
+		if not (automatic or kept):
+			continue
+		# A delete waits for the next look: a file being replaced, or a sync
+		# that is still writing, can be briefly missing. By then the walk
+		# has seen it again if it came back. It also lets a rename's new
+		# name settle, so the two pair up as a move.
+		if String(row.action).ends_with("delete"):
+			if int(_watch_delete_first.get(row.key, _watch_generation)) == _watch_generation:
+				_watch_delete_first[row.key] = _watch_generation
+				held_delete = true
+				continue
+		to_open.append(row)
+	# Forget first sightings of files no longer listed as deleted.
+	var deleted_now := {}
+	for row: Dictionary in detected:
+		if String(row.action).ends_with("delete"):
+			deleted_now[row.key] = true
+	for key: String in _watch_delete_first.keys():
+		if not deleted_now.has(key):
+			_watch_delete_first.erase(key)
+	if held_delete:
+		# New files wait with it: one may be the deleted file's new name.
+		to_open = to_open.filter(func(r: Dictionary) -> bool:
+			return String(r.action) == "edit" or _watch_refused.has(r.key))
+	var bulk: Array = to_open.filter(func(r: Dictionary) -> bool:
+		return String(r.action) != "edit" and not _watch_refused.has(r.key))
+	if bulk.size() > WATCH_BULK_ASK:
+		to_open = to_open.filter(func(r: Dictionary) -> bool: return not bulk.has(r))
+		for row: Dictionary in bulk:
+			_watch_attempted[row.key] = row.mtime
+		_ask_about_bulk(bulk) # not awaited: a pass mustn't wait on a dialog
 	if not to_open.is_empty():
 		var names: Array = to_open.map(func(r: Dictionary) -> String: return _tree_label(_local_key(r.local)))
 		_log("Changed outside Godot - opening in Perforce: %s" % ", ".join(names.slice(0, 10)) \
@@ -402,7 +520,7 @@ func _watch_detected_rows(opened: Dictionary) -> Array:
 		if String(entry[3]).is_empty() or opened.has(key):
 			continue
 		rows.append({"key": key, "local": String(entry[0]), "mtime": int(entry[1]),
-				"action": String(entry[3])})
+				"checked": int(entry[2]), "action": String(entry[3])})
 	rows.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return String(a.local) < String(b.local))
 	return rows
 
@@ -411,26 +529,42 @@ func _set_watch_detected(rows: Array) -> void:
 	var before := _watch_detected.map(func(r: Dictionary) -> String: return "%s:%s" % [r.key, r.action])
 	var after := rows.map(func(r: Dictionary) -> String: return "%s:%s" % [r.key, r.action])
 	_watch_detected = rows
+	# A file no longer listed has had its refusal settled; a later one is
+	# asked about afresh.
+	var listed := {}
+	for row: Dictionary in rows:
+		listed[row.key] = true
+	for key: String in _watch_alerted.keys():
+		if not listed.has(key):
+			_watch_alerted.erase(key)
 	if before != after:
 		_request_refresh()
 
 
-## `reconcile` the rows' files, which opens each one for what it needs (edit,
-## add or delete). Remembers each attempt, so a refusal isn't retried until
-## the file changes again, and tells the user about a refused file once per
-## session - an artist saving a teammate's locked file every minute would
-## otherwise get a dialog every minute. Not awaited: a pass must not wait on
-## a dialog. Returns the keys opened afterwards, or null if unknown.
+## `reconcile -e -a -d -M` the rows' files, which opens each one for what it
+## needs (edit, add, delete, or a move when a delete and an add pair up).
+## Remembers each attempt, so a refusal isn't retried until the file changes
+## again - unless the user chose to keep the change, see _act_on_detected.
+## A refusal is put to the user once per file per session, without making
+## the pass wait for the answer. Returns the keys opened afterwards, or null
+## if unknown.
 func _open_detected(rows: Array) -> Variant:
-	var locals: Array = rows.map(func(r: Dictionary) -> String: return String(r.local))
+	var epoch := _watch_epoch
+	# Moves first, so a pair lands in one command and -M can match it.
+	var ordered := rows.duplicate()
+	ordered.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return String(a.action) != "edit" and String(b.action) == "edit")
+	var locals: Array = ordered.map(func(r: Dictionary) -> String: return String(r.local))
 	var lines: Array = []
 	for chunk: Array in _path_chunks(locals, WATCH_CHUNK_CHARS):
-		var args: PackedStringArray = ["reconcile"]
+		var args: PackedStringArray = ["reconcile", "-e", "-a", "-d", "-M"]
 		for p: String in chunk:
 			args.append(p)
 		lines.append_array(_refusals(await _p4_exec_logged(args)).lines)
+		if _watch_gone(epoch):
+			return null
 	var records: Variant = await _opened_records()
-	if records == null:
+	if records == null or _watch_gone(epoch):
 		return null
 	var opened := {}
 	for rec: Dictionary in records:
@@ -439,37 +573,165 @@ func _open_detected(rows: Array) -> Variant:
 	# p4 names a refused file by its depot path.
 	var depot_of := {}
 	if not refused_rows.is_empty():
-		for chunk: Array in _path_chunks(refused_rows.map(func(r: Dictionary) -> String: return String(r.local)),
-				WATCH_CHUNK_CHARS):
-			var args: PackedStringArray = ["-ztag", "where"]
-			args.append_array(PackedStringArray(chunk))
-			for w in _parse_ztag(await _p4_exec(args)):
-				if w.has("path") and w.has("depotFile"):
-					depot_of[_path_key(String(w.path))] = String(w.depotFile).to_lower()
-	var to_tell: Array = []
+		var local_of := await _locals_of_depots(_preview_refusals(lines).keys())
+		if _watch_gone(epoch):
+			return null
+		for depot: String in local_of:
+			depot_of[_path_key(String(local_of[depot]))] = depot
+	var to_ask: Array = []
+	var unexplained: Array = []
 	for row: Dictionary in rows:
 		_watch_attempted[row.key] = row.mtime
 		if opened.has(row.key):
+			if _watch_refused.has(row.key):
+				_watch_refused.erase(row.key)
+				_log("'%s' is checked out now - Perforce let it go." % _tree_label(_local_key(String(row.local))))
+			continue
+		if not depot_of.has(row.key):
+			# Not opened, and Perforce didn't refuse it by name: the verdict
+			# was stale (an ignore rule, a teammate's delete synced) or the
+			# command failed. Looked at again, not asked about.
+			unexplained.append(String(row.local))
 			_watch_refused.erase(row.key)
 			continue
-		var reason := ""
-		var depot := String(depot_of.get(row.key, ""))
-		for line: String in lines:
-			var l := _path_key(line)
-			if l.contains(String(row.key)) or (not depot.is_empty() and l.contains(depot)):
-				reason = line.strip_edges()
-		_watch_refused[row.key] = reason if not reason.is_empty() else "Perforce didn't open it; the Log says why."
+		_watch_refused[row.key] = _refusal_reason(lines, String(row.key), String(depot_of[row.key]))
 		if not _watch_alerted.has(row.key):
-			_watch_alerted[row.key] = true
-			to_tell.append(_tree_label(_local_key(String(row.local))) + ": " + String(_watch_refused[row.key]))
+			to_ask.append(row)
+	if not unexplained.is_empty():
+		for local: String in unexplained:
+			_watch_cache.erase(_path_key(local))
+		_watch_cache_dirty = true
 	_request_refresh()
-	if not to_tell.is_empty():
+	if not to_ask.is_empty():
 		_log("Perforce refused %d of the %d changed file(s)." % [refused_rows.size(), rows.size()])
-		_show_alert(("Perforce wouldn't check out these files you changed:\n\n%s\n\nMost often a " +
-				"teammate has the file locked. Your changes are safe on your computer; the P4G panel " +
-				"lists the files under \"Changed, not checked out\", where you can check them out once " +
-				"the teammate is done.") % _file_listing(to_tell))
+		_ask_about_refused(to_ask) # not awaited: a pass mustn't wait on a dialog
 	return opened
+
+
+## Why Perforce refused a file, from `reconcile`'s refusal lines: "locked by
+## <user@workspace>" when the file is exclusive and someone has it.
+static func _refusal_reason(lines: Array, key: String, depot: String) -> String:
+	var reason := ""
+	for line: String in lines:
+		var l := _path_key(line)
+		if not (l.contains(key) or (not depot.is_empty() and l.contains(depot))):
+			continue
+		var at := l.find("also opened by ")
+		if at >= 0:
+			return "locked by " + line.substr(at + "also opened by ".length()).strip_edges()
+		if reason.is_empty():
+			reason = line.strip_edges()
+	return reason if not reason.is_empty() else "Perforce didn't open it; the Log says why."
+
+
+## How to undo a change on disk with `p4 clean`, by what reconcile would
+## open the file for; "" when there is nothing to put back (a new file).
+static func _clean_flag(action: String) -> String:
+	match action:
+		"edit": return "-e"
+		"delete", "move/delete": return "-d"
+	return ""
+
+
+## Ask about changes Perforce wouldn't check out: put back the version the
+## user had, or keep the change and let P4Godot check it out once Perforce
+## allows it. Asked when the change is found - in a read-only workspace
+## that is the moment checking out would have refused the edit.
+func _ask_about_refused(rows: Array) -> void:
+	if _watch_asking or _shutting_down:
+		return # Asked on a later pass, which tries these files again.
+	_watch_asking = true
+	var epoch := _watch_epoch
+	for row: Dictionary in rows:
+		_watch_alerted[row.key] = true
+	var listing: Array = rows.map(func(r: Dictionary) -> String:
+		return "%s - %s" % [_tree_label(_local_key(String(r.local))), _watch_refused.get(r.key, "")])
+	var revertable: Array = rows.filter(func(r: Dictionary) -> bool: return not _clean_flag(String(r.action)).is_empty())
+	var text := ("Perforce wouldn't check out %s you changed:\n\n%s\n\nUsually that means a " +
+			"teammate has it checked out exclusively: only one person can change such a file at a " +
+			"time. Your change can't be submitted until they submit or revert theirs, and if " +
+			"they submit, yours has to be redone on top of their version.") % [
+			"this file" if rows.size() == 1 else "these files", _file_listing(listing)]
+	if revertable.is_empty():
+		await _show_alert(text + ("\n\nP4Godot keeps trying, and checks it out as soon as " +
+				"Perforce allows."))
+		_watch_asking = false
+		return
+	var revert: bool = await _show_confirm_dialog(text + ("\n\nRevert puts back the version " +
+			"you had - your change is lost. Keep leaves it on your computer, listed in the P4G " +
+			"panel under \"Changed, not checked out\", and P4Godot checks it out as soon as " +
+			"Perforce allows."),
+			"Revert My Change" if revertable.size() == 1 else "Revert My Changes",
+			"Keep It" if rows.size() == 1 else "Keep Them")
+	if epoch != _watch_epoch:
+		return # The workspace changed while the question was up.
+	if revert:
+		await _revert_detected(revertable)
+	else:
+		_log("Kept %d change(s) Perforce wouldn't check out; trying again on each look." % rows.size())
+	_watch_asking = false
+
+
+## Many new or deleted files at once: one question before opening them.
+## They stay listed under "Changed, not checked out" either way.
+func _ask_about_bulk(rows: Array) -> void:
+	if _watch_asking or _shutting_down:
+		return
+	_watch_asking = true
+	var epoch := _watch_epoch
+	var adds := rows.filter(func(r: Dictionary) -> bool: return String(r.action).ends_with("add")).size()
+	var deletes := rows.size() - adds
+	var names: Array = rows.map(func(r: Dictionary) -> String:
+		return "%s  (%s)" % [_tree_label(_local_key(String(r.local))), r.action])
+	var yes: bool = await _show_confirm_dialog(("P4Godot found %d new and %d deleted files in your " +
+			"workspace at once:\n\n%s\n\nThat many usually means a first look at a workspace " +
+			"with files Perforce doesn't have yet (build output, say), or a folder deleted by " +
+			"mistake. Open them all in Perforce now?\n\nEither way they're listed in the P4G " +
+			"panel under \"Changed, not checked out\". Files that shouldn't be in Perforce " +
+			"belong in your ignore file (.p4ignore).") % [adds, deletes, _file_listing(names)],
+			"Open Them in Perforce", "Not Now")
+	if epoch == _watch_epoch:
+		if yes:
+			await _open_detected_rows(rows)
+		_watch_asking = false
+
+
+## Put back the version the user had for each row (`p4 clean`), reloading
+## any that are open in the editor.
+func _revert_detected(rows: Array) -> void:
+	var epoch := _watch_epoch
+	# Only what is still as it was when listed: not checked out meanwhile, and
+	# not changed again (that would be a newer change than the one asked about).
+	var records: Variant = await _opened_records()
+	if records == null or epoch != _watch_epoch:
+		return
+	var opened := {}
+	for rec: Dictionary in records:
+		opened[_path_key(String(rec.get("clientFile", "")))] = true
+	var done: Array = []
+	for row: Dictionary in rows:
+		var flag := _clean_flag(String(row.action))
+		var local := String(row.local)
+		var same: bool = (not FileAccess.file_exists(local)) if flag == "-d" \
+				else FileAccess.get_modified_time(local) == int(row.mtime)
+		if flag.is_empty() or opened.has(row.key) or not same:
+			continue
+		if epoch != _watch_epoch:
+			return
+		if await _p4_ok(["clean", flag, local]):
+			done.append(local)
+			var key := _local_key(local)
+			if key.begins_with("res://") and _is_open_in_editor(key):
+				await _reload_path(key)
+	if done.is_empty():
+		return
+	_forget_watch_entries(done)
+	var gone := {}
+	for local: String in done:
+		gone[_path_key(local)] = true
+	_set_watch_detected(_watch_detected.filter(func(r: Dictionary) -> bool: return not gone.has(r.key)))
+	EditorInterface.get_resource_filesystem().scan()
+	_log("Put back the version you had of %d file(s)." % done.size())
 
 
 # ---------------------------------------------------------------------------
@@ -485,14 +747,15 @@ func _watch_root() -> String:
 	return root
 
 
-## Every file under `root` with its modification time, read on a thread.
-func _walk_workspace(root: String) -> Dictionary:
+## Every file under `root` with its modification time, read on a thread,
+## leaving out the folders in `skip` (keys). `dirs` gets every folder walked.
+func _walk_workspace(root: String, skip: Dictionary, dirs: Array) -> Dictionary:
 	var out := {}
 	if _watch_thread != null:
 		return out
 	_watch_thread = Thread.new()
 	_watch_abort = [false]
-	_watch_thread.start(_walk_tree.bind(root, out, WATCH_MAX_FILES, _watch_abort))
+	_watch_thread.start(_walk_tree.bind(root, out, WATCH_MAX_FILES, _watch_abort, skip, dirs))
 	while _watch_thread != null and _watch_thread.is_alive():
 		await get_tree().process_frame
 	if _watch_thread == null:
@@ -503,7 +766,8 @@ func _walk_workspace(root: String) -> Dictionary:
 
 
 ## Runs on the walk thread: touches nothing but its arguments.
-static func _walk_tree(root: String, out: Dictionary, cap: int, abort: Array) -> void:
+static func _walk_tree(root: String, out: Dictionary, cap: int, abort: Array, skip: Dictionary,
+		dirs: Array) -> void:
 	var stack: Array[String] = [root]
 	while not stack.is_empty() and not abort[0]:
 		var dir: String = stack.pop_back()
@@ -520,7 +784,239 @@ static func _walk_tree(root: String, out: Dictionary, cap: int, abort: Array) ->
 			# Linked folders can loop back on themselves.
 			if sub in WATCH_SKIP_DIRS or d.is_link(sub):
 				continue
-			stack.append(dir + "/" + sub)
+			var child := dir + "/" + sub
+			if skip.has(_path_key(child)):
+				continue
+			dirs.append(child)
+			stack.append(child)
+
+
+## Folders the walk leaves out: unmapped, or ignored with nothing tracked in
+## them. One whose verdict is older than WATCH_PRUNE_RECHECK_SEC is forgotten
+## here, so this pass walks it and asks about it again.
+func _pruned_dirs(now: int) -> Dictionary:
+	var out := {}
+	for key: String in _watch_dirs.keys():
+		var verdict: Array = _watch_dirs[key]
+		if String(verdict[0]).is_empty():
+			continue
+		if int(verdict[1]) < now - WATCH_PRUNE_RECHECK_SEC:
+			_watch_dirs.erase(key)
+			continue
+		out[key] = true
+	return out
+
+
+static func _under_any(key: String, dir_keys: Array) -> bool:
+	for d: String in dir_keys:
+		if key.begins_with(d + "/"):
+			return true
+	return false
+
+
+## Learn which of the newly walked folders to leave out from now on, top
+## down, so a folder under one just left out isn't asked about. Measured on
+## p4d 2026.1: `add -n` of a made-up file answers "ignored file can't be
+## added" in an ignored folder and "file(s) not in client view" in an
+## unmapped one; and an edit to a tracked file inside an ignored folder is
+## still reported, which is why such a folder is kept.
+func _classify_dirs(dirs: Array, walked: Dictionary) -> void:
+	var ignore := await _ignore_files_state(walked)
+	if String(ignore.stamp) != _watch_ignore_stamp:
+		# The rules changed: what they decided before - left out or not - no
+		# longer holds.
+		_watch_dirs = {}
+		_watch_ignore_stamp = String(ignore.stamp)
+		_watch_cache_dirty = true
+	var by_depth := {}
+	for d: String in dirs:
+		if _watch_dirs.has(_path_key(d)):
+			continue
+		var depth := d.count("/")
+		if not by_depth.has(depth):
+			by_depth[depth] = []
+		by_depth[depth].append(d)
+	if by_depth.is_empty():
+		return
+	var depths: Array = by_depth.keys()
+	depths.sort()
+	var now := int(Time.get_unix_time_from_system())
+	var newly: Array = []
+	for depth: int in depths:
+		var batch: Array = (by_depth[depth] as Array).filter(
+				func(d: String) -> bool: return not _under_any(_path_key(d), newly))
+		if batch.is_empty():
+			continue
+		var verdicts: Variant = await _probe_dirs(batch)
+		if verdicts == null or _shutting_down:
+			return # Not answered: asked again next pass.
+		for d: String in batch:
+			var key := _path_key(d)
+			var verdict := String(verdicts.get(key, ""))
+			# A "!" rule can bring single files back into an ignored folder,
+			# which a made-up file name can't detect: then nothing is left out
+			# for being ignored.
+			if verdict == "ignored" and (bool(ignore.negations) or await _has_tracked_files(d)):
+				verdict = ""
+			_watch_dirs[key] = [verdict, now]
+			if not verdict.is_empty():
+				newly.append(key)
+	_watch_cache_dirty = true
+	if not newly.is_empty():
+		_log("Not watching %d folder(s) that the workspace leaves out or ignores: %s" % [newly.size(),
+				", ".join(newly.slice(0, 5).map(func(k: String) -> String: return _tree_label(_local_key(k))))
+				+ ("" if newly.size() <= 5 else ", ...")])
+
+
+## `add -n` of a made-up file in each folder. Returns folder key -> "ignored"
+## or "unmapped" for those left out (others are absent), or null when p4
+## didn't answer.
+##
+## Two made-up files per folder, one in it and one a level below, must agree:
+## a rule like "Build/*" ignores only a folder's own files, and a view can
+## map one subfolder of a folder it otherwise leaves out. An "unmapped"
+## answer is also checked with `where <folder>/...`, which names any
+## mapping under the folder (measured on 2026.1).
+func _probe_dirs(batch: Array) -> Variant:
+	var read_any := {}
+	var answered := false
+	var probes: Array = []
+	for d: String in batch:
+		probes.append(d + "/" + WATCH_PROBE_NAME)
+		probes.append(d + "/" + WATCH_PROBE_NAME + "/" + WATCH_PROBE_NAME)
+	for chunk: Array in _path_chunks(probes, WATCH_CHUNK_CHARS):
+		var args: PackedStringArray = ["add", "-n"]
+		args.append_array(PackedStringArray(chunk))
+		var result := await _p4_exec(args)
+		if _server_unreachable():
+			return null
+		var text := "" if result.output.is_empty() else String(result.output[0])
+		var read := _probe_verdicts_in(text)
+		read_any.merge(read.verdicts)
+		answered = answered or not text.strip_edges().is_empty()
+	if not answered:
+		return null
+	var verdicts := {}
+	for d: String in batch:
+		var key := _path_key(d)
+		var verdict := String(read_any.get(key, ""))
+		if verdict.is_empty() or String(read_any.get(key + "/" + WATCH_PROBE_NAME.to_lower(), "")) != verdict:
+			continue
+		if verdict == "unmapped":
+			var where := await _p4_exec(["-ztag", "where", d + "/..."])
+			if _parse_ztag(where).any(func(w: Dictionary) -> bool: return w.has("path")) \
+					or _server_unreachable():
+				continue # Something under it is mapped (or no answer): walk it.
+		verdicts[key] = verdict
+	return verdicts
+
+
+## Read `add -n`'s answer about probe files: {verdicts: folder key ->
+## "ignored" / "unmapped", answered: whether p4 said anything about them}.
+static func _probe_verdicts_in(text: String) -> Dictionary:
+	var verdicts := {}
+	var answered := false
+	for raw in text.split("\n", false):
+		var line := raw.strip_edges()
+		var verdict := ""
+		var at := line.find(" - ignored file can't be added")
+		if at >= 0:
+			verdict = "ignored"
+		else:
+			at = line.find(" - file(s) not in client view")
+			if at >= 0:
+				verdict = "unmapped"
+		if verdict.is_empty():
+			answered = answered or line.contains(" - opened for add")
+			continue
+		answered = true
+		verdicts[_path_key(line.substr(0, at).replace("\\", "/").get_base_dir())] = verdict
+	return {"verdicts": verdicts, "answered": answered}
+
+
+## Whether Perforce has files under a folder in this workspace. Unknown (no
+## answer) counts as yes, so a folder is never left out on a guess.
+func _has_tracked_files(dir: String) -> bool:
+	var result := await _p4_exec(["-ztag", "fstat", "-m1", "-Rh", "-T", "depotFile", dir + "/..."])
+	if not _parse_ztag(result).is_empty():
+		return true
+	var text := "" if result.output.is_empty() else String(result.output[0])
+	return not text.contains("no such file")
+
+
+## The ignore files the walk found (by P4IGNORE's names): {stamp, negations}.
+## `stamp` changes when one is added, removed or edited; `negations` is
+## whether any has a "!" rule.
+func _ignore_files_state(walked: Dictionary) -> Dictionary:
+	if _watch_ignore_names == null:
+		var result := await _p4_exec(["set", "-q", "P4IGNORE"])
+		var text := "" if result.output.is_empty() else String(result.output[0]).strip_edges()
+		var names: Array = []
+		var fixed: Array = []
+		if text.contains("="):
+			for part in text.get_slice("=", 1).replace(",", ";").split(";", false):
+				var entry := part.strip_edges().replace("\\", "/")
+				# A full path names one file wherever it is, maybe outside
+				# the workspace; a bare name means that name in any folder.
+				if _is_local_path(entry):
+					fixed.append(entry)
+				else:
+					names.append(entry.get_file().to_lower())
+		_watch_ignore_names = names
+		_watch_ignore_fixed = fixed
+	var parts := PackedStringArray()
+	var negations := false
+	_watch_ignore_files = []
+	var found: Array = []
+	if not (_watch_ignore_names as Array).is_empty():
+		for key: String in walked:
+			if key.get_file() in _watch_ignore_names:
+				found.append(String(walked[key][0]))
+	for path: String in _watch_ignore_fixed:
+		if FileAccess.file_exists(path):
+			found.append(path)
+	for path: String in found:
+		_watch_ignore_files.append(path)
+		parts.append("%s:%d" % [_path_key(path), FileAccess.get_modified_time(path)])
+		for line in FileAccess.get_file_as_string(path).split("\n"):
+			if line.strip_edges().begins_with("!"):
+				negations = true
+	parts.sort()
+	return {"stamp": "|".join(parts), "negations": negations}
+
+
+## Before the walk: if an ignore file found last time was edited or removed,
+## forget the folders it left out, so this walk goes into them again. (A new
+## ignore file is only found by the walk itself; _classify_dirs handles it.)
+func _forget_ignored_if_rules_changed() -> void:
+	if _watch_ignore_files.is_empty():
+		return
+	var parts := PackedStringArray()
+	for path: String in _watch_ignore_files:
+		if FileAccess.file_exists(path):
+			parts.append("%s:%d" % [_path_key(path), FileAccess.get_modified_time(path)])
+	parts.sort()
+	if "|".join(parts) == _watch_ignore_stamp:
+		return
+	_watch_dirs = {}
+	_watch_cache_dirty = true
+
+
+## Drop what is under a left-out folder from this pass and from the cache.
+func _drop_pruned(walked: Dictionary) -> void:
+	var pruned: Array = []
+	for key: String in _watch_dirs:
+		if not String(_watch_dirs[key][0]).is_empty():
+			pruned.append(key)
+	if pruned.is_empty():
+		return
+	for key: String in walked.keys():
+		if _under_any(key, pruned):
+			walked.erase(key)
+	for key: String in _watch_cache.keys():
+		if _under_any(key, pruned):
+			_watch_cache.erase(key)
+			_watch_cache_dirty = true
 
 
 func _watch_cache_file() -> String:
@@ -536,6 +1032,9 @@ func _load_watch_cache() -> void:
 	_watch_cache = {}
 	_watch_opened_prev = {}
 	_watch_seen = {}
+	_watch_dirs = {}
+	_watch_ignore_stamp = ""
+	_watch_ignore_files = []
 	_watch_cache_path_loaded = path
 	_watch_cache_dirty = false
 	var f := FileAccess.open(path, FileAccess.READ)
@@ -545,10 +1044,13 @@ func _load_watch_cache() -> void:
 	f.close()
 	if data is Dictionary and int(data.get("version", 0)) == WATCH_CACHE_VERSION \
 			and data.get("entries") is Dictionary and data.get("opened") is Dictionary \
-			and data.get("seen") is Dictionary:
+			and data.get("seen") is Dictionary and data.get("dirs") is Dictionary:
 		_watch_cache = data.entries
 		_watch_opened_prev = data.opened
 		_watch_seen = data.seen
+		_watch_dirs = data.dirs
+		_watch_ignore_stamp = String(data.get("ignore_stamp", ""))
+		_watch_ignore_files = data.get("ignore_files", []) as Array
 
 
 ## Written through a temporary file and a rename, so a crash mid-write can't
@@ -564,7 +1066,8 @@ func _save_watch_cache(force: bool) -> void:
 	if f == null:
 		return
 	f.store_buffer(var_to_bytes({"version": WATCH_CACHE_VERSION, "entries": _watch_cache,
-			"opened": _watch_opened_prev, "seen": _watch_seen}))
+			"opened": _watch_opened_prev, "seen": _watch_seen, "dirs": _watch_dirs,
+			"ignore_stamp": _watch_ignore_stamp, "ignore_files": _watch_ignore_files}))
 	f.close()
 	if DirAccess.rename_absolute(path + ".tmp", path) == OK:
 		_watch_cache_dirty = false
@@ -822,17 +1325,26 @@ static func _spec_with_allwrite(spec: String, on: bool) -> String:
 	return "\n".join(lines)
 
 
-## Offered once per project, when the workspace keeps files read-only.
+## Offered at startup and when connection setup connects a workspace, if the
+## workspace keeps files read-only - once per workspace: "Not Now" is
+## remembered for that server and workspace, so reconnecting doesn't ask
+## again, but picking another workspace does.
 func _offer_allwrite_once() -> void:
 	if not await _ensure_identity() or _selftest_mode:
 		return # Self-tests answer dialogs on their own; this one changes the workspace.
 	var settings := EditorInterface.get_editor_settings()
-	if settings.get_project_metadata(SETTINGS_SECTION, "allwrite_offered", false):
+	var asked: Array = settings.get_project_metadata(SETTINGS_SECTION, "allwrite_asked", [])
+	var which := "%s|%s" % [_p4_port, _p4_client]
+	if which in asked:
 		return
+	# Recorded before anything is awaited, so the startup call and the
+	# connection-setup call can't both get past this and ask twice.
+	asked.append(which)
+	settings.set_project_metadata(SETTINGS_SECTION, "allwrite_asked", asked)
+	var epoch := _watch_epoch
 	var words := await _read_client_options()
-	if words.is_empty() or "allwrite" in words:
+	if words.is_empty() or "allwrite" in words or epoch != _watch_epoch:
 		return
-	settings.set_project_metadata(SETTINGS_SECTION, "allwrite_offered", true)
 	var yes: bool = await _show_confirm_dialog(("Your Perforce workspace keeps files read-only " +
 			"until you check them out. Godot rewrites some files on its own - every .import " +
 			"file when it reimports, and scenes when it re-saves them - and those writes fail " +
@@ -841,8 +1353,12 @@ func _offer_allwrite_once() -> void:
 			"other program, and Get Latest still never overwrites a file you changed.\n\nYou " +
 			"can switch back at any time in the P4G panel's settings menu."),
 			"Make Files Writable", "Not Now")
-	if yes:
+	if yes and epoch == _watch_epoch:
 		await _switch_allwrite(true, false)
+
+
+func _on_workspace_connected() -> void:
+	_offer_allwrite_once()
 
 
 func _build_settings_menu(parent: Control) -> void:
@@ -1061,6 +1577,7 @@ static func _detected_verb(action: String) -> String:
 	match action:
 		"add": return "Mark for Add"
 		"delete": return "Mark for Delete"
+		"move/add", "move/delete": return "Record the Move"
 	return "Check Out"
 
 
@@ -1075,13 +1592,15 @@ func _populate_context_menu(meta: Dictionary) -> void:
 	if kind == "detected":
 		var action := String(meta.get("action", ""))
 		context_menu.add_item(_detected_verb(action), CTX_DETECTED_OPEN)
-		if action != "delete":
+		if not action.ends_with("delete"):
 			var in_project := String(meta.get("res_path", "")).begins_with("res://")
 			context_menu.add_item("Open" if in_project else "Show in File Manager", CTX_DETECTED_SHOW)
 		if action == "edit":
 			context_menu.add_item("Diff vs Depot", CTX_DETECTED_DIFF)
-		if action != "add":
+		if not action.ends_with("add"):
 			context_menu.add_item("History...", CTX_DETECTED_HISTORY)
+		if not _clean_flag(action).is_empty():
+			context_menu.add_item("Revert My Change...", CTX_DETECTED_REVERT)
 	else:
 		context_menu.add_item("Open All in Perforce", CTX_DETECTED_OPEN_ALL)
 	context_menu.add_separator()
@@ -1092,8 +1611,18 @@ func _on_context_menu_id_pressed(id: int) -> void:
 	var meta := _context_target
 	match id:
 		CTX_DETECTED_OPEN:
-			await _open_detected_rows(_watch_detected.filter(
-					func(r: Dictionary) -> bool: return r.local == String(meta.get("local", ""))))
+			# A move is both of its halves, which -M has to see together.
+			var whole_move := String(meta.get("action", "")).begins_with("move/")
+			await _open_detected_rows(_watch_detected.filter(func(r: Dictionary) -> bool:
+				return r.local == String(meta.get("local", "")) \
+						or (whole_move and String(r.action).begins_with("move/"))))
+		CTX_DETECTED_REVERT:
+			var row: Array = _watch_detected.filter(
+					func(r: Dictionary) -> bool: return r.local == String(meta.get("local", "")))
+			if not row.is_empty() and await _show_confirm_dialog(("Put back the version of '%s' " +
+					"you had? Your change to it is lost, and this can't be undone.") % _tree_label(
+					String(meta.get("res_path", ""))), "Revert My Change", "Cancel"):
+				await _revert_detected(row)
 		CTX_DETECTED_OPEN_ALL:
 			await _open_detected_rows(_watch_detected.duplicate())
 		CTX_DETECTED_DIFF:
@@ -1112,7 +1641,7 @@ func _on_tree_item_activated() -> void:
 	if meta is Dictionary and meta.get("type") == "detected":
 		if String(meta.action) == "edit":
 			await _diff_path(String(meta.res_path))
-		elif String(meta.action) == "add":
+		elif String(meta.action).ends_with("add"):
 			_open_res_path(String(meta.res_path))
 		return
 	super()
@@ -1125,6 +1654,7 @@ func _open_detected_rows(rows: Array) -> void:
 	for row: Dictionary in rows:
 		_watch_attempted.erase(row.key)
 		_watch_refused.erase(row.key)
+		_watch_alerted.erase(row.key) # asked for it: a refusal is worth saying again
 	await _open_detected(rows)
 	var records: Variant = await _opened_records()
 	if records == null:

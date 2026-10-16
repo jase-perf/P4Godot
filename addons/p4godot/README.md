@@ -465,26 +465,47 @@ submit.
 
 Textures, models and audio get edited in Photoshop, Blender and Audition,
 which know nothing about Perforce. P4Godot watches your whole workspace,
-including art folders beside the Godot project, and checks out the files
-those programs changed without asking. It looks each time Godot regains
-focus, and every half minute or so while Godot is open.
+including art folders beside the Godot project, and opens what those
+programs changed in your default changelist without asking: edited files
+are checked out, new files marked for add, deleted files marked for delete,
+and a renamed file recorded as a move, so its history follows it. It looks
+each time Godot regains focus, and every half minute or so while Godot is
+open.
 
-Files it can't simply check out are listed at the top of the P4G panel,
-under **Changed, not checked out**:
+A file is only marked for delete if P4Godot saw it on your disk before, and
+is still missing at its next look. A file that never arrived (a download
+that failed part-way) isn't touched, because marking it deleted would
+remove it for everyone; **Reconcile** finds those. More than 20 new or
+deleted files at once - a first look at a workspace full of files Perforce
+doesn't have yet, or a folder deleted by mistake - are listed and asked
+about once, instead of opened.
 
-- **New files** stay there until you right-click one and choose **Mark for
-  Add**. With **Auto add/edit/delete** on, they're added without asking.
-- **Missing files** stay until you choose **Mark for Delete**. They're never
-  marked deleted automatically. A file that failed to download looks exactly
-  like one you deleted on purpose, and marking it deleted by mistake would
-  remove it for everyone.
-- **Locked files** are edits Perforce wouldn't check out, usually because a
-  teammate has the file exclusively locked. The row says so; check it out
-  from its menu once they're done.
+**When a teammate has the file locked.** Some files, usually art, can be
+changed by only one person at a time. In a normal Perforce workspace you
+find that out when you try to check the file out, before you start. With
+writable files you find out when P4Godot tries to check it out after your
+edit - so it asks at once, naming who has the file:
 
-Turn off **Check out changed files automatically** to have edits listed
-there too, each with its own **Check Out**. Right-click the group's row to
-open everything in it at once.
+- **Revert My Change** puts back the version you had. Your change is lost.
+- **Keep It** leaves your change on your computer, listed in the P4G panel
+  under **Changed, not checked out** with who has the lock. P4Godot checks
+  it out as soon as they let go. Until then it can't be submitted, and if
+  they submit first, your change has to be redone on their version.
+
+Turn off **Check out changed files automatically** to choose for yourself:
+everything the watcher finds is then listed under **Changed, not checked
+out**, each with its own **Check Out**, **Mark for Add**, **Mark for
+Delete** or **Record the Move**, and **Revert My Change...** for edits and
+deletes. Right-click the group's row to open everything in it at once.
+
+**Folders it doesn't watch.** P4Godot doesn't look inside folders your
+workspace doesn't map at all, or folders your ignore file (`.p4ignore`)
+leaves out, such as build output. A folder the view maps only part of is
+still watched. It checks each new folder once, and again every
+ten minutes or when an ignore file changes. An ignored folder that still
+holds files in Perforce stays watched, since edits to those files count.
+If any ignore file has a `!` rule (which can bring single files back into
+an ignored folder), P4Godot watches ignored folders after all, to be safe.
 
 P4Godot also keeps your changelists honest about files on disk. A file you
 marked for add and then deleted is taken out of its changelist, so the
@@ -563,9 +584,9 @@ project and per user, and never written into project files.
 | --- | --- | --- |
 | Checkout on edit | on | Offer to check out a file the moment it is first modified. |
 | Checkout on save | on | Check files out just before Godot writes them, and take care of locked files around saves. Leave this on — turning it off means saves can fail. See [Why files are locked](#why-files-are-locked-until-you-check-them-out) and [Turning "Checkout on save" off](#turning-checkout-on-save-off). |
-| Auto add/edit/delete | off | Record edits, deletes, and moves in Perforce silently, with no confirmation dialogs. |
+| Auto add/edit/delete | off | Record edits, deletes, and moves you make in Godot (the FileSystem dock, the editor) silently, with no confirmation dialogs. Changes made in other programs follow **Check out changed files automatically** instead. |
 | Watch the workspace for changes | on | Look for files changed by any program, anywhere in the workspace, when Godot regains focus and every half minute or so (see [files you edited elsewhere](#files-you-edited-in-photoshop-blender-or-anywhere-else)). |
-| Check out changed files automatically | on | Check out the edits the watcher finds, without asking. When off, they're listed under **Changed, not checked out** in the P4G panel, to check out one by one. |
+| Check out changed files automatically | on | Open what the watcher finds in Perforce without asking: edits, new files, deleted files and renames. When off, they're listed under **Changed, not checked out** in the P4G panel, to open one by one. |
 | Leave workspace files writable | the workspace's own setting | Switch the workspace between leaving files writable (`allwrite`) and keeping them read-only until checked out (see [Leaving files writable](#leaving-files-writable)). This one changes the workspace on the server, so it applies everywhere you use it. |
 | Verbose log | off | Also log the commands that only ask questions and change nothing (`fstat`, `opened`, `where`, `changes`). |
 
