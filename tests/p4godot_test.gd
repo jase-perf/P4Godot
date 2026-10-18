@@ -3680,7 +3680,8 @@ func _run_cli_self_test_if_requested() -> void:
 			await _selftest_drain_frames()
 			var after := await _is_in_depot(plugin_cfg)
 			_log("[selftest] plugin in depot before=%s after=%s" % [before, after])
-			_log("[selftest] %s: plugin-prompt" % ("PASS" if after else "FAIL"))
+			# Not in Perforce before (or the check had nothing to do), in after.
+			_log("[selftest] %s: plugin-prompt" % ("PASS" if after and not before else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-plugin-tracked":
@@ -4234,6 +4235,102 @@ func _run_cli_self_test_if_requested() -> void:
 			await _p4_exec_logged(["revert", gd, fresh])
 			DirAccess.remove_absolute(fresh)
 			_log("[selftest] PASS: gui-spike")
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-diff-limits-live":
+			# Live: Diff vs Depot on a changed text file over the size limit, and
+			# on a changed binary, says why it shows nothing - and never opens
+			# the diff window or downloads the file first.
+			_selftest_auto_answer = "confirm"
+			var big := ProjectSettings.globalize_path("res://p4g_diff_big.txt")
+			var bin := ProjectSettings.globalize_path("res://p4g_diff_pic.bin")
+			var fw := FileAccess.open(big, FileAccess.WRITE)
+			for i in 30000:
+				fw.store_string("line %d of a large text file, long enough to pass the limit\n" % i)
+			fw.close()
+			fw = FileAccess.open(bin, FileAccess.WRITE)
+			fw.store_buffer(PackedByteArray([0, 1, 2, 3, 255, 254]))
+			fw.close()
+			await _p4_exec_logged(["add", big])
+			await _p4_exec_logged(["add", "-t", "binary", bin])
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: diff limits"])
+			await _p4_exec_logged(["edit", big, bin])
+			fw = FileAccess.open(big, FileAccess.READ_WRITE)
+			fw.seek_end()
+			fw.store_string("one more line\n")
+			fw.close()
+			fw = FileAccess.open(bin, FileAccess.WRITE)
+			fw.store_buffer(PackedByteArray([9, 9, 9]))
+			fw.close()
+			_selftest_shown.clear()
+			await _diff_path("res://p4g_diff_big.txt")
+			var big_said := "" if _selftest_shown.is_empty() else String(_selftest_shown[-1])
+			_selftest_shown.clear()
+			await _diff_path("res://p4g_diff_pic.bin")
+			var bin_said := "" if _selftest_shown.is_empty() else String(_selftest_shown[-1])
+			var window_shown := diff_window != null and diff_window.visible
+			_log("[selftest] big: %s | binary: %s | diff window shown: %s" % [big_said, bin_said, window_shown])
+			await _p4_exec_logged(["revert", big, bin])
+			await _p4_exec_logged(["delete", big, bin])
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: diff limits cleanup"])
+			var ok := big_said.contains("too large") and big_said.contains("P4V") \
+					and (bin_said.contains("binary") or bin_said.contains("isn't text")) and not window_shown
+			_log("[selftest] %s: diff-limits-live" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-allwrite-offer-live":
+			# Live: the startup offers run for real (self-tests normally skip
+			# them). The allwrite offer asks once per server+workspace: "Not Now"
+			# is remembered, so a second start doesn't ask; another workspace
+			# is asked afresh. The project.godot offer checks the file out with
+			# +w. Leaves the workspace noallwrite and project.godot as it was.
+			var settings := EditorInterface.get_editor_settings()
+			var checks := {}
+			var pg := ProjectSettings.globalize_path("res://project.godot")
+			# project.godot without +w, as a team that hasn't set it up has it.
+			await _p4_exec_logged(["edit", "-t", "text", pg])
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: project.godot without +w", pg])
+			settings.set_project_metadata(SETTINGS_SECTION, "allwrite_asked", [])
+			settings.set_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", false)
+			_selftest_mode = false # the whole point is to let the offers run
+			# 1. Not Now to both.
+			_selftest_auto_answer = "cancel"
+			_client_allwrite = null
+			await _offer_allwrite_once()
+			_client_allwrite = null
+			var asked: Array = settings.get_project_metadata(SETTINGS_SECTION, "allwrite_asked", [])
+			checks["declined: remembered for this workspace, still read-only"] = \
+					("%s|%s" % [_p4_port, _p4_client]) in asked and not await _workspace_is_allwrite()
+			checks["declined project.godot: unchanged"] = String((await _selftest_fstat(pg)).get("action", "")) == ""
+			# 2. A second start would answer yes - but isn't asked.
+			_selftest_auto_answer = "confirm"
+			await _offer_allwrite_once()
+			_client_allwrite = null
+			checks["not asked again"] = not await _workspace_is_allwrite() \
+					and String((await _selftest_fstat(pg)).get("action", "")) == ""
+			# 3. Another workspace (as far as the memory knows) is asked afresh;
+			#    yes switches. The project.godot offer then has nothing to do.
+			settings.set_project_metadata(SETTINGS_SECTION, "allwrite_asked", ["127.0.0.1:1|other-ws"])
+			await _offer_allwrite_once()
+			_client_allwrite = null
+			checks["another workspace is asked; yes switches"] = await _workspace_is_allwrite()
+			await _switch_allwrite(false, false)
+			while _external_scan_inflight:
+				await get_tree().process_frame
+			# 4. The project.godot offer on its own, answered yes.
+			settings.set_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", false)
+			_client_allwrite = null
+			await _offer_project_godot_writable()
+			var pg_rec := await _selftest_fstat(pg)
+			checks["project.godot checked out with +w"] = String(pg_rec.get("action", "")) == "edit" \
+					and String(pg_rec.get("type", "")).contains("+w")
+			await _p4_exec_logged(["submit", "-d", "P4Godot selftest: project.godot back to +w", pg])
+			_selftest_mode = true
+			var ok := true
+			for name: String in checks:
+				_log("[selftest] %s: %s" % [name, checks[name]])
+				ok = ok and bool(checks[name])
+			_log("[selftest] %s: allwrite-offer-live" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
 		if arg == "--p4-selftest-watch-time":

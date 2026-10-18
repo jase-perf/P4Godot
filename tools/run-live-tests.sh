@@ -20,7 +20,7 @@ ALL="probe history-gate decline-reprompt script-revert import-dock
 get-latest-scene get-latest-script get-latest-modified get-latest-checked-out
 ignore-check-live file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
 special-names history-live shelves-live submit-behind-live resolve-live submit-verdict-live submit-cancel submit-slow-trigger-live
-watch-live allwrite-live"
+watch-live allwrite-live allwrite-offer-live diff-limits-live plugin-prompt get-latest-cancel"
 TESTS="${*:-$ALL}"
 
 if ! "$GODOT" --version >/dev/null 2>&1; then
@@ -171,7 +171,7 @@ for t in $TESTS; do
 		# Get Latest against a workspace a teammate's submit left behind: a
 		# scene and a script that reload, a file changed on disk without a
 		# checkout (refused), and one checked out (left for a resolve).
-		get-latest-*)
+		get-latest-scene|get-latest-script|get-latest-modified|get-latest-checked-out)
 			case "$t" in
 				get-latest-scene) file="scenes/level.tscn"
 					extra='
@@ -188,6 +188,21 @@ for t in $TESTS; do
 					(cd "$proj" && p4t edit "$file" >/dev/null) ;;
 			esac
 			arg="--p4-selftest-get-latest=res://$file" ;;
+		# A project whose project.godot is in Perforce but whose addon isn't:
+		# the addon leaves the depot and stays on disk.
+		plugin-prompt)
+			(cd "$proj" && p4t delete -k "addons/..." >/dev/null &&
+				p4t submit -d "Take the addon out of Perforce" >/dev/null) ||
+				{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; } ;;
+		# A download big enough to cancel part-way: 40 files of 3 MB, submitted
+		# and then synced away again.
+		get-latest-cancel)
+			(cd "$proj" && mkdir -p big &&
+				for i in $(seq 1 40); do head -c 3000000 /dev/urandom > "big/blob$i.bin"; done &&
+				p4t add -t binary big/*.bin >/dev/null &&
+				p4t submit -d "Big files for the cancel test" >/dev/null &&
+				p4t sync -q "big/...#none" >/dev/null) ||
+				{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; } ;;
 		# These leave what they checked out opened, by design; reverted below.
 		history-gate|decline-reprompt) arg="$arg=res://scenes/level.tscn" ;;
 		script-revert) arg="$arg=res://scripts/player.gd" ;;
@@ -209,7 +224,7 @@ for t in $TESTS; do
 	grep "\[selftest\]" "$log" | sed 's/^/    /'
 	case "$t" in
 		probe) want="\[selftest\] probe status=ok" ;;
-		get-latest-*) want="\[selftest\] PASS: get-latest" ;;
+		get-latest-scene|get-latest-script|get-latest-modified|get-latest-checked-out) want="\[selftest\] PASS: get-latest" ;;
 		*) want="\[selftest\] PASS: $t" ;;
 	esac
 	# A PASS line may carry a note after the name; Godot's lines end in CRLF
@@ -224,7 +239,13 @@ for t in $TESTS; do
 	case "$t" in
 		history-gate|decline-reprompt|script-revert|import-dock)
 			(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1) ;;
-		get-latest-*)
+		plugin-prompt)
+			(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1; p4t reconcile -a "addons/..." >/dev/null 2>&1 &&
+				p4t submit -d "Put the addon back" >/dev/null 2>&1) ;;
+		get-latest-cancel)
+			(cd "$proj" && p4t sync -q "big/..." >/dev/null 2>&1 && p4t delete "big/..." >/dev/null 2>&1 &&
+				p4t submit -d "Remove the cancel test's files" >/dev/null 2>&1; rm -rf big) ;;
+		get-latest-scene|get-latest-script|get-latest-modified|get-latest-checked-out)
 			(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1 && p4t sync -f "$file" >/dev/null 2>&1) ;;
 	esac
 	left="$(cd "$proj" && p4t -F %depotFile% opened 2>/dev/null)"

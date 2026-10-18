@@ -45,12 +45,12 @@ written yet.
 | 7-8 Watcher: automatic and listed | Automated | `watch-live`; panel in `gui-dock` |
 | 9 Reconcile's confirmation | Screenshot | `gui-dialogs` |
 | 10 A teammate's lock | Automated | `watch-live` (both answers); dialog in `gui-dialogs` |
-| 11 Addon not in Perforce | Next | `plugin-prompt` exists; needs a project whose addon is untracked |
+| 11 Addon not in Perforce | Automated | `plugin-prompt`: the runner takes the addon out of the depot first (`delete -k`), then puts it back |
 | 12 Get Latest, nothing to do | Screenshot | `gui-dialogs` |
 | 13-15 Get Latest: reload, refusals, behind | Automated | `get-latest-scene`, `-script`, `-modified`, `-checked-out`: the runner has `mate` submit a newer revision first |
 | 16-18 Connection settings and workspace switching | Screenshot | dialogs in `gui-dialogs`; `connection-dialogs`, `connection-store` offline |
 | 19, 34-36 Resolve | Automated | `submit-behind-live`, `resolve-live`; dialogs not yet captured |
-| 20-22 Progress window, cancel | Automated | `submit-slow-trigger-live`, `submit-cancel`; window not yet captured; Get Latest cancel is next (`get-latest-cancel`) |
+| 20-22 Progress window, cancel | Automated | `submit-slow-trigger-live`, `submit-cancel`, `get-latest-cancel` (40 files of 3 MB synced away first); the window is captured in `gui-windows` |
 | 23 Delta transfer of a large binary | Next | needs a `binary+F` file of a few MB in the live project |
 | 24 Diff of an unopened changed file | Automated | `file-actions-live`; the window is captured for an opened file in `gui-windows` |
 | 25, 30 Revert: undo a move, an unopened changed file | Automated | `file-actions-live` checks the question's wording |
@@ -60,14 +60,14 @@ written yet.
 | 27 Expired password | Automated | `password-expired-live` |
 | 33 `.godot/` not ignored | Automated | `ignore-check-live` |
 | 38 Server certificate changed | Next | the test server would need an `ssl:` port and `p4d -Gc` |
-| 39 Diff of a big or binary file | Next | |
+| 39 Diff of a big or binary file | Automated | `diff-limits-live` |
 | 40-41 History window | Automated | `history-live`; window in `gui-windows` |
 | 42-44 Shelving | Automated | `shelves-live`; Shelves window in `gui-windows` |
 | 45-47 Editor menus, Who Changed This Line, changed-line marks | Automated | `editor-menus`, `history-live`; the gutter isn't captured yet |
 | 48-51, 53 Watcher and allwrite | Automated | `watch-live`, `allwrite-live` |
-| 52 Allwrite offer, once per workspace | Next | self-tests skip the offer on purpose; a GUI test can let it run |
+| 52 Allwrite offer, once per workspace | Automated | `allwrite-offer-live` lets the startup offers run, including the project.godot one |
 
-Counted: 40 rows automated, 2 partly, 5 with screenshots only, 6 next.
+Counted: 44 rows automated, 2 partly, 5 with screenshots only, 2 next.
 None of the 53 needs a person in principle; the slowest to automate are 23
 (large files) and 38 (an SSL test server).
 

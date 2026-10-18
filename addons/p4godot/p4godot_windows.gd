@@ -643,7 +643,7 @@ func _revision_diffable(p4_type: String, size: int) -> Dictionary:
 func _diff_too_big_message(res_path: String, size: int) -> String:
 	return ("'%s' is %s - too large to show side by side here (the limit is %s). " +
 			"Use Diff in P4V for a file this size.") \
-			% [res_path, String.humanize_size(size), String.humanize_size(DIFF_MAX_BYTES)]
+			% [res_path, _human_bytes(size), _human_bytes(DIFF_MAX_BYTES)]
 
 
 ## The depot path from the diff's "--- //depot/...<TAB>date" header line.
