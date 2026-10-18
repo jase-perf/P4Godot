@@ -4333,6 +4333,46 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: allwrite-offer-live" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
+		if arg.begins_with("--p4-selftest-ssl-fingerprint-live="):
+			# Live: an SSL server whose certificate changed since this computer
+			# trusted it (tools/run-live-tests.sh stages it). Connection setup
+			# must warn, name both fingerprints, and on "Trust New Fingerprint"
+			# install exactly the new one. Restores the connection settings.
+			var ssl_port := arg.substr("--p4-selftest-ssl-fingerprint-live=".length())
+			var saved_port := _override_port
+			var saved_user := _override_user
+			var saved_client := _override_client
+			_override_port = ssl_port
+			_override_user = ""
+			_override_client = ""
+			_reset_connection_state()
+			var before := String((await _p4_exec(["trust", "-l"])).output[0])
+			_selftest_auto_answer = "confirm"
+			_selftest_shown.clear()
+			var status := await _probe_connection()
+			var probe_text := _last_probe_text
+			var trusted := status == "fingerprint changed" and await _handle_fingerprint_change()
+			var warning := ""
+			for shown: String in _selftest_shown:
+				if shown.contains("CHANGED"):
+					warning = shown
+			var after := String((await _p4_exec(["trust", "-l"])).output[0])
+			var change := _fingerprint_change_in(probe_text)
+			_override_port = saved_port
+			_override_user = saved_user
+			_override_client = saved_client
+			_save_connection_overrides()
+			_log("[selftest] status before setup: %s; new fingerprint %s" % [status, change.get("new", "")])
+			_log("[selftest] trusted before: %s" % before.strip_edges().replace("\n", " | "))
+			_log("[selftest] trusted after: %s" % after.strip_edges().replace("\n", " | "))
+			var new_fp := String(change.get("new", ""))
+			var old_fp := _trusted_fingerprint_for(before, String(change.get("address", "")))
+			var ok := trusted and not new_fp.is_empty() and not old_fp.is_empty() \
+					and warning.contains(new_fp) and warning.contains(old_fp) and after.contains(new_fp) \
+					and not after.contains(old_fp)
+			_log("[selftest] %s: ssl-fingerprint-live" % ("PASS" if ok else "FAIL"))
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-watch-time":
 			# Manual benchmark, not in any runner: time the watcher's first pass
 			# (every file checked) and the one after (cache hits) on whatever

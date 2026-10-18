@@ -20,7 +20,7 @@ ALL="probe history-gate decline-reprompt script-revert import-dock
 get-latest-scene get-latest-script get-latest-modified get-latest-checked-out
 ignore-check-live file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
 special-names history-live shelves-live submit-behind-live resolve-live submit-verdict-live submit-cancel submit-slow-trigger-live
-watch-live allwrite-live allwrite-offer-live diff-limits-live plugin-prompt get-latest-cancel"
+watch-live allwrite-live allwrite-offer-live diff-limits-live plugin-prompt get-latest-cancel ssl-fingerprint-live"
 TESTS="${*:-$ALL}"
 
 if ! "$GODOT" --version >/dev/null 2>&1; then
@@ -132,6 +132,30 @@ printf '\n[editor_plugins]\n\nenabled=PackedStringArray("res://addons/p4godot/pl
 ) || { echo "FAIL: couldn't submit the test project"; exit 1; }
 echo "ok: test project submitted to $P4PORT as $P4USER ($(cd "$proj" && p4t -F %depotFile% files ./... | wc -l | tr -d ' ') files)"
 
+# A second p4d on an SSL port, trusted once and then given a new
+# certificate - what an admin replacing the certificate (or something
+# intercepting the connection) looks like to a client. Prints the port.
+stage_ssl_change() {
+	p4d_bin="$(sh tools/p4-test-server.sh fetch)" || return 1
+	sslroot="$work/ssl"
+	mkdir -p "$sslroot/db" "$sslroot/keys"
+	export P4SSLDIR="$sslroot/keys"
+	"$p4d_bin" -Gc >/dev/null 2>&1 || return 1
+	sslport="ssl:127.0.0.1:$((30000 + $$ % 9000))"
+	"$p4d_bin" -r "$sslroot/db" -p "$sslport" > "$sslroot/out" 2>&1 < /dev/null &
+	sslpid=$!
+	sleep 2
+	p4 -p "$sslport" trust -y >/dev/null 2>&1 || return 1
+	kill "$sslpid" 2>/dev/null; wait "$sslpid" 2>/dev/null
+	rm -f "$sslroot/keys/"*
+	"$p4d_bin" -Gc >/dev/null 2>&1 || return 1
+	"$p4d_bin" -r "$sslroot/db" -p "$sslport" > "$sslroot/out" 2>&1 < /dev/null &
+	sslpid=$!
+	sleep 2
+	unset P4SSLDIR
+	echo "$sslport"
+}
+
 # The second user, for staging a teammate's work.
 mate() { p4 -p "$P4PORT" -u mate -c mate-ws "$@"; }
 
@@ -147,6 +171,14 @@ stage_behind() {
 run() {
 	secs="$1"; shift
 	if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+	status=$?
+	# On Windows the console godot is a wrapper around the real editor, and
+	# timeout stops only the wrapper. Stop what is left of this run's editor
+	# - only processes started in this run's own folder, nothing else.
+	if [ "$status" = 124 ] && command -v wmic >/dev/null 2>&1; then
+		wmic process where "CommandLine like '%$(basename "$work")%' and Name like 'Godot%'" call terminate >/dev/null 2>&1
+	fi
+	return $status
 }
 
 # GUI=1 runs the editor in a real window, for the screenshot tests: each
@@ -194,6 +226,9 @@ for t in $TESTS; do
 			(cd "$proj" && p4t delete -k "addons/..." >/dev/null &&
 				p4t submit -d "Take the addon out of Perforce" >/dev/null) ||
 				{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; } ;;
+		ssl-fingerprint-live)
+			sslport="$(stage_ssl_change)" || { echo "FAIL: $t (staging)"; failed="$failed $t"; continue; }
+			arg="$arg=$sslport" ;;
 		# A download big enough to cancel part-way: 40 files of 3 MB, submitted
 		# and then synced away again.
 		get-latest-cancel)
@@ -239,6 +274,8 @@ for t in $TESTS; do
 	case "$t" in
 		history-gate|decline-reprompt|script-revert|import-dock)
 			(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1) ;;
+		ssl-fingerprint-live)
+			[ -n "${sslpid:-}" ] && kill "$sslpid" 2>/dev/null ;;
 		plugin-prompt)
 			(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1; p4t reconcile -a "addons/..." >/dev/null 2>&1 &&
 				p4t submit -d "Put the addon back" >/dev/null 2>&1) ;;

@@ -541,32 +541,8 @@ func _offer_connection_setup() -> void:
 			await _p4_exec_logged(["trust", "-i", fp])
 			continue
 		if status == "fingerprint changed":
-			var change := _fingerprint_change_in(_last_probe_text)
-			if String(change.new).is_empty():
-				await _show_alert("WARNING: this Perforce server's SSL fingerprint has CHANGED since " +
-						"this computer last connected, and P4Godot couldn't read the new one (see " +
-						"the P4 Log).\n\nThat can mean the server's certificate was replaced - or " +
-						"that something is intercepting the connection. Ask your server admin before " +
-						"trusting it (`p4 trust -f` in a terminal).")
+			if not await _handle_fingerprint_change():
 				break
-			var known := await _p4_exec(["trust", "-l"])
-			var old_fp := _trusted_fingerprint_for("" if known.output.is_empty() \
-					else String(known.output[0]), String(change.address))
-			var trust_new: bool = await _show_confirm_dialog(("WARNING: the SSL fingerprint of the " +
-					"Perforce server at %s has CHANGED since this computer last connected.\n\n" +
-					"Fingerprint you trusted before:\n%s\n\nFingerprint the server shows now:\n%s\n\n" +
-					"That happens when an admin replaces the server's certificate - and when " +
-					"something is intercepting the connection. Trust the new fingerprint only if " +
-					"your server admin confirms the change and the new fingerprint matches the one " +
-					"they gave you, character for character.") \
-					% [change.address, old_fp if not old_fp.is_empty() else "(not found)", change.new],
-					"Trust New Fingerprint", "Cancel")
-			if not trust_new:
-				break
-			# -f replaces the old entry; -i installs exactly the fingerprint shown.
-			# p4 installs any value it is given without checking it (measured), so
-			# the next pass's probe is what confirms it matches.
-			await _p4_exec_logged(["trust", "-f", "-i", String(change.new)])
 			continue
 		if status == "no server":
 			var prefill: String = await _suggest_port()
@@ -594,6 +570,39 @@ func _offer_connection_setup() -> void:
 	_update_conn_status()
 	if not _p4_available:
 		_log("Perforce is still not configured - press Refresh (the circular-arrow button) in the P4G dock to run setup again.")
+
+
+## The server's SSL fingerprint differs from the one this computer trusted:
+## warn, naming both, and install exactly the new one if the user says so.
+## Returns whether it was trusted.
+func _handle_fingerprint_change() -> bool:
+	var change := _fingerprint_change_in(_last_probe_text)
+	if String(change.new).is_empty():
+		await _show_alert("WARNING: this Perforce server's SSL fingerprint has CHANGED since " +
+				"this computer last connected, and P4Godot couldn't read the new one (see " +
+				"the P4 Log).\n\nThat can mean the server's certificate was replaced - or " +
+				"that something is intercepting the connection. Ask your server admin before " +
+				"trusting it (`p4 trust -f` in a terminal).")
+		return false
+	var known := await _p4_exec(["trust", "-l"])
+	var old_fp := _trusted_fingerprint_for("" if known.output.is_empty() \
+			else String(known.output[0]), String(change.address))
+	var trust_new: bool = await _show_confirm_dialog(("WARNING: the SSL fingerprint of the " +
+			"Perforce server at %s has CHANGED since this computer last connected.\n\n" +
+			"Fingerprint you trusted before:\n%s\n\nFingerprint the server shows now:\n%s\n\n" +
+			"That happens when an admin replaces the server's certificate - and when " +
+			"something is intercepting the connection. Trust the new fingerprint only if " +
+			"your server admin confirms the change and the new fingerprint matches the one " +
+			"they gave you, character for character.") \
+			% [change.address, old_fp if not old_fp.is_empty() else "(not found)", change.new],
+			"Trust New Fingerprint", "Cancel")
+	if not trust_new:
+		return false
+	# -f replaces the old entry; -i installs exactly the fingerprint shown.
+	# p4 installs any value it is given without checking it (measured), so
+	# the next pass's probe is what confirms it matches.
+	await _p4_exec_logged(["trust", "-f", "-i", String(change.new)])
+	return true
 
 
 ## Best guess for the server-address prompt: a stored override, else whatever

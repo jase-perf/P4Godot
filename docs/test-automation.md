@@ -59,7 +59,7 @@ written yet.
 | 26, 32 Mark for Add with ignore rules | Automated | `file-actions-live` |
 | 27 Expired password | Automated | `password-expired-live` |
 | 33 `.godot/` not ignored | Automated | `ignore-check-live` |
-| 38 Server certificate changed | Next | the test server would need an `ssl:` port and `p4d -Gc` |
+| 38 Server certificate changed | Automated | `ssl-fingerprint-live`: the runner trusts a second p4d on an `ssl:` port, then gives it a new certificate (`p4d -Gc`) |
 | 39 Diff of a big or binary file | Automated | `diff-limits-live` |
 | 40-41 History window | Automated | `history-live`; window in `gui-windows` |
 | 42-44 Shelving | Automated | `shelves-live`; Shelves window in `gui-windows` |
@@ -67,7 +67,7 @@ written yet.
 | 48-51, 53 Watcher and allwrite | Automated | `watch-live`, `allwrite-live` |
 | 52 Allwrite offer, once per workspace | Automated | `allwrite-offer-live` lets the startup offers run, including the project.godot one |
 
-Counted: 44 rows automated, 2 partly, 5 with screenshots only, 2 next.
+Counted: 45 rows automated, 2 partly, 5 with screenshots only, 1 next (23, a delta transfer, needs server configuration to research).
 None of the 53 needs a person in principle; the slowest to automate are 23
 (large files) and 38 (an SSL test server).
 
