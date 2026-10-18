@@ -55,7 +55,7 @@ var _progress_note_text: String = ""
 func _build_progress_window() -> void:
 	_progress_window = Window.new()
 	_progress_window.title = "Perforce"
-	_progress_window.size = Vector2i(560, 200)
+	_progress_window.size = Vector2i(Vector2(560, 200) * EditorInterface.get_editor_scale())
 	_progress_window.visible = false
 	_progress_window.unresizable = false
 	# Closing HIDES it. The transfer carries on, and the Log says so.
@@ -269,7 +269,10 @@ static func _transfer_summary(t: P4Progress) -> String:
 const DIFF_BG_DEL := Color(0.60, 0.14, 0.14, 0.42)
 const DIFF_BG_ADD := Color(0.16, 0.55, 0.22, 0.38)
 const DIFF_BG_FILL := Color(0.5, 0.5, 0.55, 0.10) # alignment filler rows
-const DIFF_GUTTER_COLS := 7 # "12345  " line-number prefix baked into each line
+## The line-number prefix baked into each line ("123456  "). Eight columns,
+## a multiple of the tab width, so a tab in the text still reaches the tab
+## stop the file was written for (seven made indents one column wide).
+const DIFF_GUTTER_COLS := 8
 const DIFF_CONTEXT_KEEP := 3 # context lines kept around each change when collapsed
 # Largest file shown side by side, either side. Past this the panes slow the
 # editor down and a line-by-line view stops being readable; P4V handles it.
@@ -306,8 +309,8 @@ class P4DiffHighlighter extends SyntaxHighlighter:
 ## span that actually differs is brightened. Repopulated and popped per diff.
 func _build_diff_window() -> void:
 	diff_window = Window.new()
-	diff_window.title = "P4 Diff"
-	diff_window.size = Vector2i(1160, 640)
+	diff_window.title = "P4Godot - Diff"
+	diff_window.size = Vector2i(Vector2(1160, 640) * EditorInterface.get_editor_scale())
 	diff_window.visible = false
 	diff_window.close_requested.connect(_on_diff_window_close_requested)
 
@@ -482,8 +485,11 @@ func _diff_path(res_path: String) -> void:
 		return
 	var new_text := f.get_as_text()
 	f.close()
-	_show_diff(old_text, new_text, text, "%s#have" % _diff_depot_path(text, res_path),
-			"%s (workspace)" % res_path, res_path)
+	_show_diff(old_text, new_text, text, DIFF_HAVE_LABEL, DIFF_WORKSPACE_LABEL, res_path)
+
+
+const DIFF_HAVE_LABEL := "The version you last downloaded"
+const DIFF_WORKSPACE_LABEL := "Your copy, on disk"
 
 
 ## Show two texts side by side, aligned by `unified` (p4's -du output for the
@@ -495,7 +501,7 @@ func _show_diff(old_text: String, new_text: String, unified: String,
 	diff_left_label.text = "  " + left_label
 	diff_right_label.text = "  " + right_label
 	_render_diff()
-	diff_window.title = "P4 Diff: %s" % title
+	diff_window.title = "P4Godot - Diff: %s" % _plain_paths(title)
 	diff_window.popup_centered()
 
 
@@ -922,7 +928,7 @@ func _populate_diff_panes(rows: Array) -> void:
 			_diff_change_blocks.append(i)
 		in_block = changed
 		if kind == "gap":
-			var marker := "       ... %d unchanged lines ..." % int(r.count)
+			var marker := "        ... %d unchanged lines ..." % int(r.count)
 			left_text += marker + "\n"
 			right_text += marker + "\n"
 			left_bg.append(DIFF_BG_FILL)
@@ -931,8 +937,8 @@ func _populate_diff_panes(rows: Array) -> void:
 			right_hl.line_spans[i] = [[0, marker.length(), right_hl.gutter_color]]
 			i += 1
 			continue
-		left_text += ("%5d  %s\n" % [r.old_line, r.left]) if int(r.old_line) > 0 else "\n"
-		right_text += ("%5d  %s\n" % [r.new_line, r.right]) if int(r.new_line) > 0 else "\n"
+		left_text += ("%6d  %s\n" % [r.old_line, r.left]) if int(r.old_line) > 0 else "\n"
+		right_text += ("%6d  %s\n" % [r.new_line, r.right]) if int(r.new_line) > 0 else "\n"
 		match kind:
 			"pair":
 				left_bg.append(DIFF_BG_DEL)

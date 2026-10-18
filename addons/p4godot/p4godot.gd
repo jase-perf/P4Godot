@@ -51,7 +51,7 @@ extends "p4godot_watch.gd"
 ## - project.godot writes and edits made OUTSIDE the editor are not covered
 ##   (use Reconcile for those). New files aren't auto-added either - Godot
 ##   emits no create signal, and the save handlers skip untracked files - so
-##   add them with the FileSystem dock's "P4: Mark for Add" or via Reconcile.
+##   add them with the FileSystem dock's "P4 > Mark for Add" or via Reconcile.
 ## - p4 commands run on a background worker thread (one at a time, in order),
 ##   so a slow or unreachable server no longer stalls the editor. Results are
 ##   cached per file per session as before. Two deliberate exceptions stay on

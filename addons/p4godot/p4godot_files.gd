@@ -883,7 +883,7 @@ func _scene_saved_probe(path: String) -> void:
 					"Your work is safe on your computer, but Perforce doesn't know about " +
 					"it, so it won't reach your team. Once whoever is using the file lets " +
 					"go of it, right-click the file in the FileSystem dock and choose " +
-					"'P4: Check Out' - or press \"Reconcile...\" in the P4G panel - so the " +
+					"'P4 > Check Out' - or press \"Reconcile...\" in the P4G panel - so the " +
 					"change joins your list of pending changes.") % [res_path, result.reason])
 		return
 
@@ -1234,7 +1234,7 @@ func _run_rescue_flow() -> void:
 	var picked: Dictionary = await _show_checkout_target_dialog(message, ok_text,
 			"Leave Unsaved", choices)
 	if not picked.ok:
-		_log("File(s) remain unsaved. Check them out (FileSystem dock 'P4: Check Out', or `p4 edit`) when you're ready.")
+		_log("File(s) remain unsaved. Check them out (FileSystem dock 'P4 > Check Out', or `p4 edit`) when you're ready.")
 		return
 
 	var succeeded: Array = []
@@ -1344,7 +1344,7 @@ func _on_resource_saved(res: Resource) -> void:
 		_show_alert(("Godot saved '%s', but Perforce wouldn't record the change - %s.\n\n" +
 				"Your work is safe on your computer, but Perforce doesn't know about it, " +
 				"so it won't reach your team. Once whoever is using the file lets go of " +
-				"it, right-click the file in the FileSystem dock and choose 'P4: Check " +
+				"it, right-click the file in the FileSystem dock and choose 'P4 > Check " +
 				"Out' - or press \"Reconcile...\" in the P4G panel - so the change joins " +
 				"your list of pending changes.") % [res_path, result.reason])
 
@@ -1400,7 +1400,7 @@ func _summarize_reconcile(preview: Array) -> Dictionary:
 		# reconcile's clientFile is the raw local path (only depotFile comes
 		# back escaped), which is what a reconcile argument wants.
 		var local := String(rec.get("clientFile", ""))
-		if local.is_empty():
+		if local.is_empty() or _is_godot_save_leftover(local):
 			continue
 		var res := _local_to_res(local)
 		var action := String(rec.get("action", ""))

@@ -1198,12 +1198,12 @@ func _run_cli_self_test_if_requested() -> void:
 					and (row.get_metadata(0) as Dictionary).get("type") == "detected"
 			if row != null:
 				_populate_context_menu(row.get_metadata(0))
-				checks["edit row menu"] = _selftest_menu_labels() == "Check Out | Show in File Manager | Diff vs Depot | History... | Revert My Change... |  | Refresh"
+				checks["edit row menu"] = _selftest_menu_labels() == "Check Out |  | Show in File Manager | Diff vs Depot | History... |  | Revert My Change... |  | Refresh"
 				_log("[selftest] edit row menu: %s" % _selftest_menu_labels())
 			_populate_context_menu({"type": "detected", "action": "delete", "local": outside, "res_path": outside})
-			checks["delete row menu"] = _selftest_menu_labels() == "Mark for Delete | History... | Revert My Change... |  | Refresh"
+			checks["delete row menu"] = _selftest_menu_labels() == "Mark for Delete |  | History... |  | Revert My Change... |  | Refresh"
 			_populate_context_menu({"type": "detected", "action": "move/add", "local": outside, "res_path": outside})
-			checks["moved-to row menu"] = _selftest_menu_labels() == "Record the Move | Show in File Manager |  | Refresh"
+			checks["moved-to row menu"] = _selftest_menu_labels() == "Record the Move |  | Show in File Manager |  | Refresh"
 
 			# Answers p4 2026.1 gave (copied 2026-10-16), and what is made of them.
 			var probe_text := ("//game/main/build/__p4godot_folder_probe__#1 - opened for add\n" +
@@ -1372,7 +1372,7 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] fs-menu: %s" % " | ".join(labels))
 			var ok := fs_files.size() == 2 and ("res://a.gd" in fs_files) \
 					and not ("res://sub/" in fs_files) and labels.size() == 7 \
-				and labels.has("P4: History...")
+				and labels.has("History...")
 			_log("[selftest] %s: fs-menu" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
@@ -2090,7 +2090,7 @@ func _run_cli_self_test_if_requested() -> void:
 			_populate_context_menu({"type": "file", "res_path": "res://" + names[1],
 					"change": "default", "unresolved": false})
 			var marks_ok: bool = marked == ["res://" + names[0]] \
-					and with_item.begins_with("Resolve... | Open") \
+					and with_item.begins_with("Resolve... |  | Open") \
 					and not _selftest_menu_labels().contains("Resolve")
 			_log("[selftest] panel marks only the file that needs resolving, and offers Resolve on it: %s" % marks_ok)
 			ok = ok and marks_ok
@@ -2186,7 +2186,7 @@ func _run_cli_self_test_if_requested() -> void:
 			diff_window.hide()
 			await _on_history_workspace_pressed()
 			var ws_ok: bool = diff_window.visible and added.call("five") \
-					and diff_right_label.text.contains("(workspace)")
+					and diff_right_label.text.contains(DIFF_WORKSPACE_LABEL)
 			_log("[selftest] diff: previous=%s move=%s across-move=%s workspace=%s" % [prev_ok, move_ok, across_ok, ws_ok])
 
 			# 4b. Who changed each line. b.txt is "one TWO three four five": "one"
@@ -2526,7 +2526,7 @@ func _run_cli_self_test_if_requested() -> void:
 					and not String(base_a.old).contains("mate5") and String(base_a.new).contains("mate5") \
 					and bool(base_new.ok) and String(base_new.left) == "(new file)" \
 					and not bool(base_lock.ok) and String(base_lock.reason).contains("binary") \
-					and bool(ws_a.ok) and String(ws_a.right).contains("(workspace)")
+					and bool(ws_a.ok) and String(ws_a.right) == DIFF_WORKSPACE_LABEL
 			# The window's own button, on the selected row.
 			var a_row: TreeItem = null
 			for item in _shelf_files_tree.get_root().get_children():
@@ -3792,7 +3792,7 @@ func _run_cli_self_test_if_requested() -> void:
 			var came_up_to_date: bool = not still_behind.names.has(path)
 			var refusal_reported: bool = report.contains("would not overwrite") \
 					and report.contains(path)
-			var resolve_reported: bool = report.contains("two versions combined") \
+			var resolve_reported: bool = report.contains("have to be combined") \
 					and report.contains(path)
 			var outcome := ""
 			var outcome_ok := false
@@ -4179,6 +4179,63 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: watch-live" % ("PASS" if ok else "FAIL"))
 			get_tree().quit()
 			return
+		if arg in ["--p4-selftest-gui-dock", "--p4-selftest-gui-dialogs", "--p4-selftest-gui-windows",
+				"--p4-selftest-gui-editor"]:
+			var which := arg.trim_prefix("--p4-selftest-")
+			var ok: bool = false
+			match which:
+				"gui-dock": ok = await _gui_test_dock()
+				"gui-dialogs": ok = await _gui_test_dialogs()
+				"gui-windows": ok = await _gui_test_windows()
+				"gui-editor": ok = await _gui_test_editor()
+			_log("[selftest] %s: %s" % ["PASS" if ok else "FAIL", which])
+			get_tree().quit()
+			return
+		if arg == "--p4-selftest-gui-spike":
+			# GUI (tools/run-live-tests.sh with GUI=1): can a test see what the
+			# user sees? Saves the editor, the dock's menu and a dialog.
+			_selftest_auto_answer = ""
+			var gd := ProjectSettings.globalize_path("res://main.gd")
+			await _p4_exec_logged(["edit", gd])
+			var fresh := ProjectSettings.globalize_path("res://notes_spike.txt")
+			var fw := FileAccess.open(fresh, FileAccess.WRITE)
+			fw.store_string("x\n")
+			fw.close()
+			await _p4_exec_logged(["add", fresh])
+			await _refresh_changelists()
+			await _gui_show_dock()
+			await _gui_frames(30)
+			await _gui_shot("editor")
+			_log("[selftest] step done: await _gui_shot('editor')")
+			var row := tree.get_root().get_first_child().get_first_child()
+			if row:
+				row.select(0)
+				_context_target = row.get_metadata(0)
+				_show_context_menu(_context_target)
+				_log("[selftest] step done: _show_context_menu(_context_target)")
+				await _gui_frames(5)
+				await _gui_shot("dock-menu", context_menu)
+				_log("[selftest] step done: await _gui_shot('dock-menu', context_menu)")
+				context_menu.hide()
+			_log("[selftest] menu hidden; showing a dialog")
+			_show_confirm_dialog("Submit 2 files from the default changelist?\n\n    main.gd\n    notes_spike.txt",
+					"Submit", "Cancel")
+			_log("[selftest] dialog requested")
+			await _gui_frames(5)
+			for w in get_tree().root.find_children("*", "Window", true, false):
+				var win := w as Window
+				if win.visible:
+					var t := (win as AcceptDialog).dialog_text.left(80) if win is AcceptDialog else ""
+					_log("[selftest] window %s title='%s' exclusive=%s text='%s'" % [win.get_class(), win.title, win.exclusive, t])
+			var dialog := await _gui_wait_dialog()
+			if dialog:
+				await _gui_shot("dialog", dialog)
+				_gui_press(dialog, false)
+			await _p4_exec_logged(["revert", gd, fresh])
+			DirAccess.remove_absolute(fresh)
+			_log("[selftest] PASS: gui-spike")
+			get_tree().quit()
+			return
 		if arg == "--p4-selftest-watch-time":
 			# Manual benchmark, not in any runner: time the watcher's first pass
 			# (every file checked) and the one after (cache hits) on whatever
@@ -4529,3 +4586,524 @@ func _selftest_wait_asked() -> void:
 	var deadline := Time.get_ticks_msec() + 20000
 	while _watch_asking and Time.get_ticks_msec() < deadline:
 		await get_tree().process_frame
+
+
+# ---------------------------------------------------------------------------
+# GUI tests: screenshots of the real editor (run with GUI=1)
+# ---------------------------------------------------------------------------
+
+func _gui_frames(n: int) -> void:
+	for i in n:
+		await get_tree().process_frame
+
+
+## Save a PNG of what the user sees into $P4GODOT_SHOTS: the editor's main
+## window, or `window` alone. A window drawn inside the editor (dialogs and
+## menus are, in GUI tests: see _gui_show_dock) is cut out of the main
+## window's picture, title bar and border included.
+func _gui_shot(name: String, window: Window = null) -> void:
+	var dir := OS.get_environment("P4GODOT_SHOTS")
+	if dir.is_empty():
+		_log("[selftest] (no P4GODOT_SHOTS: skipped screenshot %s)" % name)
+		return
+	await _gui_frames(3)
+	var main := EditorInterface.get_base_control().get_window()
+	var image: Image
+	if window == null or window == main:
+		image = main.get_texture().get_image()
+	elif window.is_embedded():
+		var full := main.get_texture().get_image()
+		var title := 0
+		if not window.borderless:
+			title = maxi(window.get_theme_constant("title_height"), int(32 * EditorInterface.get_editor_scale()))
+		var margin := 6
+		var rect := Rect2i(window.position - Vector2i(margin, title + margin),
+				window.size + Vector2i(margin * 2, title + margin * 2))
+		rect = rect.intersection(Rect2i(Vector2i.ZERO, full.get_size()))
+		image = full.get_region(rect)
+	else:
+		image = window.get_texture().get_image()
+	var path := dir.path_join(name + ".png")
+	image.save_png(path)
+	_log("[selftest] screenshot %s (%dx%d)" % [path, image.get_width(), image.get_height()])
+
+
+## Open the P4G panel: it sits in the bottom bar, collapsed. Godot 4.7 keeps
+## a toggle button named after the dock there.
+func _gui_show_dock() -> void:
+	var w := EditorInterface.get_base_control().get_window()
+	w.mode = Window.MODE_WINDOWED
+	w.size = Vector2i(1600, 900)
+	# Dialogs and menus drawn inside the editor window, not as windows of
+	# their own: a new native window stalled the editor's frame loop under
+	# test (measured), and inside, a screenshot shows them in context.
+	w.gui_embed_subwindows = true
+	# Godot's own startup dialogs (Load Errors) are not under test: note what
+	# they say, then close them so the plugin's dialogs are the only ones up.
+	for found in get_tree().root.find_children("*", "AcceptDialog", true, false):
+		var d := found as AcceptDialog
+		if d.visible:
+			var said := PackedStringArray()
+			for label in d.find_children("*", "RichTextLabel", true, false):
+				said.append((label as RichTextLabel).get_parsed_text().strip_edges())
+			_log("[selftest] closing Godot's '%s' dialog: %s %s" % [d.title, d.dialog_text, " ".join(said)])
+			d.hide()
+	if dock.is_visible_in_tree():
+		return
+	var chain := PackedStringArray()
+	var n: Node = dock
+	for i in 6:
+		n = n.get_parent()
+		if n == null:
+			break
+		chain.append("%s(%s)" % [n.get_class(), n.name])
+	_log("[selftest] dock parents: %s" % " < ".join(chain))
+	if dock.get_parent() is TabContainer:
+		var tc := dock.get_parent() as TabContainer
+		_log("[selftest] tab container: tabs=%d current=%d visible=%s" % [tc.get_tab_count(), tc.current_tab, tc.is_visible_in_tree()])
+	if has_method("make_bottom_panel_item_visible"):
+		call("make_bottom_panel_item_visible", dock)
+		await _gui_frames(5)
+		_log("[selftest] after make_bottom_panel_item_visible: %s" % dock.is_visible_in_tree())
+		if dock.is_visible_in_tree():
+			return
+	var button := _gui_find_button(EditorInterface.get_base_control(), "P4G")
+	if button:
+		if button.toggle_mode:
+			button.button_pressed = true
+		else:
+			button.pressed.emit()
+	else:
+		_log("[selftest] no P4G button in the bottom bar")
+
+
+func _gui_find_button(node: Node, text: String) -> Button:
+	for child in node.get_children():
+		if child is Button and (child as Button).text == text and (child as Button).is_visible_in_tree():
+			return child
+		var deeper := _gui_find_button(child, text)
+		if deeper:
+			return deeper
+	return null
+
+
+## The plugin's dialog on screen, once it appears (up to 5 s).
+func _gui_wait_dialog() -> AcceptDialog:
+	for i in 100:
+		await _gui_frames(3)
+		if i % 10 == 0:
+			_log("[selftest] waiting for a dialog, %d frames, msec %d, lock %s" % [i * 3, Time.get_ticks_msec(), _dialog_busy])
+		for found in get_tree().root.find_children("*", "AcceptDialog", true, false):
+			var d := found as AcceptDialog
+			if not d.visible:
+				continue
+			if d.title == "Load Errors":
+				# Godot's own, not under test: say what it said and close it.
+				var said := PackedStringArray()
+				for label in d.find_children("*", "RichTextLabel", true, false):
+					said.append((label as RichTextLabel).get_parsed_text().strip_edges())
+				_log("[selftest] closing Godot's Load Errors: %s" % " ".join(said))
+				d.hide()
+				continue
+			await _gui_frames(3)
+			return d
+	var shown := PackedStringArray()
+	for w in get_tree().root.find_children("*", "Window", true, false):
+		if (w as Window).visible:
+			shown.append("%s '%s'" % [w.get_class(), (w as Window).title])
+	_log("[selftest] no dialog appeared (dialog lock held: %s); visible windows: %s" % [
+			_dialog_busy, ", ".join(shown)])
+	return null
+
+
+## Answer a dialog as its buttons do: the plugin's dialogs resolve on the
+## dialog's own confirmed / canceled signals.
+func _gui_press(dialog: AcceptDialog, ok: bool) -> void:
+	if ok:
+		dialog.confirmed.emit()
+	else:
+		dialog.canceled.emit()
+
+
+# ---------------------------------------------------------------------------
+# GUI tour: every screen the plugin shows, with realistic data, saved as
+# screenshots for review (GUI=1 tools/run-live-tests.sh gui-dock gui-dialogs
+# gui-windows). Each returns whether its own checks held; the screenshots
+# are the real output.
+# ---------------------------------------------------------------------------
+
+## A workspace with something in every state the dock can show: the default
+## changelist (edit, add, an outside-project edit), a numbered changelist
+## with an edit, a delete and a shelf, and an untracked file the watcher
+## lists. Returns the paths it touched, for _gui_cleanup.
+func _gui_stage(tag: String) -> Dictionary:
+	var paths := {}
+	var gd := ProjectSettings.globalize_path("res://main.gd")
+	# Named per test: an earlier test submitted its own, which left them
+	# read-only.
+	var level := ProjectSettings.globalize_path("res://levels/%s_level_01.tscn" % tag)
+	var hero := ProjectSettings.globalize_path("res://art/%s_hero.png" % tag)
+	var notes := ProjectSettings.globalize_path("res://docs/design_notes.txt")
+	var art := _client_root.path_join("art/readme.txt")
+	DirAccess.make_dir_recursive_absolute(level.get_base_dir())
+	DirAccess.make_dir_recursive_absolute(hero.get_base_dir())
+	DirAccess.make_dir_recursive_absolute(notes.get_base_dir())
+	var scene := PackedScene.new()
+	var root := Node2D.new()
+	root.name = "Level01"
+	scene.pack(root)
+	ResourceSaver.save(scene, ProjectSettings.localize_path(level))
+	root.free()
+	var img := Image.create(16, 16, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.2, 0.6, 0.9))
+	img.save_png(hero)
+	for pair in [[notes, "Design notes\n"]]:
+		var fw := FileAccess.open(String(pair[0]), FileAccess.WRITE)
+		fw.store_string(String(pair[1]))
+		fw.close()
+	await _p4_exec_logged(["add", level, hero])
+	await _p4_exec_logged(["submit", "-d", "Level 1 and the hero sprite"])
+	await _p4_exec_logged(["edit", gd])
+	await _p4_exec_logged(["add", notes])
+	await _p4_exec_logged(["edit", art])
+	var cl := await _create_selftest_change("Lighting pass for level 1: warmer key light, softer shadows", "")
+	await _p4_exec_logged(["edit", "-c", cl, level])
+	await _p4_exec_logged(["delete", "-c", cl, hero])
+	await _p4_exec_logged(["shelve", "-c", cl])
+	paths.cl = cl
+	paths.files = [gd, level, hero, notes, art]
+	# Something the watcher lists, with automatic opening off.
+	var stray := ProjectSettings.globalize_path("res://art/concept_v2.png")
+	img.save_png(stray)
+	paths.stray = stray
+	detect_external_checkbox.set_pressed_no_signal(true)
+	auto_checkout_detected_checkbox.set_pressed_no_signal(false)
+	await _gui_frames(150)
+	await _selftest_watch_pass()
+	_rebuild_tree(await _query_pending_model())
+	return paths
+
+
+func _gui_cleanup(paths: Dictionary) -> void:
+	await _p4_exec_logged(["shelve", "-d", "-c", String(paths.cl)])
+	var revert: PackedStringArray = ["revert"]
+	revert.append_array(PackedStringArray(paths.files))
+	await _p4_exec_logged(revert)
+	await _p4_exec_logged(["change", "-d", String(paths.cl)])
+	DirAccess.remove_absolute(String(paths.stray))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path("res://docs/design_notes.txt"))
+
+
+## The tree row whose metadata matches every key in `want`, or null.
+func _gui_row(want: Dictionary) -> TreeItem:
+	var stack: Array = [tree.get_root()]
+	while not stack.is_empty():
+		var item: TreeItem = stack.pop_back()
+		if item == null:
+			continue
+		var meta: Variant = item.get_metadata(0)
+		if meta is Dictionary:
+			var all := true
+			for k in want:
+				if String((meta as Dictionary).get(k, "")) != String(want[k]):
+					all = false
+			if all:
+				return item
+		for child in item.get_children():
+			stack.append(child)
+	return null
+
+
+## Right-click a row the way the mouse would, then capture the menu.
+func _gui_shot_row_menu(name: String, row: TreeItem) -> void:
+	if row == null:
+		_log("[selftest] no row for %s" % name)
+		return
+	row.select(0)
+	tree.scroll_to_item(row)
+	await _gui_frames(2)
+	var rect := tree.get_item_area_rect(row, 0)
+	var at := Vector2i(tree.get_screen_position() + rect.position + Vector2(rect.size.x * 0.4, rect.size.y * 0.5))
+	_context_target = row.get_metadata(0)
+	_populate_context_menu(_context_target)
+	context_menu.reset_size()
+	context_menu.position = at
+	context_menu.popup()
+	await _gui_frames(4)
+	await _gui_shot(name + "-menu", context_menu)
+	await _gui_shot(name + "-in-context")
+	context_menu.hide()
+
+
+func _gui_test_dock() -> bool:
+	await _gui_show_dock()
+	var paths := await _gui_stage(OS.get_cmdline_user_args()[0].trim_prefix("--p4-selftest-gui-"))
+	await _gui_frames(10)
+	await _gui_shot("dock")
+	await _gui_shot_row_menu("dock-file", _gui_row({"type": "file", "action": "edit"}))
+	await _gui_shot_row_menu("dock-default-cl", _gui_row({"type": "cl", "change": "default"}))
+	await _gui_shot_row_menu("dock-numbered-cl", _gui_row({"type": "cl", "change": String(paths.cl)}))
+	await _gui_shot_row_menu("dock-shelf", _gui_row({"type": "shelf"}))
+	await _gui_shot_row_menu("dock-shelved-file", _gui_row({"type": "shelved_file"}))
+	await _gui_shot_row_menu("dock-detected", _gui_row({"type": "detected"}))
+	settings_menu.show_popup()
+	await _gui_frames(4)
+	await _gui_shot("dock-settings-menu", settings_menu.get_popup())
+	settings_menu.get_popup().hide()
+	# A narrow editor: the toolbar has to wrap rather than clip.
+	var w := EditorInterface.get_base_control().get_window()
+	w.size = Vector2i(1100, 800)
+	await _gui_frames(20)
+	await _gui_shot("dock-narrow")
+	w.size = Vector2i(1600, 900)
+	# Perforce unreachable.
+	_set_actions_enabled(false)
+	_rebuild_tree({"available": false, "changelists": []})
+	await _gui_frames(5)
+	await _gui_shot("dock-unavailable")
+	_set_actions_enabled(true)
+	await _gui_cleanup(paths)
+	return true
+
+
+## Start `flow` (not awaited), capture the dialog it shows as `name`, and
+## answer it. Returns the dialog's text.
+func _gui_capture(name: String, flow: Callable, ok: bool = false) -> String:
+	flow.call()
+	var dialog := await _gui_wait_dialog()
+	if dialog == null:
+		_log("[selftest] FAIL: %s showed no dialog" % name)
+		return ""
+	var text := dialog.dialog_text
+	await _gui_shot(name, dialog)
+	_gui_press(dialog, ok)
+	await _gui_frames(5)
+	return text
+
+
+func _gui_test_dialogs() -> bool:
+	await _gui_show_dock()
+	_selftest_auto_answer = ""
+	var paths := await _gui_stage(OS.get_cmdline_user_args()[0].trim_prefix("--p4-selftest-gui-"))
+	var cl := String(paths.cl)
+	var gd := ProjectSettings.globalize_path("res://main.gd")
+	await _gui_capture("dialog-new-changelist", func() -> void: _on_new_changelist_pressed())
+	await _gui_capture("dialog-submit-description", func() -> void: _submit_changelist("default", []))
+	await _gui_capture("dialog-revert", func() -> void: _revert_path("res://main.gd"))
+	await _gui_capture("dialog-reconcile", func() -> void: _reconcile_flow())
+	await _gui_capture("dialog-get-latest", func() -> void: _get_latest_flow())
+	await _gui_capture("dialog-shelve", func() -> void: _shelve_changelist(cl, false))
+	await _gui_capture("dialog-delete-shelf", func() -> void: _delete_shelf(cl, []))
+	await _gui_capture("dialog-revert-unchanged", func() -> void: _revert_unchanged_flow())
+	var choices := await _pending_changelist_choices()
+	await _gui_capture("dialog-checkout-target", func() -> void:
+		_show_checkout_target_dialog(("'levels/level_01.tscn' isn't checked out. Check it out so you " +
+				"can save your change?"), "Check Out", "Discard My Changes", choices))
+	var row := {"key": _path_key(gd), "local": gd, "mtime": 1, "checked": 1, "action": "edit"}
+	_watch_refused[_path_key(gd)] = "locked by mate@mate-ws"
+	await _gui_capture("dialog-lock", func() -> void: _ask_about_refused([row]))
+	_watch_refused.erase(_path_key(gd))
+	_watch_alerted.clear()
+	var many: Array = []
+	for i in 24:
+		many.append({"key": "k%d" % i, "local": _client_root.path_join("build/out_%02d.bin" % i), "mtime": 1,
+				"checked": 1, "action": "add" if i % 3 else "delete"})
+	await _gui_capture("dialog-bulk", func() -> void: _ask_about_bulk(many))
+	await _gui_capture("dialog-allwrite-offer", func() -> void: _show_allwrite_offer())
+	await _gui_capture("dialog-project-godot-offer", func() -> void: _show_project_godot_offer())
+	await _gui_capture("dialog-connection", func() -> void: _show_connection_dialog("ssl:perforce.example.com:1666", "dev"))
+	await _gui_capture("dialog-workspace", func() -> void:
+		_show_option_dialog("P4Godot - Connection Setup", ("Server: ssl:perforce.example.com:1666\nUser: dev\n\n" +
+				"Found a workspace whose root contains this project.\nWorkspace to use for this project " +
+				"(stored per-project, per-user):"), PackedStringArray(["dev-ws  (C:/Projects/Game)",
+				"dev-laptop  (D:/Work/Game)"]), 0, "Use This Workspace", CHANGE_SERVER_TEXT))
+	await _gui_capture("dialog-password", func() -> void:
+		_show_input_dialog("P4 Login", "Password for dev on ssl:perforce.example.com:1666:", "", false,
+				"Log In", true))
+	await _gui_capture("dialog-alert", func() -> void: _show_alert(NOT_CONNECTED_MESSAGE))
+	await _gui_capture("dialog-resolve", func() -> void:
+		_resolve_one({"res_path": "res://scripts/player.gd", "local": gd, "binary": false,
+				"special": false, "shelf": ""}, 1, 2))
+	await _gui_capture("dialog-resolve-binary", func() -> void:
+		_resolve_one({"res_path": "res://art/icon.svg", "local": gd, "binary": true,
+				"special": false, "shelf": ""}, 2, 2))
+	_selftest_auto_answer = "confirm"
+	await _gui_cleanup(paths)
+	return true
+
+
+func _gui_test_windows() -> bool:
+	await _gui_show_dock()
+	_selftest_auto_answer = ""
+	var paths := await _gui_stage(OS.get_cmdline_user_args()[0].trim_prefix("--p4-selftest-gui-"))
+	var gd := ProjectSettings.globalize_path("res://main.gd")
+	var fw := FileAccess.open(gd, FileAccess.WRITE)
+	fw.store_string("extends Node\n\n## The game's entry point.\n\n\nfunc _ready() -> void:\n\tprint(\"Hello from P4Godot\")\n\tset_process(true)\n")
+	fw.close()
+	_on_toggle_log_pressed()
+	await _gui_frames(10)
+	await _gui_shot("window-log", log_window)
+	_on_toggle_log_pressed()
+	_diff_path("res://main.gd")
+	await _gui_frames(60)
+	await _gui_shot("window-diff", diff_window)
+	diff_window.hide()
+	# History: a few submitted revisions of main.gd first.
+	for i in 3:
+		fw = FileAccess.open(gd, FileAccess.WRITE)
+		fw.store_string("extends Node\n# revision %d\n" % i)
+		fw.close()
+		await _p4_exec_logged(["submit", "-d", "Tune the main script, round %d\n\nSmaller steps this time." % (i + 1), gd])
+		await _p4_exec_logged(["edit", gd])
+	_show_history("res://main.gd")
+	await _gui_frames(60)
+	await _gui_shot("window-history", history_window)
+	history_window.hide()
+	_show_shelves(String(paths.cl))
+	await _gui_frames(90)
+	await _gui_shot("window-shelves", shelves_window)
+	shelves_window.hide()
+	# The transfer progress window, part-way through a submit.
+	var tracker := P4Progress.new()
+	tracker.total_files = 14
+	tracker.total_bytes = 52 * 1024 * 1024
+	_progress_begin("Submitting", "Submitting changelist #12: 14 files", tracker)
+	tracker.files_done = 5
+	tracker._bytes_done = 19 * 1024 * 1024
+	tracker.reporting = true
+	tracker.current = "art/environment/forest_tiles.png"
+	_progress_refresh()
+	await _gui_frames(20)
+	await _gui_shot("window-progress", _progress_window)
+	_progress_end()
+	_selftest_auto_answer = "confirm"
+	await _gui_cleanup(paths)
+	return true
+
+
+## Right-click at a point of the editor window (its own coordinates), as the
+## mouse would. Pushed into the window's viewport: the OS input queue only
+## reaches a window with focus, and a test's window may not have it.
+func _gui_right_click(at: Vector2) -> void:
+	var vp := EditorInterface.get_base_control().get_viewport()
+	await _gui_hover(at)
+	for pressed in [true, false]:
+		var e := InputEventMouseButton.new()
+		e.button_index = MOUSE_BUTTON_RIGHT
+		e.button_mask = MOUSE_BUTTON_MASK_RIGHT if pressed else 0
+		e.pressed = pressed
+		e.position = at
+		e.global_position = at
+		vp.push_input(e, true)
+		await _gui_frames(2)
+
+
+func _gui_hover(at: Vector2) -> void:
+	var e := InputEventMouseMotion.new()
+	e.position = at
+	e.global_position = at
+	EditorInterface.get_base_control().get_viewport().push_input(e, true)
+	await _gui_frames(2)
+
+
+## The newest visible PopupMenu in the editor (a context menu just opened).
+func _gui_open_menu() -> PopupMenu:
+	var found: PopupMenu = null
+	for p in get_tree().root.find_children("*", "PopupMenu", true, false):
+		if (p as PopupMenu).visible:
+			found = p
+	return found
+
+
+## Open the submenu whose item reads `label` in `menu`, by keyboard.
+func _gui_open_submenu(menu: PopupMenu, label: String) -> PopupMenu:
+	for i in menu.item_count:
+		if menu.get_item_text(i) == label:
+			menu.set_focused_item(i)
+			var key := InputEventKey.new()
+			key.keycode = KEY_RIGHT
+			key.pressed = true
+			menu.push_input(key)
+			await _gui_frames(4)
+			var sub := menu.get_item_submenu_node(i)
+			if sub and not sub.visible:
+				# Opened beside its item, where the mouse would have opened it.
+				sub.popup(Rect2i(menu.position + Vector2i(menu.size.x, 0), Vector2i.ZERO))
+				await _gui_frames(4)
+			return sub
+	return null
+
+
+func _gui_test_editor() -> bool:
+	await _gui_show_dock()
+	_selftest_auto_answer = ""
+	var ok := true
+	# The FileSystem dock: the P4 submenu on a file, and the hover tooltip.
+	var fs := EditorInterface.get_file_system_dock()
+	fs.navigate_to_path("res://scripts/player.gd")
+	await _gui_frames(20)
+	var fs_tree: Tree = null
+	for t in fs.find_children("*", "Tree", true, false):
+		if (t as Tree).is_visible_in_tree() and (t as Tree).get_selected() != null:
+			fs_tree = t
+	if fs_tree:
+		var item := fs_tree.get_selected()
+		var rect := fs_tree.get_item_area_rect(item, 0)
+		var at := fs_tree.get_global_rect().position + rect.position + rect.size * 0.5
+		# The P4 lines come from status a first hover fetches; the second shows it.
+		await _gui_hover(at)
+		await _gui_frames(90)
+		await _gui_hover(at + Vector2(0, 200))
+		await _gui_frames(30)
+		await _gui_hover(at)
+		await _gui_frames(120)
+		await _gui_shot("fs-tooltip")
+		await _gui_right_click(at)
+		await _gui_frames(5)
+		var menu := _gui_open_menu()
+		if menu:
+			var sub := await _gui_open_submenu(menu, "P4")
+			await _gui_shot("fs-menu")
+			if sub:
+				await _gui_shot("fs-p4-submenu", sub)
+			menu.hide()
+		else:
+			_log("[selftest] FAIL: no FileSystem dock menu opened")
+			ok = false
+	else:
+		_log("[selftest] FAIL: couldn't find the FileSystem tree")
+		ok = false
+	# The code editor: a script with changed lines (the marks), its P4
+	# submenu, and Who Changed This Line.
+	var script := load("res://scripts/player.gd") as Script
+	EditorInterface.set_main_screen_editor("Script")
+	EditorInterface.edit_script(script)
+	await _gui_frames(30)
+	var code := EditorInterface.get_script_editor().get_current_editor().get_base_editor() as CodeEdit
+	if code:
+		await _p4_exec_logged(["edit", ProjectSettings.globalize_path("res://scripts/player.gd")])
+		code.text = "extends Node\n\n## Moves the player.\n\nfunc _ready() -> void:\n\tset_process(true)\n\n\nfunc _process(delta: float) -> void:\n\tposition_changed(delta)\n"
+		code.text_changed.emit()
+		await _gui_frames(60)
+		await _gui_shot("code-marks")
+		var line_rect := code.get_rect_at_line_column(4, 2)
+		var at := code.get_global_rect().position + Vector2(line_rect.position) + Vector2(4, 4)
+		code.set_caret_line(4)
+		await _gui_right_click(at)
+		await _gui_frames(5)
+		var menu := _gui_open_menu()
+		if menu:
+			var sub := await _gui_open_submenu(menu, "P4")
+			await _gui_shot("code-menu")
+			if sub:
+				await _gui_shot("code-p4-submenu", sub)
+			menu.hide()
+		await _gui_capture("dialog-who-changed", func() -> void:
+			_show_who_changed_line("res://scripts/player.gd", 1, code.text, true))
+		code.text = load("res://scripts/player.gd").source_code
+		await _p4_exec_logged(["revert", ProjectSettings.globalize_path("res://scripts/player.gd")])
+	else:
+		_log("[selftest] FAIL: no code editor")
+		ok = false
+	_selftest_auto_answer = "confirm"
+	return ok

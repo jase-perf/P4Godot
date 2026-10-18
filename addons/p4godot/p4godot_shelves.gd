@@ -243,7 +243,7 @@ func _shelve_changelist(change: String, revert_after: bool, preset_desc: String 
 				"without submitting them, so a teammate can review them or you can pick them up later."
 	else:
 		text = ("Update the shelf of %s?\n\nThe shelf becomes exactly these %d file%s, as they are " +
-				"on disk now:\n\n%s\nA shelved file that is no longer open here leaves the shelf.") % [
+				"on disk now:\n\n%s\n\nA shelved file that is no longer open here leaves the shelf.") % [
 				what, files.size(), "" if files.size() == 1 else "s", _file_listing(labels)]
 	if change == "default":
 		text += "\n\nPerforce only shelves numbered changelists, so these files move to a new one first."
@@ -676,11 +676,10 @@ func _shelf_workspace_diff(change: String, file: Dictionary) -> Dictionary:
 	var new_lines := _split_lines(new_text)
 	if old_lines == new_lines:
 		return fail.call("'%s' on your computer is identical to the shelved version." % file_name)
-	var res := _local_to_res(local)
 	return {"ok": true, "reason": "", "old": old_text, "new": new_text,
 			"unified": _line_diff_unified(old_lines, new_lines),
-			"left": "%s  (shelved in #%s)" % [file.depot, change],
-			"right": "%s (workspace)" % (res if not res.is_empty() else local)}
+			"left": "Shelved in changelist #%s" % change,
+			"right": DIFF_WORKSPACE_LABEL}
 
 
 func _show_shelf_diff(data: Dictionary, title: String) -> void:
@@ -719,8 +718,8 @@ func _diff_shelved_row(meta: Dictionary, vs_workspace: bool) -> void:
 
 func _build_shelves_window() -> void:
 	shelves_window = Window.new()
-	shelves_window.title = "P4 Shelves"
-	shelves_window.size = Vector2i(1000, 640)
+	shelves_window.title = "P4Godot - Shelves"
+	shelves_window.size = Vector2i(Vector2(1000, 640) * EditorInterface.get_editor_scale())
 	shelves_window.visible = false
 	shelves_window.close_requested.connect(func() -> void: shelves_window.hide())
 
@@ -767,13 +766,13 @@ func _build_shelves_window() -> void:
 	_shelves_tree.select_mode = Tree.SELECT_ROW
 	_shelves_tree.custom_minimum_size = Vector2(0, 180)
 	var titles := ["Change", "User", "Workspace", "Date", "Description"]
-	var widths := [80, 110, 150, 130, 0]
+	var widths := [80, 110, 150, 150, 0]
 	for c in titles.size():
 		_shelves_tree.set_column_title(c, titles[c])
 		_shelves_tree.set_column_title_alignment(c, HORIZONTAL_ALIGNMENT_LEFT)
 		if widths[c] > 0:
 			_shelves_tree.set_column_expand(c, false)
-			_shelves_tree.set_column_custom_minimum_width(c, widths[c])
+			_shelves_tree.set_column_custom_minimum_width(c, int(widths[c] * EditorInterface.get_editor_scale()))
 	_shelves_tree.item_selected.connect(func() -> void: _on_shelf_selected())
 	split.add_child(_shelves_tree)
 
@@ -791,7 +790,7 @@ func _build_shelves_window() -> void:
 	_shelf_files_tree.set_column_title(0, "Shelved file")
 	_shelf_files_tree.set_column_title(1, "Action")
 	_shelf_files_tree.set_column_expand(1, false)
-	_shelf_files_tree.set_column_custom_minimum_width(1, 100)
+	_shelf_files_tree.set_column_custom_minimum_width(1, int(100 * EditorInterface.get_editor_scale()))
 	_shelf_files_tree.multi_selected.connect(func(_item: TreeItem, _col: int, _sel: bool) -> void:
 		_update_shelf_buttons.call_deferred())
 	_shelf_files_tree.item_activated.connect(_on_shelf_diff_pressed)

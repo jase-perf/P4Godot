@@ -140,7 +140,7 @@ func _add_file_submenu(menu: EditorContextMenuPlugin, key: String, title: String
 		sub.add_separator()
 	var actions := _fs_context_actions()
 	for i in actions.size():
-		sub.add_item(String(actions[i].label).trim_prefix("P4: "), i)
+		_menu_add(sub, String(actions[i].icon), String(actions[i].label), i)
 	_slot_submenus[key] = sub
 	_slot_targets[key] = {"res": res_path, "line": line,
 			"code": weakref(code) if code != null else null}
@@ -327,13 +327,13 @@ func _draw_gutter_line(line: int, _gutter: int, area: Rect2, code: CodeEdit) -> 
 	var marks: Dictionary = code.get_meta("p4_gutter_marks", {})
 	match String(marks.get(line, "")):
 		"added":
-			code.draw_rect(Rect2(area.position.x, area.position.y, GUTTER_WIDTH - 1, area.size.y), ACTION_ADD_COLOR)
+			code.draw_rect(Rect2(area.position.x, area.position.y, GUTTER_WIDTH - 1, area.size.y), _action_color("add"))
 		"changed":
-			code.draw_rect(Rect2(area.position.x, area.position.y, GUTTER_WIDTH - 1, area.size.y), ACTION_EDIT_COLOR)
+			code.draw_rect(Rect2(area.position.x, area.position.y, GUTTER_WIDTH - 1, area.size.y), _action_color("edit"))
 		"deleted":
-			code.draw_rect(Rect2(area.position.x, area.position.y - 1, area.size.x, 2), ACTION_DELETE_COLOR)
+			code.draw_rect(Rect2(area.position.x, area.position.y - 1, area.size.x, 2), _action_color("delete"))
 		"deleted_end":
-			code.draw_rect(Rect2(area.position.x, area.end.y - 1, area.size.x, 2), ACTION_DELETE_COLOR)
+			code.draw_rect(Rect2(area.position.x, area.end.y - 1, area.size.x, 2), _action_color("delete"))
 
 
 ## A refresh follows syncs, submits and reverts, any of which can change the

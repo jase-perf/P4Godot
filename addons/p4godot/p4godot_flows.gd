@@ -144,7 +144,7 @@ func _get_latest_body() -> String:
 		if FileAccess.file_exists(String(local)):
 			preexisting[_path_key(String(local))] = true
 	var started_unix := int(Time.get_unix_time_from_system())
-	_progress_begin("Get Latest", "Downloading %d file(s) from Perforce" % tracker.total_files,
+	_progress_begin("P4Godot - Get Latest", "Downloading %d file(s) from Perforce" % tracker.total_files,
 			tracker)
 	var synced: Dictionary = await _safe_sync([_project_scope()], tracker)
 	if _shutting_down:
@@ -803,7 +803,7 @@ func _resolve_one(file: Dictionary, position: int, total: int) -> String:
 					"other is lost from the newest revision. Talk to whoever made the other " +
 					"change before you choose.")
 		var pick: Dictionary = await _show_option_dialog("Resolve (%d of %d)" % [position, total],
-				message, options, 0, "OK")
+				message, options, 0, "Continue", "", "Stop Here")
 		if not pick.ok:
 			return "stop"
 		var mode := String(modes[int(pick.index)])
@@ -1208,7 +1208,7 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 			return
 
 	var tracker := _submit_tracker(files)
-	_progress_begin("Submitting to Perforce", "Submitting changelist %s" % number, tracker)
+	_progress_begin("P4Godot - Submit", "Submitting changelist %s" % number, tracker)
 	var result: Dictionary = await _p4_exec_streamed(["submit", "-c", number], tracker)
 	var cancelled: bool = bool(result.get("cancelled", false))
 	# What p4 printed and how it exited are not the outcome. A submit whose
@@ -1495,7 +1495,7 @@ func _submit_outcome_text(outcome: String, number: String, final: String, said: 
 			return ("Perforce didn't accept your files:\n\n%s\n\nNothing was sent, and your " +
 					"work is untouched. The usual cause is that a teammate changed one of the " +
 					"same files first, so you need their version before you can send yours: " +
-					"right-click the file in the P4G panel and choose \"Sync This File\", then " +
+					"right-click the file in the P4G panel and choose \"Get Latest Version\", then " +
 					"right-click it again and choose \"Resolve...\" to combine their changes " +
 					"with yours, and submit again.\n\nYour files are in changelist %s in the P4G panel, with " +
 					"your description. Submit it from there once the problem is sorted out.") \
@@ -1580,10 +1580,10 @@ func _sync_path(res_path: String, revision: String = "") -> bool:
 	var refused: Array = notes.modified + notes.clobbered
 	if not refused.is_empty():
 		var next_step := ("Check it out (right-click it in the FileSystem dock and choose " +
-				"\"P4: Check Out\"), then sync it again - Perforce will then ask you to combine " +
+				"\"P4 > Check Out\"), then sync it again - Perforce will then ask you to combine " +
 				"the two versions.") if revision.is_empty() else ("To go back to the older " +
 				"version, first throw your change away (right-click the file and choose " +
-				"\"P4: Revert...\"), or check it out and submit it.")
+				"\"P4 > Revert...\"), or check it out and submit it.")
 		await _show_alert(("Perforce didn't download %s of '%s'.\n\nThe file " +
 				"is changed on your disk but not checked out, so Perforce left your version " +
 				"alone instead of throwing it away. %s") % [which, res_path, next_step])

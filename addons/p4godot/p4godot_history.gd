@@ -336,8 +336,8 @@ static func _diff2_identical(text: String) -> bool:
 
 func _build_history_window() -> void:
 	history_window = Window.new()
-	history_window.title = "P4 History"
-	history_window.size = Vector2i(980, 600)
+	history_window.title = "P4Godot - History"
+	history_window.size = Vector2i(Vector2(980, 600) * EditorInterface.get_editor_scale())
 	history_window.visible = false
 	history_window.close_requested.connect(func() -> void: history_window.hide())
 
@@ -361,13 +361,13 @@ func _build_history_window() -> void:
 	_history_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_history_tree.custom_minimum_size = Vector2(0, 220)
 	var titles := ["Revision", "Change", "Date", "User", "Action", "Description"]
-	var widths := [130, 70, 130, 110, 90, 0]
+	var widths := [130, 70, 150, 110, 90, 0]
 	for c in titles.size():
 		_history_tree.set_column_title(c, titles[c])
 		_history_tree.set_column_title_alignment(c, HORIZONTAL_ALIGNMENT_LEFT)
 		if widths[c] > 0:
 			_history_tree.set_column_expand(c, false)
-			_history_tree.set_column_custom_minimum_width(c, widths[c])
+			_history_tree.set_column_custom_minimum_width(c, int(widths[c] * EditorInterface.get_editor_scale()))
 	_history_tree.multi_selected.connect(func(_item: TreeItem, _col: int, _sel: bool) -> void:
 		_update_history_buttons.call_deferred())
 	_history_tree.item_activated.connect(_on_history_diff_pressed)
@@ -441,7 +441,7 @@ func _show_history(res_path: String, select_change: int = 0) -> void:
 	_history_have_rev = 0 if not renamed_from.is_empty() else int(stat.get("haveRev", "0"))
 	_history_select_change = select_change
 	_populate_history()
-	history_window.title = "P4 History: %s" % res_path
+	history_window.title = "P4Godot - History: %s" % _plain_paths(res_path)
 	history_window.popup_centered()
 
 
@@ -651,7 +651,7 @@ func _diff_revision_vs_workspace(res_path: String, rev: Dictionary) -> void:
 		await _show_alert("Godot couldn't download revision #%d of '%s'. Press \"Log\" in the P4G panel to see what Perforce said." % [rev.rev, res_path])
 		return
 	_show_diff("" if old.output.is_empty() else String(old.output[0]), new_text, text,
-			_history_rev_label(rev), "%s (workspace)" % res_path, res_path)
+			_history_rev_label(rev), DIFF_WORKSPACE_LABEL, res_path)
 
 
 ## Put revision `rev` of res_path on disk in place of the one there (`p4 sync

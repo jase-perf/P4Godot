@@ -178,7 +178,7 @@ Tracked files are read-only, so an installer can't overwrite them. Check the
 folder out first, whichever way you install:
 
 1. **Check out** `addons/p4godot/` — right-click it in the FileSystem dock →
-   **P4: Check Out**, or `p4 edit addons/p4godot/...`.
+   **P4 → Check Out**, or `p4 edit addons/p4godot/...`.
 2. **Install the new version**, from the asset store or by extracting the zip
    over the folder.
 3. **Reconcile.** A new version can add or remove files, which a checkout
@@ -221,7 +221,7 @@ It also tells you about the two things it can't simply download:
 
 It covers the Godot project, not the whole workspace, because a workspace
 often holds more than one project. Single files still have right-click →
-**P4: Get Latest (Sync)**.
+**P4 → Get Latest Version**.
 
 ### Claiming files as you edit them
 
@@ -278,7 +278,7 @@ flow opens at startup and asks only for what's missing:
   Server or User...** instead of picking.
 
 To change any of this later, open the settings menu in the P4G toolbar and
-choose **Connection settings...**. It asks for the server and user, then the
+choose **Connection Settings...**. It asks for the server and user, then the
 workspace. Emptying a box goes back to your normal Perforce settings.
 
 Before it asks anything, P4Godot uses the Perforce configuration you already
@@ -343,7 +343,7 @@ unknown, with what to do next.
 
 ### A file's history
 
-Right-click a file → **P4: History...** (in the FileSystem dock or the P4G
+Right-click a file → **P4 → History...** (in the FileSystem dock or the P4G
 panel) lists every submitted revision: who, when, which changelist, and the
 whole description. It follows the file back through moves and renames, so a
 file renamed last month still shows its earlier revisions under the old name.
@@ -420,9 +420,10 @@ first.
 
 ### Right-click actions in Godot's file browser
 
-- **Right-click P4 actions** on any file (not folders): **P4: Check Out**,
-  **P4: Mark for Add**, **P4: Get Latest (Sync)**, **P4: Diff vs Depot**,
-  **P4: History...**, **P4: Revert...**, and **P4: Show Status in Log**. Checking out an imported
+- **Right-click P4 actions** on any file (not folders), in a **P4**
+  submenu: **Check Out**, **Mark for Add**, **Diff vs Depot**,
+  **History...**, **Get Latest Version**, **Revert...**, and **Show Status
+  in Log**. Checking out an imported
   asset also checks out its `.import` file, which holds its import settings.
   The menu is hidden while Perforce isn't connected.
 - **Hover tooltips** show each file's Perforce status: the revision you have
@@ -437,7 +438,8 @@ first.
   move for all of them. A rename that only changes capital letters
   (`Hero.png` → `hero.png`) can't be recorded on a server that ignores case;
   P4Godot says so and explains the two-step way round. These actions prompt
-  by default, or apply silently with the "Auto add/edit/delete" setting.
+  by default, or apply silently with the "Check out, delete and move without
+  asking" setting.
 
 ### P4 in the editor's other menus
 
@@ -451,8 +453,8 @@ The same actions are on a **P4** submenu wherever a file is in front of you:
   **Show in History** opens the file's history at that change. It follows the
   file back through renames. A line you changed yourself and haven't
   submitted is called yours.
-- **The scene tree**: right-click a node → **P4: enemy.tscn** and
-  **P4: enemy.gd** act on the scene the node is an instance of and the script
+- **The scene tree**: right-click a node → **P4 → enemy.tscn** and
+  **P4 → enemy.gd** act on the scene the node is an instance of and the script
   it has.
 
 **Changed lines are marked in the code editor.** A thin bar beside the line
@@ -577,24 +579,29 @@ queries.
 ## Settings
 
 The settings button on the right of the P4G panel toolbar, next to **Log**
-(tooltip "P4Godot settings"), holds these settings. They are stored per
-project and per user, and never written into project files.
+(tooltip "P4Godot settings"), holds these settings, grouped as below. They
+are stored per project and per user, and never written into project files,
+except **Leave workspace files writable**, which is the workspace's own.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Checkout on edit | on | Offer to check out a file the moment it is first modified. |
-| Checkout on save | on | Check files out just before Godot writes them, and take care of locked files around saves. Leave this on — turning it off means saves can fail. See [Why files are locked](#why-files-are-locked-until-you-check-them-out) and [Turning "Checkout on save" off](#turning-checkout-on-save-off). |
-| Auto add/edit/delete | off | Record edits, deletes, and moves you make in Godot (the FileSystem dock, the editor) silently, with no confirmation dialogs. Changes made in other programs follow **Check out changed files automatically** instead. |
+| **Editing in Godot** | | |
+| Check out on edit | on | Offer to check out a file the moment it is first modified. |
+| Check out on save | on | Check files out just before Godot writes them, and take care of locked files around saves. Leave this on — turning it off means saves can fail. See [Why files are locked](#why-files-are-locked-until-you-check-them-out) and [Turning "Check out on save" off](#turning-check-out-on-save-off). |
+| Check out, delete and move without asking | off | Record edits, deletes, and moves you make in Godot (the FileSystem dock, the editor) silently, with no confirmation dialogs. Changes made in other programs follow **Check out changed files automatically** instead. |
+| **Other programs** | | |
 | Watch the workspace for changes | on | Look for files changed by any program, anywhere in the workspace, when Godot regains focus and every half minute or so (see [files you edited elsewhere](#files-you-edited-in-photoshop-blender-or-anywhere-else)). |
 | Check out changed files automatically | on | Open what the watcher finds in Perforce without asking: edits, new files, deleted files and renames. When off, they're listed under **Changed, not checked out** in the P4G panel, to open one by one. |
+| **Workspace** | | |
 | Leave workspace files writable | the workspace's own setting | Switch the workspace between leaving files writable (`allwrite`) and keeping them read-only until checked out (see [Leaving files writable](#leaving-files-writable)). This one changes the workspace on the server, so it applies everywhere you use it. |
+| **Troubleshooting** | | |
 | Verbose log | off | Also log the commands that only ask questions and change nothing (`fstat`, `opened`, `where`, `changes`). |
 
 One setting lives in **Editor Settings → Perforce** because it applies to
 every project: **Executable Path**, the full path to `p4` if P4Godot can't
 find it on its own.
 
-### Turning "Checkout on save" off
+### Turning "Check out on save" off
 
 On Windows, saving a scene to a file you haven't checked out fails, and
 P4Godot asks what you want to do. Saving a script shows Godot's own error
@@ -616,7 +623,7 @@ contents really changed, P4Godot checks it out afterwards.
 - **New files aren't added the moment you create them**, because Godot
   doesn't announce them. The watcher lists them under **Changed, not checked
   out** within half a minute; to add one straight away, use right-click →
-  **P4: Mark for Add**, or Reconcile.
+  **P4 → Mark for Add**, or Reconcile.
 - **The watcher trusts what Perforce last confirmed.** A Get Latest that
   changes Perforce's records without touching the files (`p4 sync -k`, or
   P4V's "Update Have List Only") isn't noticed; press **Reconcile** after
@@ -682,16 +689,16 @@ contents really changed, P4Godot checks it out afterwards.
   Dock don't see your shell's `PATH`. If your copy is somewhere else again, set
   **Editor Settings → Perforce → Executable Path** to its full path.
 - **Wrong workspace, server, or user.** Open the settings menu in the P4G
-  toolbar and choose **Connection settings...**. Clicking the connection
+  toolbar and choose **Connection Settings...**. Clicking the connection
   status (it shows `user @ workspace`) goes straight to the workspace list.
   The choice is stored per project. If you'd rather use a `P4CONFIG` file in the workspace root, it
   works as long as you haven't picked a workspace in P4Godot's setup for this
   project.
 - **A Load Error writing `project.godot` when the project opens.** Godot
-  sometimes rewrites `project.godot` at startup (version stamps, plugin
-  state), which fails while the file is read-only. Give it the
-  always-writable filetype once with
-  `p4 edit -t text+w project.godot`, then submit. To make that the default for
+  4.7 writes `project.godot` every time the editor starts, changed or not,
+  which fails while the file is read-only. P4Godot offers once to fix it.
+  To do it yourself, give the file the always-writable filetype with
+  `p4 edit -t +w project.godot`, then submit. To make that the default for
   new projects, see
   [filetypes for art and `project.godot`](https://github.com/jase-perf/P4Godot/blob/main/docs/first-time-setup.md#4-in-a-terminal-lock-art-files).
 - **Something else.** Turn on **Verbose log** in the settings menu and

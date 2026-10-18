@@ -4,6 +4,37 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **A design pass, from screenshots of every screen** (a new GUI test mode
+  runs the plugin in a real editor window and captures the panel, menus,
+  dialogs and windows):
+  - Dialogs keep a reading width and wrap their text, instead of stretching
+    across the screen; they're titled "P4Godot" and fit their height.
+  - Paths in dialogs read as they do in the P4G panel (`scenes/main.tscn`,
+    not `res://scenes/main.tscn`).
+  - Action colours come from the editor theme, so they stay readable in
+    light themes; "delete" was hard to read in the Shelves window.
+  - The settings menu is grouped (Editing in Godot, Other programs,
+    Workspace, Troubleshooting) and spells "check out" one way.
+  - Right-click menus in the P4G panel have the editor's icons and keep
+    Revert apart from the rest; "Sync This File" is now "Get Latest
+    Version". The FileSystem dock's Perforce actions are in one **P4**
+    submenu, as on script tabs and in the code editor.
+  - When Perforce isn't reachable, the panel says so and offers **Set Up
+    Connection...**.
+  - The diff window keeps a file's indentation (tabs were one column wide)
+    and labels its sides "The version you last downloaded" and "Your copy,
+    on disk".
+  - The Log wraps long lines, uses a monospace font, and has **Copy All**;
+    read-only commands such as `describe` no longer fill it.
+  - Date columns in the History and Shelves windows no longer cut off, and
+    windows scale with the editor.
+  - Godot's own leftover save files (`project.godot4667122.tmp`) are no
+    longer offered for adding.
+- **project.godot can be made always writable in one click.** Godot 4.7
+  writes `project.godot` at every editor start (measured), which fails with
+  "Load Errors" in a read-only workspace. P4Godot offers once to check it
+  out with the `+w` filetype.
+
 - **P4Godot watches your whole workspace for changes made by any program**,
   including art folders beside the Godot project, and opens them in Perforce
   without asking: edits, new files, deleted files (only ones it saw on disk

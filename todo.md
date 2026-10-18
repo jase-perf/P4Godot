@@ -148,6 +148,12 @@ A Perforce colleague's C++ GDExtension design covers the P4 side this plugin is 
 - [x] (0.14.1, `_line_names_file` + `dismiss-dialog` selftest with a negative control) Error-dialog dismissal matched by basename substring, so `level.tscn` also covered `sublevel.tscn` and could hide a real failure. Now matches the full res:// or OS path, falling back to a name-boundary match on the bare file name.
 - [x] (0.14.0) Import dock: the Reimport button's button_down arms the reimport guard before the dock saves `.import` settings. Import groups are still uncovered (Godot never reports group members to plugins).
 
+## From the GUI tour (2026-10-17)
+
+- [ ] The FileSystem dock's hover tooltip showed only Godot's plain file name in the GUI tour, even on a second hover, where the README promises Perforce status (`_on_tooltip_for_path`, EditorResourceTooltipPlugin). Check by hand whether it works with a real mouse; if not, find out which hovers Godot 4.7 hands to tooltip plugins.
+- [x] Godot 4.7 writes project.godot on every windowed editor start (measured, with and without P4Godot), which shows "Load Errors" when the file is read-only. P4Godot now offers once to give it the +w filetype; README troubleshooting says so.
+- [ ] A plugin dialog opened while Godot's own exclusive dialog (Load Errors) is up: both showed in GUI mode, but whether the plugin's sits behind Godot's on a real desktop wasn't checked.
+
 ## Allwrite workspaces + change detection (Godot) — built 2026-10-15 in `p4godot_watch.gd`
 
 Goal: make `allwrite` workspaces the smooth path. Godot rewrites files it didn't change (every `.import` on each reimport, re-saved scenes), which errors in read-only workspaces. Detect edits from any tool, including external editors, and open them in Perforce after the fact.

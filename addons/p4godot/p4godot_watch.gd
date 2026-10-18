@@ -777,6 +777,8 @@ static func _walk_tree(root: String, out: Dictionary, cap: int, abort: Array, sk
 		d.include_hidden = true
 		for f in d.get_files():
 			var p := dir + "/" + f
+			if _is_godot_save_leftover(p):
+				continue
 			out[_path_key(p)] = [p, FileAccess.get_modified_time(p)]
 			if out.size() >= cap:
 				return
@@ -1332,6 +1334,11 @@ static func _spec_with_allwrite(spec: String, on: bool) -> String:
 func _offer_allwrite_once() -> void:
 	if not await _ensure_identity() or _selftest_mode:
 		return # Self-tests answer dialogs on their own; this one changes the workspace.
+	await _offer_allwrite_inner()
+	await _offer_project_godot_writable()
+
+
+func _offer_allwrite_inner() -> void:
 	var settings := EditorInterface.get_editor_settings()
 	var asked: Array = settings.get_project_metadata(SETTINGS_SECTION, "allwrite_asked", [])
 	var which := "%s|%s" % [_p4_port, _p4_client]
@@ -1345,7 +1352,50 @@ func _offer_allwrite_once() -> void:
 	var words := await _read_client_options()
 	if words.is_empty() or "allwrite" in words or epoch != _watch_epoch:
 		return
-	var yes: bool = await _show_confirm_dialog(("Your Perforce workspace keeps files read-only " +
+	var yes := await _show_allwrite_offer()
+	if yes and epoch == _watch_epoch:
+		await _switch_allwrite(true, false)
+
+
+## Godot 4.7's editor writes project.godot every time it starts with a
+## window, changed or not - measured: a read-only project.godot failed to
+## write on every windowed start, with this plugin enabled and without it -
+## and shows "Load Errors" when it can't. In a workspace that keeps files
+## read-only, the fix is the always-writable filetype, which the whole team
+## gets once it's submitted. Offered once per project.
+func _offer_project_godot_writable() -> void:
+	if _client_allwrite == true or _selftest_mode or _shutting_down:
+		return
+	var settings := EditorInterface.get_editor_settings()
+	if settings.get_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", false):
+		return
+	var rec := await _fetch_fstat_record("res://project.godot")
+	if rec.is_empty() or not rec.has("headType") or rec.has("action") \
+			or _type_is_writable(String(rec.headType)):
+		return # Not in Perforce, already checked out, or already writable.
+	settings.set_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", true)
+	if not await _show_project_godot_offer():
+		return
+	var local := ProjectSettings.globalize_path("res://project.godot")
+	if await _p4_ok(["edit", "-t", "+w", local]):
+		_log(("project.godot is checked out with the always-writable filetype. Submit it, and " +
+				"nobody on your team gets Godot's \"Unable to write project.godot\" error again."))
+	else:
+		await _show_alert(("Perforce wouldn't change project.godot's filetype. Press \"Log\" in " +
+				"the P4G panel to see what it said."))
+	_request_refresh()
+
+
+func _show_project_godot_offer() -> bool:
+	return await _show_confirm_dialog(("Godot writes project.godot every time the editor " +
+			"starts, and when the file is read-only - as it is in your workspace - Godot shows " +
+			"\"Load Errors: Unable to write project.godot\".\n\nP4Godot can check project.godot " +
+			"out with the always-writable filetype (+w). Submit it, and nobody on your team sees " +
+			"that error again."), "Make It Writable", "Not Now")
+
+
+func _show_allwrite_offer() -> bool:
+	return await _show_confirm_dialog(("Your Perforce workspace keeps files read-only " +
 			"until you check them out. Godot rewrites some files on its own - every .import " +
 			"file when it reimports, and scenes when it re-saves them - and those writes fail " +
 			"on read-only files.\n\nP4Godot can switch the workspace to leave files writable. " +
@@ -1353,18 +1403,13 @@ func _offer_allwrite_once() -> void:
 			"other program, and Get Latest still never overwrites a file you changed.\n\nYou " +
 			"can switch back at any time in the P4G panel's settings menu."),
 			"Make Files Writable", "Not Now")
-	if yes and epoch == _watch_epoch:
-		await _switch_allwrite(true, false)
 
 
 func _on_workspace_connected() -> void:
 	_offer_allwrite_once()
 
 
-func _build_settings_menu(parent: Control) -> void:
-	super(parent)
-	var popup := settings_menu.get_popup()
-	popup.add_separator()
+func _add_workspace_settings(popup: PopupMenu) -> void:
 	popup.add_check_item("Leave workspace files writable", SETTINGS_MENU_ALLWRITE)
 	popup.set_item_tooltip(popup.get_item_index(SETTINGS_MENU_ALLWRITE),
 			("Switch the Perforce workspace between leaving files writable (\"allwrite\") and " +
@@ -1560,7 +1605,7 @@ func _rebuild_tree(model: Dictionary) -> void:
 				_detected_verb(String(row.action)).to_lower()]
 		if not refused.is_empty():
 			tip += "\nPerforce refused to open it: %s" % refused
-			item.set_custom_color(0, ACTION_DELETE_COLOR)
+			item.set_custom_color(0, _action_color("delete"))
 		item.set_tooltip_text(0, tip)
 		item.set_text(1, String(row.action))
 		item.set_text_alignment(1, HORIZONTAL_ALIGNMENT_RIGHT)
@@ -1589,22 +1634,27 @@ func _populate_context_menu(meta: Dictionary) -> void:
 	context_menu.clear()
 	move_submenu.clear()
 	_move_targets.clear()
+	var m := context_menu
 	if kind == "detected":
 		var action := String(meta.get("action", ""))
-		context_menu.add_item(_detected_verb(action), CTX_DETECTED_OPEN)
+		_menu_add(m, "ArrowUp" if action == "edit" else "Add" if action.ends_with("add") else "Remove",
+				_detected_verb(action), CTX_DETECTED_OPEN)
+		m.add_separator()
 		if not action.ends_with("delete"):
 			var in_project := String(meta.get("res_path", "")).begins_with("res://")
-			context_menu.add_item("Open" if in_project else "Show in File Manager", CTX_DETECTED_SHOW)
+			_menu_add(m, "Load" if in_project else "Filesystem",
+					"Open" if in_project else "Show in File Manager", CTX_DETECTED_SHOW)
 		if action == "edit":
-			context_menu.add_item("Diff vs Depot", CTX_DETECTED_DIFF)
+			_menu_add(m, "Search", "Diff vs Depot", CTX_DETECTED_DIFF)
 		if not action.ends_with("add"):
-			context_menu.add_item("History...", CTX_DETECTED_HISTORY)
+			_menu_add(m, "History", "History...", CTX_DETECTED_HISTORY)
 		if not _clean_flag(action).is_empty():
-			context_menu.add_item("Revert My Change...", CTX_DETECTED_REVERT)
+			m.add_separator()
+			_menu_add(m, "UndoRedo", "Revert My Change...", CTX_DETECTED_REVERT)
 	else:
-		context_menu.add_item("Open All in Perforce", CTX_DETECTED_OPEN_ALL)
-	context_menu.add_separator()
-	context_menu.add_item("Refresh", CTX_REFRESH)
+		_menu_add(m, "ArrowUp", "Open All in Perforce", CTX_DETECTED_OPEN_ALL)
+	m.add_separator()
+	_menu_add(m, "Reload", "Refresh", CTX_REFRESH)
 
 
 func _on_context_menu_id_pressed(id: int) -> void:

@@ -165,14 +165,14 @@ func _build_dock() -> void:
 	dock.add_child(settings_row)
 
 	auto_checkout_checkbox = CheckBox.new()
-	auto_checkout_checkbox.text = "Checkout on edit"
+	auto_checkout_checkbox.text = "Check out on edit"
 	auto_checkout_checkbox.tooltip_text = "Offer to check out a file the moment it is first modified in the editor."
 	auto_checkout_checkbox.button_pressed = true
 	auto_checkout_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(auto_checkout_checkbox)
 
 	checkout_on_save_checkbox = CheckBox.new()
-	checkout_on_save_checkbox.text = "Checkout on save"
+	checkout_on_save_checkbox.text = "Check out on save"
 	checkout_on_save_checkbox.tooltip_text = "Automatically check out edited files right before the editor writes them."
 	checkout_on_save_checkbox.button_pressed = true
 	checkout_on_save_checkbox.toggled.connect(_on_setting_toggled)
@@ -185,7 +185,7 @@ func _build_dock() -> void:
 	settings_row.add_child(verbose_log_checkbox)
 
 	auto_open_checkbox = CheckBox.new()
-	auto_open_checkbox.text = "Auto add/edit/delete"
+	auto_open_checkbox.text = "Check out, delete and move without asking"
 	auto_open_checkbox.tooltip_text = "When on, edits, deletes, and moves/renames are opened in Perforce automatically, with no confirmation dialog. When off, deletes and moves prompt first (and edits follow 'Checkout on edit')."
 	auto_open_checkbox.toggled.connect(_on_setting_toggled)
 	settings_row.add_child(auto_open_checkbox)
@@ -247,26 +247,37 @@ func _build_settings_menu(parent: Control) -> void:
 		settings_menu.text = "Settings"
 	var popup := settings_menu.get_popup()
 	popup.hide_on_checkable_item_selection = false
-	popup.add_check_item("Checkout on edit", 0)
-	popup.add_check_item("Checkout on save", 1)
-	popup.add_check_item("Auto add/edit/delete", 2)
+	# Grouped by where the change happens, under headings, so a setting's
+	# neighbours explain it.
+	popup.add_separator("Editing in Godot")
+	popup.add_check_item("Check out on edit", 0)
+	popup.add_check_item("Check out on save", 1)
+	popup.add_check_item("Check out, delete and move without asking", 2)
+	popup.add_separator("Other programs")
 	popup.add_check_item("Watch the workspace for changes", 3)
 	popup.add_check_item("Check out changed files automatically", 5)
+	popup.add_separator("Workspace")
+	_add_workspace_settings(popup)
+	popup.add_item("Connection Settings...", SETTINGS_MENU_CONNECTION)
+	popup.add_separator("Troubleshooting")
 	popup.add_check_item("Verbose log", 4)
 	for pair in [[0, "Offer to check out a file the moment it is first modified in the editor."],
-			[1, "Automatically check out edited files right before the editor writes them."],
-			[2, "Open edits, deletes, and moves in Perforce silently, with no confirmation dialogs."],
+			[1, "Check out edited files right before the editor writes them."],
+			[2, "Check out, mark for delete and record moves of files you change in Godot without asking first."],
 			[3, WATCH_TOOLTIP],
 			[5, AUTO_CHECKOUT_DETECTED_TOOLTIP],
-			[4, "Log read-only status probes too, not just state-changing commands."]]:
+			[4, "Log read-only status queries too, not just commands that change something."],
+			[SETTINGS_MENU_CONNECTION, "Change the Perforce server, user, or workspace this project uses."]]:
 		popup.set_item_tooltip(popup.get_item_index(int(pair[0])), String(pair[1]))
-	popup.add_separator()
-	popup.add_item("Connection settings...", SETTINGS_MENU_CONNECTION)
-	popup.set_item_tooltip(popup.get_item_index(SETTINGS_MENU_CONNECTION),
-			"Change the Perforce server, user, or workspace this project uses.")
 	popup.about_to_popup.connect(_sync_settings_menu)
 	popup.id_pressed.connect(_on_settings_menu_id_pressed)
 	parent.add_child(settings_menu)
+
+
+## Settings about the workspace itself, above Connection Settings. The watch
+## layer adds its allwrite switch here.
+func _add_workspace_settings(_popup: PopupMenu) -> void:
+	pass
 
 
 func _settings_menu_checkbox(id: int) -> CheckBox:
@@ -285,6 +296,8 @@ func _sync_settings_menu() -> void:
 	for id in SETTINGS_MENU_CHECKBOXES:
 		var cb := _settings_menu_checkbox(id)
 		popup.set_item_checked(popup.get_item_index(id), cb != null and cb.button_pressed)
+	# Checking out what the watcher finds means nothing while it isn't watching.
+	popup.set_item_disabled(popup.get_item_index(5), not detect_external_checkbox.button_pressed)
 
 
 func _on_settings_menu_id_pressed(id: int) -> void:
@@ -400,8 +413,8 @@ func _on_clear_log_pressed() -> void:
 ## modal semantics and the _dialog_busy serialization used for real prompts.
 func _build_log_window() -> void:
 	log_window = Window.new()
-	log_window.title = "P4 Log"
-	log_window.size = Vector2i(640, 360)
+	log_window.title = "P4Godot - Log"
+	log_window.size = Vector2i(Vector2(900, 480) * EditorInterface.get_editor_scale())
 	log_window.visible = false
 	# Closing HIDES (never frees) so log_box survives to keep receiving _log().
 	log_window.close_requested.connect(_on_log_window_close_requested)
@@ -412,15 +425,27 @@ func _build_log_window() -> void:
 
 	var log_tools := HBoxContainer.new()
 	log_root.add_child(log_tools)
+	_add_toolbar_button(log_tools, "ActionCopy", "Copy All",
+			"Copy the whole log, to paste into a bug report or a message to whoever runs your server.",
+			_on_copy_log_pressed)
 	_add_toolbar_button(log_tools, "", "Clear Log", "Empty the P4 activity log.", _on_clear_log_pressed)
 
 	log_box = TextEdit.new()
 	log_box.editable = false
 	log_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# Commands and paths are long: wrap them rather than cut them off.
+	log_box.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	var mono := EditorInterface.get_base_control().get_theme_font("source", "EditorFonts")
+	if mono:
+		log_box.add_theme_font_override("font", mono)
 	log_root.add_child(log_box)
 
 	# Child of dock, so dock.queue_free() in _exit_tree() cascades to it.
 	dock.add_child(log_window)
+
+
+func _on_copy_log_pressed() -> void:
+	DisplayServer.clipboard_set(log_box.text)
 
 
 func _on_toggle_log_pressed() -> void:
@@ -442,12 +467,11 @@ func _build_tree() -> void:
 	tree = Tree.new()
 	tree.hide_root = true
 	tree.columns = 2
-	tree.set_column_title(0, "Changelist / File")
-	tree.set_column_title(1, "Action")
-	tree.set_column_titles_visible(true)
+	# No header row: the rows say what they are, and the bottom panel is short.
+	tree.set_column_titles_visible(false)
 	tree.set_column_expand(0, true)
 	tree.set_column_expand(1, false)
-	tree.set_column_custom_minimum_width(1, 90)
+	tree.set_column_custom_minimum_width(1, int(90 * EditorInterface.get_editor_scale()))
 	tree.allow_rmb_select = true # so right-click selects the row under the cursor
 	tree.select_mode = Tree.SELECT_ROW
 	tree.custom_minimum_size = Vector2(0, 180)
@@ -458,6 +482,7 @@ func _build_tree() -> void:
 	tree.drop_mode_flags = Tree.DROP_MODE_ON_ITEM
 	tree.set_drag_forwarding(_tree_get_drag_data, _tree_can_drop_data, _tree_drop_data)
 	dock.add_child(tree)
+	_build_empty_state()
 
 	context_menu = PopupMenu.new()
 	context_menu.id_pressed.connect(_on_context_menu_id_pressed)
@@ -470,6 +495,30 @@ func _build_tree() -> void:
 	context_menu.add_child(move_submenu)
 
 
+## Shown over the tree when Perforce isn't reachable: what's wrong and the one
+## button that fixes it, instead of a row to double-click.
+var _empty_state: CenterContainer
+
+
+func _build_empty_state() -> void:
+	_empty_state = CenterContainer.new()
+	_empty_state.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_empty_state.visible = false
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 8)
+	var label := Label.new()
+	label.text = "P4Godot isn't connected to Perforce."
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	column.add_child(label)
+	var button := Button.new()
+	button.text = "Set Up Connection..."
+	button.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	button.pressed.connect(_offer_connection_setup)
+	column.add_child(button)
+	_empty_state.add_child(column)
+	tree.add_child(_empty_state)
+
+
 ## Rebuild the whole tree from a model snapshot (see _query_pending_model). Cheap
 ## enough to clear-and-rebuild - the opened set is small and this only runs on
 ## refresh, not per frame.
@@ -479,10 +528,9 @@ func _rebuild_tree(model: Dictionary) -> void:
 	_last_changelists = model.get("changelists", [])
 	tree.clear()
 	var root := tree.create_item()
+	if _empty_state:
+		_empty_state.visible = not model.get("available", false)
 	if not model.get("available", false):
-		var row := tree.create_item(root)
-		row.set_text(0, "Perforce unavailable - double-click here to set up the connection.")
-		row.set_metadata(0, {"type": "setup"})
 		return
 	var folder_icon := _theme_icon("Folder")
 	var bold := _editor_bold_font()
@@ -514,7 +562,7 @@ func _rebuild_tree(model: Dictionary) -> void:
 				# unshelved onto this one - is waiting to be combined with
 				# it; the server refuses the submit until it is.
 				f_item.set_text(0, "%s  (needs resolve)" % _tree_label(String(f.res_path)))
-				f_item.set_custom_color(0, ACTION_DELETE_COLOR)
+				f_item.set_custom_color(0, _action_color("delete"))
 				f_item.set_tooltip_text(0, ("%s\n%s\nAnother version of this file - a teammate's, " +
 						"or a shelf you unshelved - is waiting to be combined with yours. Right-click " +
 						"and choose \"Resolve...\" to combine the two versions.") % [f.res_path, f.depot_path])
@@ -748,49 +796,68 @@ func _populate_context_menu(meta: Dictionary) -> void:
 	move_submenu.clear()
 	_move_targets.clear()
 	var kind: String = meta.get("type", "")
+	var m := context_menu
+	# Grouped: look, then organise, then change the file on disk, with the
+	# one that throws work away last and apart. Icons are the editor's own.
 	if kind == "file":
 		if bool(meta.get("unresolved", false)):
-			context_menu.add_item("Resolve...", CTX_RESOLVE)
-		context_menu.add_item("Open", CTX_OPEN)
-		context_menu.add_item("Diff vs Depot", CTX_DIFF)
-		context_menu.add_item("History...", CTX_HISTORY)
-		context_menu.add_item("Revert This File", CTX_REVERT)
-		context_menu.add_item("Sync This File", CTX_SYNC)
-		context_menu.add_item("Reload From Disk", CTX_RELOAD)
+			_menu_add(m, "StatusWarning", "Resolve...", CTX_RESOLVE)
+			m.add_separator()
+		_menu_add(m, "Load", "Open", CTX_OPEN)
+		_menu_add(m, "Search", "Diff vs Depot", CTX_DIFF)
+		_menu_add(m, "History", "History...", CTX_HISTORY)
+		m.add_separator()
 		_populate_move_submenu(String(meta.get("change", "")))
-		context_menu.add_submenu_node_item("Move to Changelist", move_submenu)
-		context_menu.add_separator()
+		m.add_submenu_node_item("Move to Changelist", move_submenu)
+		m.add_separator()
+		_menu_add(m, "ArrowDown", "Get Latest Version", CTX_SYNC)
+		_menu_add(m, "Reload", "Reload From Disk", CTX_RELOAD)
+		m.add_separator()
+		_menu_add(m, "UndoRedo", "Revert...", CTX_REVERT)
+		m.add_separator()
 	elif kind == "cl":
 		var fc := int(meta.get("file_count", -1)) # -1 (unknown) is treated non-empty
 		var shelved := int(meta.get("shelved_count", 0))
 		if fc != 0:
-			context_menu.add_item("Submit Changelist...", CTX_SUBMIT)
+			_menu_add(m, "ArrowUp", "Submit Changelist...", CTX_SUBMIT)
 		# Editing the default changelist's description promotes it to a numbered one.
-		context_menu.add_item("Edit Description...", CTX_EDIT_DESC)
+		_menu_add(m, "Edit", "Edit Description...", CTX_EDIT_DESC)
+		if fc != 0 or shelved > 0:
+			m.add_separator()
+		if fc != 0:
+			_menu_add(m, "Save", "Update Shelf..." if shelved > 0 else "Shelve Files...", CTX_SHELVE)
+			_menu_add(m, "", "Shelve and Revert...", CTX_SHELVE_REVERT)
+		if shelved > 0:
+			_menu_add(m, "Load", "Unshelve Files...", CTX_UNSHELVE)
+			_menu_add(m, "Remove", "Delete Shelved Files...", CTX_DELETE_SHELF)
 		# Perforce won't delete a changelist that still has a shelf.
 		if String(meta.get("change", "")) != "default" and fc == 0 and shelved == 0:
-			context_menu.add_item("Delete Changelist", CTX_DELETE_CL)
-		if fc != 0 or shelved > 0:
-			context_menu.add_separator()
-		if fc != 0:
-			context_menu.add_item("Update Shelf..." if shelved > 0 else "Shelve Files...", CTX_SHELVE)
-			context_menu.add_item("Shelve and Revert...", CTX_SHELVE_REVERT)
-		if shelved > 0:
-			context_menu.add_item("Unshelve Files...", CTX_UNSHELVE)
-			context_menu.add_item("Delete Shelved Files...", CTX_DELETE_SHELF)
-		context_menu.add_separator()
+			m.add_separator()
+			_menu_add(m, "Remove", "Delete Changelist", CTX_DELETE_CL)
+		m.add_separator()
 	elif kind == "shelf":
-		context_menu.add_item("Unshelve Files...", CTX_UNSHELVE)
-		context_menu.add_item("Delete Shelved Files...", CTX_DELETE_SHELF)
-		context_menu.add_item("Show in Shelves Window", CTX_SHELF_WINDOW)
-		context_menu.add_separator()
+		_menu_add(m, "Load", "Unshelve Files...", CTX_UNSHELVE)
+		_menu_add(m, "", "Show in Shelves Window", CTX_SHELF_WINDOW)
+		m.add_separator()
+		_menu_add(m, "Remove", "Delete Shelved Files...", CTX_DELETE_SHELF)
+		m.add_separator()
 	elif kind == "shelved_file":
-		context_menu.add_item("Diff vs Base", CTX_SHELF_DIFF)
-		context_menu.add_item("Diff vs Workspace", CTX_SHELF_DIFF_WORKSPACE)
-		context_menu.add_item("Unshelve This File...", CTX_UNSHELVE)
-		context_menu.add_item("Delete From Shelf...", CTX_DELETE_SHELF)
-		context_menu.add_separator()
-	context_menu.add_item("Refresh", CTX_REFRESH)
+		_menu_add(m, "Search", "Diff vs Base", CTX_SHELF_DIFF)
+		_menu_add(m, "", "Diff vs Workspace", CTX_SHELF_DIFF_WORKSPACE)
+		m.add_separator()
+		_menu_add(m, "Load", "Unshelve This File...", CTX_UNSHELVE)
+		_menu_add(m, "Remove", "Delete From Shelf...", CTX_DELETE_SHELF)
+		m.add_separator()
+	_menu_add(m, "Reload", "Refresh", CTX_REFRESH)
+
+
+## A menu item with an editor-theme icon when the theme has one by that name.
+func _menu_add(menu: PopupMenu, icon_name: String, label: String, id: int) -> void:
+	var icon: Texture2D = null if icon_name.is_empty() else _theme_icon(icon_name)
+	if icon:
+		menu.add_icon_item(icon, label, id)
+	else:
+		menu.add_item(label, id)
 
 
 ## Populate the Move-to-Changelist submenu with every pending changelist except
@@ -1279,14 +1346,20 @@ func _unregister_filesystem_hooks() -> void:
 ## res:// paths.
 func _fs_context_actions() -> Array:
 	return [
-		{"label": "P4: Check Out", "method": "_ctx_checkout"},
-		{"label": "P4: Mark for Add", "method": "_ctx_add"},
-		{"label": "P4: Get Latest (Sync)", "method": "_ctx_sync"},
-		{"label": "P4: Diff vs Depot", "method": "_ctx_diff"},
-		{"label": "P4: History...", "method": "_ctx_history"},
-		{"label": "P4: Revert...", "method": "_ctx_revert"},
-		{"label": "P4: Show Status in Log", "method": "_ctx_status"},
+		{"label": "Check Out", "method": "_ctx_checkout", "icon": "Edit"},
+		{"label": "Mark for Add", "method": "_ctx_add", "icon": "Add"},
+		{"label": "Diff vs Depot", "method": "_ctx_diff", "icon": "Search"},
+		{"label": "History...", "method": "_ctx_history", "icon": "History"},
+		{"label": "Get Latest Version", "method": "_ctx_sync", "icon": "ArrowDown"},
+		{"label": "Revert...", "method": "_ctx_revert", "icon": "UndoRedo"},
+		{"label": "Show Status in Log", "method": "_ctx_status", "icon": ""},
 	]
+
+
+# The FileSystem dock's P4 submenu for the latest right-click, and the files
+# it acts on.
+var _fs_submenu: PopupMenu
+var _fs_submenu_paths: PackedStringArray
 
 
 ## Called by P4FileSystemContextMenu._popup_menu: add the Perforce actions to the
@@ -1297,8 +1370,24 @@ func _populate_fs_context_menu(menu: EditorContextMenuPlugin, paths: PackedStrin
 		return
 	if _fs_files_only(paths).is_empty():
 		return
-	for action in _fs_context_actions():
-		menu.add_context_menu_item(String(action.label), Callable(self, String(action.method)))
+	# One "P4" submenu, as on script tabs, scene tabs, the code editor and the
+	# scene tree, rather than seven items crowding Godot's own menu. A new one
+	# each time: Godot clears its menu before asking plugins.
+	if is_instance_valid(_fs_submenu):
+		_fs_submenu.queue_free()
+	_fs_submenu = PopupMenu.new()
+	_fs_submenu_paths = paths
+	var actions := _fs_context_actions()
+	for i in actions.size():
+		_menu_add(_fs_submenu, String(actions[i].icon), String(actions[i].label), i)
+	_fs_submenu.id_pressed.connect(_on_fs_submenu_id)
+	menu.add_context_submenu_item("P4", _fs_submenu)
+
+
+func _on_fs_submenu_id(id: int) -> void:
+	var actions := _fs_context_actions()
+	if id >= 0 and id < actions.size():
+		call(String(actions[id].method), _fs_submenu_paths)
 
 
 ## The res:// file paths in `paths`, dropping folders (a trailing slash or an
@@ -1435,14 +1524,14 @@ func _decorate_tooltip(res_path: String, base: Control) -> void:
 	var head := String(rec.get("headRev", have))
 	_add_tooltip_label(base, "P4  %s#%s" % [rec.get("depotFile"), have], P4_ACCENT)
 	if head != have:
-		_add_tooltip_label(base, "head is #%s - out of date" % head, ACTION_DELETE_COLOR)
+		_add_tooltip_label(base, "head is #%s - out of date" % head, _action_color("delete"))
 	if rec.has("action"):
 		_add_tooltip_label(base, "opened for %s" % rec.get("action"), _action_color(String(rec.get("action"))))
 	if rec.has("ourLock"):
-		_add_tooltip_label(base, "locked by you", ACTION_EDIT_COLOR)
+		_add_tooltip_label(base, "locked by you", _action_color("edit"))
 	var others := _fstat_other_openers(rec)
 	if not others.is_empty():
-		_add_tooltip_label(base, "also open by %s" % ", ".join(others), ACTION_DELETE_COLOR)
+		_add_tooltip_label(base, "also open by %s" % ", ".join(others), _action_color("delete"))
 
 
 func _add_tooltip_label(base: Control, text: String, color: Color) -> void:

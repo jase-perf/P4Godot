@@ -570,7 +570,7 @@ func _offer_connection_setup() -> void:
 			continue
 		if status == "no server":
 			var prefill: String = await _suggest_port()
-			var res: Dictionary = await _show_input_dialog("P4 Connection Setup",
+			var res: Dictionary = await _show_input_dialog("P4Godot - Connection Setup",
 					"Couldn't reach a Perforce server.\n" +
 					"Enter the server address (host:port, e.g. ssl:p4.example.com:1666):",
 					prefill, false, "Connect")
@@ -646,7 +646,7 @@ func _pick_client() -> bool:
 		if ordered.is_empty():
 			# "No workspaces" is only true if the server was asked and answered.
 			var listed: bool = int(result.exit_code) == 0
-			var res: Dictionary = await _show_input_dialog("P4 Connection Setup", where +
+			var res: Dictionary = await _show_input_dialog("P4Godot - Connection Setup", where +
 					("You have no workspaces on this server.\n\n" if listed else
 					"P4Godot couldn't list your workspaces on this server:\n%s\n\n"
 							% _first_line(result)) +
@@ -672,7 +672,7 @@ func _pick_client() -> bool:
 				preselect = i
 		var head := "Found a workspace whose root contains this project.\n" if not matches.is_empty() \
 				else "None of your workspaces' roots contain this project - pick one anyway,\nor cancel and create a workspace for it first.\n"
-		var picked: Dictionary = await _show_option_dialog("P4 Connection Setup",
+		var picked: Dictionary = await _show_option_dialog("P4Godot - Connection Setup",
 				where + head + "Workspace to use for this project (stored per-project, per-user):",
 				options, preselect, "Use This Workspace", CHANGE_SERVER_TEXT)
 		if picked.extra:
@@ -1193,12 +1193,19 @@ func _dim_color() -> Color:
 	return Color(0.62, 0.62, 0.67)
 
 
+## The colour for an action word, from the editor theme, so it keeps its
+## contrast in light themes and dark ones alike. The constants are the
+## fallback when the editor theme lacks the colour.
 func _action_color(action: String) -> Color:
+	var base := EditorInterface.get_base_control()
+	var pair: Array = ["accent_color", ACTION_EDIT_COLOR] # edit / integrate / branch
 	if action.contains("delete"):
-		return ACTION_DELETE_COLOR
-	if action.contains("add"):
-		return ACTION_ADD_COLOR
-	return ACTION_EDIT_COLOR # edit / integrate / branch
+		pair = ["error_color", ACTION_DELETE_COLOR]
+	elif action.contains("add"):
+		pair = ["success_color", ACTION_ADD_COLOR]
+	if base and base.has_theme_color(String(pair[0]), "Editor"):
+		return base.get_theme_color(String(pair[0]), "Editor")
+	return pair[1]
 
 
 func _file_icon(res_path: String) -> Texture2D:
@@ -2106,8 +2113,11 @@ func _is_probe_command(args: PackedStringArray) -> bool:
 			break
 	match sub:
 		"info", "fstat", "opened", "where", "changes", "print", "have", "files", "dirs", \
-		"diff", "diff2", "set", "clients":
+		"diff", "diff2", "set", "clients", "describe", "filelog", "annotate", "users", \
+		"ignores", "streams", "sizes":
 			return true
+		"client":
+			return "-o" in args # client -o reads; client -i / -d change the workspace
 		"change":
 			return "-o" in args # change -o reads; change -i / -d mutate
 		"login":
@@ -2421,10 +2431,7 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 	# skips confirmed/canceled - never leave the coroutine hanging.
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
 
-	# Do NOT add_child(dialog) first: popup_exclusive_centered() parents the
-	# dialog itself (Window::_try_parent_dialog()) and silently no-ops - the
-	# dialog never shows, with no error - if it already has a parent.
-	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+	_popup_dialog(dialog)
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -2464,9 +2471,7 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 		dialog.add_button(extra_text, true, "extra")
 		dialog.custom_action.connect(_on_dialog_extra_action)
 	var vbox := VBoxContainer.new()
-	var label := Label.new()
-	label.text = message
-	vbox.add_child(label)
+	vbox.add_child(_message_label(message))
 	var input: Control
 	if multiline:
 		var te := TextEdit.new()
@@ -2503,7 +2508,7 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+	_popup_dialog(dialog)
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -2532,7 +2537,7 @@ func _show_input_dialog(title: String, message: String, default_text: String,
 ## workspace. `extra_text` adds a third button; pressing it closes the dialog
 ## with `extra` true and `ok` false.
 func _show_option_dialog(title: String, message: String, options: PackedStringArray,
-		preselect: int, ok_text: String, extra_text: String = "") -> Dictionary:
+		preselect: int, ok_text: String, extra_text: String = "", cancel_text: String = "Cancel") -> Dictionary:
 	if _shutting_down:
 		return {"ok": false, "index": -1, "extra": false}
 	if _selftest_mode:
@@ -2547,13 +2552,12 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 	var dialog := ConfirmationDialog.new()
 	dialog.title = title
 	dialog.set_ok_button_text(ok_text)
+	dialog.set_cancel_button_text(cancel_text)
 	if not extra_text.is_empty():
 		dialog.add_button(extra_text, true, "extra")
 		dialog.custom_action.connect(_on_dialog_extra_action)
 	var vbox := VBoxContainer.new()
-	var label := Label.new()
-	label.text = message
-	vbox.add_child(label)
+	vbox.add_child(_message_label(message))
 	var picker := OptionButton.new()
 	for opt in options:
 		picker.add_item(opt)
@@ -2565,7 +2569,7 @@ func _show_option_dialog(title: String, message: String, options: PackedStringAr
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+	_popup_dialog(dialog)
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -2601,14 +2605,12 @@ func _show_connection_dialog(port: String, user: String) -> Dictionary:
 	_dialog_result_confirmed = false
 
 	var dialog := ConfirmationDialog.new()
-	dialog.title = "P4 Connection Settings"
+	dialog.title = "P4Godot - Connection Settings"
 	dialog.set_ok_button_text("Connect")
 	var vbox := VBoxContainer.new()
-	var intro := Label.new()
-	intro.text = ("Which Perforce server this project uses, and who you are on it.\n" +
-			"Stored for this project only, for you only. Leave a box empty to use\n" +
-			"your normal Perforce settings (a P4CONFIG file, or `p4 set`).")
-	vbox.add_child(intro)
+	vbox.add_child(_message_label(("Which Perforce server this project uses, and who you are " +
+			"on it. Stored for this project only, for you only. Leave a box empty to use your " +
+			"normal Perforce settings (a P4CONFIG file, or `p4 set`).")))
 	var port_label := Label.new()
 	port_label.text = "Server address:"
 	vbox.add_child(port_label)
@@ -2629,7 +2631,7 @@ func _show_connection_dialog(port: String, user: String) -> Dictionary:
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+	_popup_dialog(dialog)
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -2671,9 +2673,7 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	dialog.set_ok_button_text(ok_text)
 	dialog.set_cancel_button_text(cancel_text)
 	var vbox := VBoxContainer.new()
-	var label := Label.new()
-	label.text = text
-	vbox.add_child(label)
+	vbox.add_child(_message_label(text))
 	var row := HBoxContainer.new()
 	var row_label := Label.new()
 	row_label.text = picker_label
@@ -2690,7 +2690,7 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+	_popup_dialog(dialog)
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
@@ -2714,6 +2714,76 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	return {"ok": confirmed, "change": change}
 
 
+static var _godot_temp_re: RegEx
+
+
+## Whether `local` is the temporary file a Godot save left behind when it
+## couldn't replace the real file (a read-only one, say): the real file's
+## name plus digits and ".tmp" - "project.godot4667122.tmp" - with the real
+## file beside it. Never worth adding to Perforce; Godot replaces or drops it.
+static func _is_godot_save_leftover(local: String) -> bool:
+	if not local.ends_with(".tmp"):
+		return false
+	if _godot_temp_re == null:
+		_godot_temp_re = RegEx.create_from_string("^(.+?)\\d+\\.tmp$")
+	var m := _godot_temp_re.search(local.replace("\\", "/"))
+	return m != null and FileAccess.file_exists(m.get_string(1))
+
+
+## How wide every dialog's text is, before editor scaling: long text wraps
+## at a reading width instead of stretching the dialog across the screen.
+const DIALOG_WIDTH := 560
+
+static var _res_prefix_re: RegEx
+
+
+## Show one of the plugin's dialogs: at the reading width with its text
+## wrapped, titled "P4Godot" unless it has a title of its own, and with
+## project paths written as the P4G panel writes them (no "res://").
+func _popup_dialog(dialog: AcceptDialog) -> void:
+	if dialog.title.is_empty() or dialog.title == "Alert!" or dialog.title == "Please Confirm...":
+		dialog.title = "P4Godot"
+	dialog.dialog_text = _plain_paths(dialog.dialog_text)
+	dialog.dialog_autowrap = true
+	var width := int(DIALOG_WIDTH * EditorInterface.get_editor_scale())
+	# Do NOT add_child(dialog) first: popup_exclusive_centered() parents the
+	# dialog itself (Window::_try_parent_dialog()) and silently no-ops - the
+	# dialog never shows, with no error - if it already has a parent.
+	dialog.popup_exclusive_centered(EditorInterface.get_base_control(), Vector2i(width, 0))
+	_fit_dialog_height(dialog, width)
+
+
+## A wrapping label reports its height before it knows its width, which left
+## dialogs with a tall empty band above their buttons (measured in the GUI
+## tour). Once laid out at its width, the dialog takes the height it needs.
+func _fit_dialog_height(dialog: AcceptDialog, width: int) -> void:
+	for i in 2:
+		await get_tree().process_frame
+	if not is_instance_valid(dialog) or not dialog.visible:
+		return
+	dialog.size = Vector2i(width, int(dialog.get_contents_minimum_size().y))
+	dialog.move_to_center()
+
+
+## The message of a dialog with fields of its own: wrapped at the reading
+## width, with paths written as the panel writes them - what _popup_dialog
+## does for a plain dialog's text.
+func _message_label(text: String) -> Label:
+	var label := Label.new()
+	label.text = _plain_paths(text)
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label.custom_minimum_size.x = (DIALOG_WIDTH - 32) * EditorInterface.get_editor_scale()
+	return label
+
+
+## `text` with "res://" dropped from the start of each project path. The P4G
+## panel names project files that way, so dialogs and panel agree.
+static func _plain_paths(text: String) -> String:
+	if _res_prefix_re == null:
+		_res_prefix_re = RegEx.create_from_string("(^|[\\s'\"(])res://(?=\\S)")
+	return _res_prefix_re.sub(text, "$1", true)
+
+
 ## Shows a modal OK-only notice (checkout failures and other conditions the
 ## user should see without being asked anything). Serialized through the same
 ## _dialog_busy lock as _show_confirm_dialog so alerts and prompts can never
@@ -2730,12 +2800,11 @@ func _show_alert(text: String) -> void:
 	_dialog_result_ready = false
 
 	var dialog := AcceptDialog.new()
-	dialog.title = "Perforce"
 	dialog.set_text(text)
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	dialog.close_requested.connect(_on_confirm_dialog_canceled)
-	dialog.popup_exclusive_centered(EditorInterface.get_base_control())
+	_popup_dialog(dialog)
 
 	if not _selftest_auto_answer.is_empty():
 		await get_tree().process_frame
