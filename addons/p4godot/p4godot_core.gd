@@ -2785,6 +2785,9 @@ static func _code_color(name: String, fallback: Color) -> Color:
 func _tree_label(key: String) -> String:
 	if key.begins_with("res://"):
 		return key.trim_prefix("res://")
+	if key.begins_with("//"):
+		return key # a depot path: not on this computer
+
 	return _relative_to_project(key)
 
 

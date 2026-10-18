@@ -527,6 +527,7 @@ func _rebuild_tree(model: Dictionary) -> void:
 	if tree == null:
 		return
 	_last_changelists = model.get("changelists", [])
+	_last_opened_trusted = bool(model.get("available", false)) and bool(model.get("opened_ok", true))
 	tree.clear()
 	var root := tree.create_item()
 	if _empty_state:
@@ -839,7 +840,7 @@ func _populate_move_submenu(current_change: String) -> void:
 		if String(cl.change) == current_change:
 			continue
 		var label: String = "Default changelist" if cl.change == "default" \
-				else "#%s  %s" % [cl.change, cl.desc]
+				else "#%s  %s" % [cl.change, String(cl.desc).get_slice("\n", 0)]
 		move_submenu.add_item(label, CTX_MOVE_BASE + _move_targets.size())
 		_move_targets.append(String(cl.change))
 	move_submenu.add_separator()
@@ -1336,7 +1337,9 @@ func _fs_context_actions() -> Array:
 ## the panel last listed as opened: Check Out and Mark for Add when every one
 ## is checked out already, Revert when none is. A mixed selection keeps all.
 func _disable_inapplicable_actions(sub: PopupMenu, paths: Array) -> void:
-	if paths.is_empty():
+	# Before the first refresh, or after one that failed, nothing is known:
+	# everything stays available rather than greying out the wrong items.
+	if paths.is_empty() or not _last_opened_trusted:
 		return
 	var opened := {}
 	for cl in _last_changelists:
@@ -1353,6 +1356,10 @@ func _disable_inapplicable_actions(sub: PopupMenu, paths: Array) -> void:
 				or (count == 0 and method == "_ctx_revert")
 		sub.set_item_disabled(sub.get_item_index(i), off)
 
+
+# Whether _last_changelists came from a refresh that could read the opened
+# files (a failed one leaves it empty, which says nothing about them).
+var _last_opened_trusted := false
 
 # The FileSystem dock's P4 submenus, newest last, and the files the newest
 # acts on. The dock has two popups (tree and file list) that each keep the

@@ -1180,6 +1180,7 @@ func _run_cli_self_test_if_requested() -> void:
 			var project := ProjectSettings.globalize_path("res://").replace("\\", "/").trim_suffix("/")
 			var outside := project.get_base_dir().path_join("art/hero.psd")
 			checks["labels"] = _tree_label("res://scenes/a.tscn") == "scenes/a.tscn" \
+					and _tree_label("//depot/game/a.tscn") == "//depot/game/a.tscn" \
 					and _tree_label(outside) == "../art/hero.psd"
 			checks["row verbs"] = _detected_verb("edit") == "Check Out" and _detected_verb("add") == "Mark for Add" \
 					and _detected_verb("delete") == "Mark for Delete"
@@ -5387,7 +5388,6 @@ func _gui_test_readme() -> bool:
 	# --- The GIF: edit a script that isn't checked out, say yes, and the file
 	# is in the default changelist.
 	var player_res := "res://player/player.gd"
-	var player := ProjectSettings.globalize_path(player_res)
 	var script := load(player_res) as Script
 	EditorInterface.set_main_screen_editor("Script")
 	EditorInterface.edit_script(script)
@@ -5401,6 +5401,9 @@ func _gui_test_readme() -> bool:
 	for i in code.get_line_count():
 		if code.get_line(i).begins_with("const WALK_SPEED"):
 			line = i
+	if line < 0 or not code.get_line(line).contains("200.0"):
+		_log("[selftest] FAIL: the demo's player.gd has no \"const WALK_SPEED = 200.0\"")
+		return false
 	var col := code.get_line(line).find("200.0")
 	code.set_caret_line(line)
 	code.set_caret_column(col)

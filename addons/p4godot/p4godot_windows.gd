@@ -116,7 +116,7 @@ func _progress_begin(title: String, headline: String, tracker: P4Progress) -> vo
 	_progress_note_text = ""
 	_progress_started_msec = Time.get_ticks_msec()
 	_progress_last_activity_msec = _progress_started_msec
-	_progress_window.title = "P4Godot - " + title
+	_progress_window.title = title if title.begins_with("P4Godot") else "P4Godot - " + title
 	_progress_headline.text = headline
 	_progress_cancel_button.disabled = false
 	_progress_cancel_button.text = "Cancel"
@@ -408,9 +408,12 @@ func _color_diff_pane(te: TextEdit) -> void:
 	var style := StyleBoxFlat.new()
 	style.bg_color = bg
 	style.set_content_margin_all(4)
-	# read_only is the stylebox a non-editable TextEdit draws.
-	te.add_theme_stylebox_override("normal", style)
+	# read_only is the stylebox a non-editable TextEdit draws. In bulk, so
+	# the theme_changed they fire comes once, after both are set.
+	te.begin_bulk_theme_override()
 	te.add_theme_stylebox_override("read_only", style)
+	te.add_theme_stylebox_override("normal", style)
+	te.end_bulk_theme_override()
 	te.queue_redraw()
 
 

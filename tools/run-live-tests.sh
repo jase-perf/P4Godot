@@ -141,7 +141,10 @@ run_import() {
 	if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi
 }
 run_import "$GODOT" --headless --editor --import --path "$proj" > "$work/logs/import.log" 2>&1
-[ -d "$proj/.godot/imported" ] || { echo "FAIL: Godot didn't import the test project"; exit 1; }
+# A run cut short still leaves .godot/imported: check a file of its own.
+imported="$proj/art/icon.svg.import"
+[ -n "${DEMO:-}" ] && imported="$proj/.godot/imported"
+[ -e "$imported" ] || { echo "FAIL: Godot didn't import the test project"; exit 1; }
 printf '\n[editor_plugins]\n\nenabled=PackedStringArray("res://addons/p4godot/plugin.cfg")\n' >> "$proj/project.godot"
 (
 	cd "$proj" || exit 1
@@ -270,6 +273,8 @@ for t in $TESTS; do
 			[ -n "${DEMO:-}" ] || { echo "FAIL: $t takes DEMO=<Godot's Skeleton2D demo>"; failed="$failed $t"; continue; }
 			f=player/player.gd
 			(mate sync -q "//mate-ws/..." >/dev/null 2>&1
+				grep -q '^const ACCELERATION_SPEED = WALK_SPEED \* 6.0' "$P4TEST_MATE_WS/$f" &&
+				grep -q '^const TERMINAL_VELOCITY = 400' "$P4TEST_MATE_WS/$f" &&
 				mate edit "$P4TEST_MATE_WS/$f" >/dev/null &&
 				sed -i 's/^const ACCELERATION_SPEED = WALK_SPEED \* 6.0/const ACCELERATION_SPEED = WALK_SPEED * 8.0/' "$P4TEST_MATE_WS/$f" &&
 				mate submit -d "Player: tighter air control" "$P4TEST_MATE_WS/$f" >/dev/null &&
