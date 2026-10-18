@@ -754,7 +754,7 @@ func _login_flow() -> bool:
 			(_override_user if not _override_user.is_empty() else "your Perforce user")
 	var where := "" if _p4_port.is_empty() else (" on %s" % _p4_port)
 	while true:
-		var res: Dictionary = await _show_input_dialog("P4 Login",
+		var res: Dictionary = await _show_input_dialog("Log In to Perforce",
 				"Perforce needs you to log in again%s.\nPassword for %s:" % [where, who],
 				"", false, "Log In", true)
 		if not res.ok:
@@ -770,7 +770,7 @@ func _login_flow() -> bool:
 		if msg.contains("doesn't exist"):
 			# Wrong Perforce user (e.g. the OS username default). Let them fix
 			# the user name and go around again.
-			var ures: Dictionary = await _show_input_dialog("P4 Login",
+			var ures: Dictionary = await _show_input_dialog("Log In to Perforce",
 					"That Perforce user doesn't exist on %s.\nUser name to log in as:" % _p4_port,
 					who, false, "Set User")
 			if ures.ok and not String(ures.text).strip_edges().is_empty():
@@ -844,17 +844,17 @@ func _change_password_flow() -> bool:
 			(_override_user if not _override_user.is_empty() else "your Perforce user")
 	var where := "" if _p4_port.is_empty() else (" on %s" % _p4_port)
 	while true:
-		var old: Dictionary = await _show_input_dialog("P4 Password Expired",
+		var old: Dictionary = await _show_input_dialog("Password Expired",
 				("Your Perforce password%s has expired. The server refuses everything " +
 				"until you choose a new one.\n\nCurrent password for %s:") % [where, who],
 				"", false, "Next", true)
 		if not old.ok:
 			return false
-		var fresh: Dictionary = await _show_input_dialog("P4 Password Expired",
+		var fresh: Dictionary = await _show_input_dialog("Password Expired",
 				"New password for %s:" % who, "", false, "Next", true)
 		if not fresh.ok:
 			return false
-		var again: Dictionary = await _show_input_dialog("P4 Password Expired",
+		var again: Dictionary = await _show_input_dialog("Password Expired",
 				"Type the new password once more:", "", false, "Change Password", true)
 		if not again.ok:
 			return false
@@ -1222,9 +1222,16 @@ func _file_icon(res_path: String) -> Texture2D:
 		"tscn", "scn": return _theme_icon("PackedScene")
 		"gd": return _theme_icon("GDScript")
 		"cs": return _theme_icon("CSharpScript")
-		"tres", "res": return _theme_icon("Resource")
 		"png", "webp", "jpg", "jpeg", "svg", "bmp": return _theme_icon("Image")
-		_: return _theme_icon("File")
+	# Anything else by its resource type, as the FileSystem dock shows it
+	# ("TileSet" for a tileset.tres), else a plain file: a row without an
+	# icon sits out of line with the rest.
+	if res_path.begins_with("res://"):
+		var type := EditorInterface.get_resource_filesystem().get_file_type(res_path)
+		var icon := _theme_icon(type) if not type.is_empty() else null
+		if icon:
+			return icon
+	return _theme_icon("File")
 
 
 ## Whether res_path is open as a scene tab or in the script editor.
@@ -1354,7 +1361,7 @@ func _pending_changelist_choices() -> Array:
 	var choices: Array = [{"change": "default", "label": "Default changelist"}]
 	if not await _ensure_identity():
 		return choices
-	for crec in _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
+	for crec in _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending", "-L",
 			"-c", _p4_client, "-u", _p4_user])):
 		var num := String(crec.get("change", ""))
 		if num.is_empty():
@@ -1599,7 +1606,7 @@ func _query_pending_model() -> Dictionary:
 	# 1b. Pending numbered changelists owned by us in this client, and the
 	#     files shelved in those that have a shelf (`changes` tags them with
 	#     an empty `shelved` field).
-	var changes := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending",
+	var changes := _parse_ztag(await _p4_exec(["-ztag", "changes", "-s", "pending", "-L",
 			"-c", _p4_client, "-u", _p4_user]))
 	var with_shelf: Array = []
 	for crec in changes:
@@ -2771,6 +2778,38 @@ static func _code_color(name: String, fallback: Color) -> Color:
 	return base.get_theme_color(name, "CodeEdit") if base and base.has_theme_color(name, "CodeEdit") else fallback
 
 
+## A file's name in the tree. res:// is implied for project files; dropping
+## it leaves more room for the paths themselves. A file elsewhere in the
+## workspace is shown relative to the project folder ("../art/hero.psd"), so
+## it reads as the neighbour it is. The tooltip keeps the full story.
+func _tree_label(key: String) -> String:
+	if key.begins_with("res://"):
+		return key.trim_prefix("res://")
+	return _relative_to_project(key)
+
+
+## `local` relative to the project folder, climbing out with "../" as far as
+## needed; unchanged when the two share no folder (another drive).
+func _relative_to_project(local: String) -> String:
+	var project := ProjectSettings.globalize_path("res://").replace("\\", "/").trim_suffix("/")
+	var a := project.split("/")
+	var b := local.replace("\\", "/").split("/")
+	var fold := OS.get_name() in ["Windows", "macOS"]
+	var common := 0
+	while common < a.size() and common < b.size() - 1:
+		var same := a[common].to_lower() == b[common].to_lower() if fold else a[common] == b[common]
+		if not same:
+			break
+		common += 1
+	if common == 0:
+		return local
+	var parts := PackedStringArray()
+	for i in a.size() - common:
+		parts.append("..")
+	parts.append_array(b.slice(common))
+	return "/".join(parts)
+
+
 ## How wide every dialog's text is, before editor scaling: long text wraps
 ## at a reading width instead of stretching the dialog across the screen.
 const DIALOG_WIDTH := 560
@@ -2785,8 +2824,12 @@ static var _res_prefix_re: RegEx
 ## wrapped, titled "P4Godot" unless it has a title of its own, and with
 ## project paths written as the P4G panel writes them (no "res://").
 func _popup_dialog(dialog: AcceptDialog) -> void:
+	# Every dialog says it is the plugin's: "Check Out" alone could be any
+	# plugin's, or Godot's.
 	if dialog.title.is_empty():
 		dialog.title = "P4Godot"
+	elif not dialog.title.begins_with("P4Godot"):
+		dialog.title = "P4Godot - " + dialog.title
 	dialog.dialog_text = _plain_paths(dialog.dialog_text)
 	dialog.dialog_autowrap = true
 	var width := int(DIALOG_WIDTH * EditorInterface.get_editor_scale())

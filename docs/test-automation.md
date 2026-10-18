@@ -14,11 +14,11 @@ on 2026-10-17, Windows 11, Godot 4.7, p4d 2026.1.
   `project.godot`, the `.uid` and `.import` files are in Perforce, as in a
   real team's project). The editor runs headless.
 - **GUI** (`GUI=1 SHOTS=<folder> tools/run-live-tests.sh <godot> gui-dock
-  gui-dialogs gui-windows`): the same, in a real editor window. Each test
-  drives the plugin, waits for what it shows, answers dialogs, and saves PNGs
-  of the editor, menus, dialogs and windows into `SHOTS`. The PNGs are what a
-  design review reads; they also make README screenshots. Only Godot's own
-  windows are captured, never the desktop.
+  gui-dialogs gui-windows gui-editor`): the same, in a real editor window.
+  Each test drives the plugin, waits for what it shows, answers dialogs, and
+  saves PNGs of the editor, menus, dialogs and windows into `SHOTS`. The PNGs
+  are what a design review reads. Only Godot's own windows are captured,
+  never the desktop. `THEME=light` runs the same tour in Godot's light theme.
 
 GUI mode found two things headless runs can't: Godot opens its own "Load
 Errors" dialog when it can't write a read-only `project.godot` at startup,
@@ -49,7 +49,7 @@ written yet.
 | 12 Get Latest, nothing to do | Screenshot | `gui-dialogs` |
 | 13-15 Get Latest: reload, refusals, behind | Automated | `get-latest-scene`, `-script`, `-modified`, `-checked-out`: the runner has `mate` submit a newer revision first |
 | 16-18 Connection settings and workspace switching | Screenshot | dialogs in `gui-dialogs`; `connection-dialogs`, `connection-store` offline |
-| 19, 34-36 Resolve | Automated | `submit-behind-live`, `resolve-live`; dialogs not yet captured |
+| 19, 34-36 Resolve | Automated | `submit-behind-live`, `resolve-live`; dialogs captured in `gui-dialogs` |
 | 20-22 Progress window, cancel | Automated | `submit-slow-trigger-live`, `submit-cancel`, `get-latest-cancel` (40 files of 3 MB synced away first); the window is captured in `gui-windows` |
 | 23 Delta transfer of a large binary | Next | needs a `binary+F` file of a few MB in the live project |
 | 24 Diff of an unopened changed file | Automated | `file-actions-live`; the window is captured for an opened file in `gui-windows` |
@@ -80,7 +80,31 @@ person runs these.
 
 ### README screenshots (10)
 
-All ten can come from GUI tests; `gui-dock`, `gui-dialogs` and
-`gui-windows` already capture the panel, most dialogs, and the diff,
-history, shelves and log windows. The hero GIF needs frame capture over a
-few seconds, which the same `_gui_shot` can do.
+Automated. `gui-readme` takes them in a copy of Godot's Skeleton2D demo, in
+a realistic state: a teammate's submits in the history, three changelists
+(one shelved), a file outside the project, and an edit, a new file and a
+deleted file the watcher lists. Each picture is cropped to what its README
+section describes. The hero GIF is real: the test types into a script that
+isn't checked out, answers the prompt, and saves a frame at each step.
+
+```
+DEMO=<the Skeleton2D demo folder> GUI=1 SHOTS=<folder> tools/run-live-tests.sh <godot> gui-readme
+uv run --no-project --with pillow python tools/readme-gif.py <folder>/gif docs/images/hero-checkout.gif
+```
+
+Then copy the PNGs from `<folder>` into `docs/images/`. `DEMO` copies the
+demo's game files into the test project, leaving its addons, Perforce
+settings and editor cache behind.
+
+Taking them found six problems, all fixed:
+
+- The submit confirmation listed a file outside the project by its full
+  path, where the panel shows `../art/readme.txt`.
+- Changelist names were cut at 31 characters (`p4 changes` without `-L`).
+- A `.tres` file had no icon, so its row sat out of line with the rest.
+- The P4 submenus offered Check Out and Mark for Add on a file already
+  checked out, and Revert on one that isn't. These items are greyed out now.
+- Some dialogs were titled only "Check Out" or "P4 Login", which doesn't say
+  which plugin is asking. Every title now starts with "P4Godot".
+- Every plugin window had Godot's default grey behind it. That looks fine
+  in the dark theme, but the light theme put dark text on dark grey.

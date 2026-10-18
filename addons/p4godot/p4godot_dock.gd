@@ -539,8 +539,10 @@ func _rebuild_tree(model: Dictionary) -> void:
 	for cl in model.changelists:
 		var cl_item := tree.create_item(root)
 		var label: String = "Default changelist" if cl.change == "default" \
-				else "#%s  %s" % [cl.change, cl.desc]
+				else "#%s  %s" % [cl.change, String(cl.desc).get_slice("\n", 0)]
 		cl_item.set_text(0, label)
+		if cl.change != "default":
+			cl_item.set_tooltip_text(0, "Changelist #%s\n\n%s" % [cl.change, cl.desc])
 		if bold:
 			cl_item.set_custom_font(0, bold)
 		var count: int = cl.files.size()
@@ -612,38 +614,6 @@ func _rebuild_tree(model: Dictionary) -> void:
 					s_item.set_icon_modulate(0, Color(1, 1, 1, 0.6))
 				s_item.set_metadata(0, {"type": "shelved_file", "res_path": s.res_path,
 						"depot_path": s.depot_path, "action": s.action, "change": cl.change})
-
-
-## A file's name in the tree. res:// is implied for project files; dropping
-## it leaves more room for the paths themselves. A file elsewhere in the
-## workspace is shown relative to the project folder ("../art/hero.psd"), so
-## it reads as the neighbour it is. The tooltip keeps the full story.
-func _tree_label(key: String) -> String:
-	if key.begins_with("res://"):
-		return key.trim_prefix("res://")
-	return _relative_to_project(key)
-
-
-## `local` relative to the project folder, climbing out with "../" as far as
-## needed; unchanged when the two share no folder (another drive).
-func _relative_to_project(local: String) -> String:
-	var project := ProjectSettings.globalize_path("res://").replace("\\", "/").trim_suffix("/")
-	var a := project.split("/")
-	var b := local.replace("\\", "/").split("/")
-	var fold := OS.get_name() in ["Windows", "macOS"]
-	var common := 0
-	while common < a.size() and common < b.size() - 1:
-		var same := a[common].to_lower() == b[common].to_lower() if fold else a[common] == b[common]
-		if not same:
-			break
-		common += 1
-	if common == 0:
-		return local
-	var parts := PackedStringArray()
-	for i in a.size() - common:
-		parts.append("..")
-	parts.append_array(b.slice(common))
-	return "/".join(parts)
 
 
 func _editor_bold_font() -> Font:
@@ -1361,6 +1331,29 @@ func _fs_context_actions() -> Array:
 	]
 
 
+## Grey out the actions in `sub` (built from _fs_context_actions, ids = the
+## action's index) that can't apply to the res:// `paths`, going by the files
+## the panel last listed as opened: Check Out and Mark for Add when every one
+## is checked out already, Revert when none is. A mixed selection keeps all.
+func _disable_inapplicable_actions(sub: PopupMenu, paths: Array) -> void:
+	if paths.is_empty():
+		return
+	var opened := {}
+	for cl in _last_changelists:
+		for f in cl.files:
+			opened[String(f.res_path)] = true
+	var count := 0
+	for p in paths:
+		if opened.has(String(p)):
+			count += 1
+	var actions := _fs_context_actions()
+	for i in actions.size():
+		var method := String(actions[i].method)
+		var off := (count == paths.size() and method in ["_ctx_checkout", "_ctx_add"]) \
+				or (count == 0 and method == "_ctx_revert")
+		sub.set_item_disabled(sub.get_item_index(i), off)
+
+
 # The FileSystem dock's P4 submenus, newest last, and the files the newest
 # acts on. The dock has two popups (tree and file list) that each keep the
 # submenu they were last given, so the two newest stay alive.
@@ -1391,6 +1384,7 @@ func _populate_fs_context_menu(menu: EditorContextMenuPlugin, paths: PackedStrin
 	var actions := _fs_context_actions()
 	for i in actions.size():
 		_menu_add(sub, String(actions[i].icon), String(actions[i].label), i)
+	_disable_inapplicable_actions(sub, _fs_files_only(paths))
 	sub.id_pressed.connect(_on_fs_submenu_id)
 	menu.add_context_submenu_item("P4", sub)
 

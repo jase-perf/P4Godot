@@ -1096,7 +1096,7 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	if not behind.is_empty():
 		var labels := {}
 		for f in files:
-			labels[String(f.depot_path)] = String(f.label)
+			labels[String(f.depot_path)] = _tree_label(String(f.label))
 		var lines: Array = []
 		for depot: String in behind.slice(0, 12):
 			lines.append("    " + String(labels.get(depot, depot)))
@@ -1145,7 +1145,7 @@ func _submit_changelist(change: String, files: Array, preset_desc: String = "") 
 	var file_lines: Array = []
 	var shown: int = mini(files.size(), 20)
 	for i in range(shown):
-		file_lines.append("    %s  (%s)" % [files[i].label, files[i].action])
+		file_lines.append("    %s  (%s)" % [_tree_label(String(files[i].label)), files[i].action])
 	if files.size() > shown:
 		file_lines.append("    ...and %d more" % (files.size() - shown))
 	var label := "the default changelist" if change == "default" else "changelist #%s" % change

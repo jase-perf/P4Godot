@@ -141,6 +141,7 @@ func _add_file_submenu(menu: EditorContextMenuPlugin, key: String, title: String
 	var actions := _fs_context_actions()
 	for i in actions.size():
 		_menu_add(sub, String(actions[i].icon), String(actions[i].label), i)
+	_disable_inapplicable_actions(sub, [res_path])
 	_slot_submenus[key] = sub
 	_slot_targets[key] = {"res": res_path, "line": line,
 			"code": weakref(code) if code != null else null}

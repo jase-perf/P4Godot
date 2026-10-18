@@ -4190,7 +4190,7 @@ func _run_cli_self_test_if_requested() -> void:
 			get_tree().quit()
 			return
 		if arg in ["--p4-selftest-gui-dock", "--p4-selftest-gui-dialogs", "--p4-selftest-gui-windows",
-				"--p4-selftest-gui-editor"]:
+				"--p4-selftest-gui-editor", "--p4-selftest-gui-readme"]:
 			var which := arg.trim_prefix("--p4-selftest-")
 			var ok: bool = false
 			match which:
@@ -4198,6 +4198,7 @@ func _run_cli_self_test_if_requested() -> void:
 				"gui-dialogs": ok = await _gui_test_dialogs()
 				"gui-windows": ok = await _gui_test_windows()
 				"gui-editor": ok = await _gui_test_editor()
+				"gui-readme": ok = await _gui_test_readme()
 			_log("[selftest] %s: %s" % ["PASS" if ok else "FAIL", which])
 			get_tree().quit()
 			return
@@ -4759,13 +4760,7 @@ func _gui_shot(name: String, window: Window = null) -> void:
 		image = main.get_texture().get_image()
 	elif window.is_embedded():
 		var full := main.get_texture().get_image()
-		var title := 0
-		if not window.borderless:
-			title = maxi(window.get_theme_constant("title_height"), int(32 * EditorInterface.get_editor_scale()))
-		var margin := 6
-		var rect := Rect2i(window.position - Vector2i(margin, title + margin),
-				window.size + Vector2i(margin * 2, title + margin * 2))
-		rect = rect.intersection(Rect2i(Vector2i.ZERO, full.get_size()))
+		var rect := _gui_window_rect(window).intersection(Rect2i(Vector2i.ZERO, full.get_size()))
 		image = full.get_region(rect)
 	else:
 		image = window.get_texture().get_image()
@@ -5073,7 +5068,7 @@ func _gui_test_dialogs() -> bool:
 				"(stored per-project, per-user):"), PackedStringArray(["dev-ws  (C:/Projects/Game)",
 				"dev-laptop  (D:/Work/Game)"]), 0, "Use This Workspace", CHANGE_SERVER_TEXT))
 	await _gui_capture("dialog-password", func() -> void:
-		_show_input_dialog("P4 Login", "Password for dev on ssl:perforce.example.com:1666:", "", false,
+		_show_input_dialog("Log In to Perforce", "Password for dev on ssl:perforce.example.com:1666:", "", false,
 				"Log In", true))
 	await _gui_capture("dialog-alert", func() -> void: _show_alert(NOT_CONNECTED_MESSAGE))
 	await _gui_capture("dialog-resolve", func() -> void:
@@ -5277,4 +5272,284 @@ func _gui_test_editor() -> bool:
 		_log("[selftest] FAIL: no code editor")
 		ok = false
 	_selftest_auto_answer = "confirm"
+	return ok
+
+
+# ---------------------------------------------------------------------------
+# README pictures (GUI=1 DEMO=<Godot's Skeleton2D demo> tools/run-live-tests.sh
+# gui-readme): the README's screenshots and its animated GIF, taken from a
+# real game project in a realistic state. The runner has a teammate (mate)
+# submit two changes to the player script first, so its history has two
+# authors.
+# ---------------------------------------------------------------------------
+
+## Where an embedded window is drawn in the editor's picture, title bar and
+## border included.
+func _gui_window_rect(window: Window) -> Rect2i:
+	var title := 0
+	if not window.borderless:
+		title = maxi(window.get_theme_constant("title_height"), int(32 * EditorInterface.get_editor_scale()))
+	var margin := 6
+	return Rect2i(window.position - Vector2i(margin, title + margin),
+			window.size + Vector2i(margin * 2, title + margin * 2))
+
+
+## Save the part of the editor's picture inside `rect` (plus a small border).
+func _gui_shot_rect(name: String, rect: Rect2i) -> void:
+	var dir := OS.get_environment("P4GODOT_SHOTS")
+	if dir.is_empty():
+		return
+	await _gui_frames(3)
+	var full := EditorInterface.get_base_control().get_window().get_texture().get_image()
+	rect = rect.grow(8).intersection(Rect2i(Vector2i.ZERO, full.get_size()))
+	var image := full.get_region(rect)
+	var path := dir.path_join(name + ".png")
+	image.save_png(path)
+	_log("[selftest] screenshot %s (%dx%d)" % [path, image.get_width(), image.get_height()])
+
+
+# The animated GIF's frames: PNGs of the editor plus a list of how long each
+# is shown, put together by tools/readme-gif.py.
+var _gif_frames := PackedStringArray()
+
+
+func _gui_gif_frame(hold_ms: int) -> void:
+	var dir := OS.get_environment("P4GODOT_SHOTS")
+	if dir.is_empty():
+		return
+	await _gui_frames(3)
+	DirAccess.make_dir_recursive_absolute(dir.path_join("gif"))
+	var name := "%04d.png" % _gif_frames.size()
+	EditorInterface.get_base_control().get_window().get_texture().get_image() \
+			.save_png(dir.path_join("gif").path_join(name))
+	_gif_frames.append("%s %d" % [name, hold_ms])
+
+
+func _gui_gif_finish(crop: Rect2i) -> void:
+	var dir := OS.get_environment("P4GODOT_SHOTS")
+	if dir.is_empty():
+		return
+	var f := FileAccess.open(dir.path_join("gif/frames.txt"), FileAccess.WRITE)
+	f.store_line("crop %d %d %d %d" % [crop.position.x, crop.position.y, crop.size.x, crop.size.y])
+	for line in _gif_frames:
+		f.store_line(line)
+	f.close()
+	_log("[selftest] gif: %d frames" % _gif_frames.size())
+
+
+## Right-click a dock row and save the panel with its menu open.
+func _gui_readme_row_menu(name: String, row: TreeItem) -> bool:
+	if row == null:
+		_log("[selftest] FAIL: no row for %s" % name)
+		return false
+	row.select(0)
+	tree.scroll_to_item(row)
+	await _gui_frames(2)
+	var rect := tree.get_item_area_rect(row, 0)
+	var at := Vector2i(tree.get_screen_position() + rect.position + Vector2(rect.size.x * 0.35, rect.size.y * 0.5))
+	_context_target = row.get_metadata(0)
+	_populate_context_menu(_context_target)
+	context_menu.reset_size()
+	context_menu.position = at
+	context_menu.popup()
+	await _gui_frames(4)
+	var area := Rect2i(dock.get_global_rect()).merge(Rect2i(context_menu.position, context_menu.size))
+	await _gui_shot_rect(name, area)
+	context_menu.hide()
+	return true
+
+
+## Give the bottom panel `height` pixels, as dragging its divider would. The
+## editor's split (4.7) ignores split_offset here (measured) but honours a
+## minimum size on the panel, which is what this sets; 0 gives the panel back.
+func _gui_panel_height(height: int) -> void:
+	var panel: Node = dock
+	while panel != null and not (panel.get_parent() is SplitContainer
+			and (panel.get_parent() as SplitContainer).vertical):
+		panel = panel.get_parent()
+	if panel == null:
+		_log("[selftest] no split above the panel")
+		return
+	(panel as Control).custom_minimum_size.y = height
+	await _gui_frames(10)
+	_log("[selftest] panel height %d (wanted %d)" % [int(dock.size.y), height])
+
+
+func _gui_test_readme() -> bool:
+	if not FileAccess.file_exists("res://player/player.gd"):
+		_log("[selftest] FAIL: gui-readme takes DEMO=<Godot's Skeleton2D demo>")
+		return false
+	await _gui_show_dock()
+	_selftest_auto_answer = ""
+	var ok := true
+	EditorInterface.open_scene_from_path("res://level.tscn")
+	await _gui_frames(60)
+	# --- The GIF: edit a script that isn't checked out, say yes, and the file
+	# is in the default changelist.
+	var player_res := "res://player/player.gd"
+	var player := ProjectSettings.globalize_path(player_res)
+	var script := load(player_res) as Script
+	EditorInterface.set_main_screen_editor("Script")
+	EditorInterface.edit_script(script)
+	await _gui_frames(30)
+	_rebuild_tree(await _query_pending_model())
+	var code := EditorInterface.get_script_editor().get_current_editor().get_base_editor() as CodeEdit
+	if code == null:
+		_log("[selftest] FAIL: no code editor")
+		return false
+	var line := -1
+	for i in code.get_line_count():
+		if code.get_line(i).begins_with("const WALK_SPEED"):
+			line = i
+	var col := code.get_line(line).find("200.0")
+	code.set_caret_line(line)
+	code.set_caret_column(col)
+	# Near the top, where the prompt (centred on the editor) won't cover it.
+	code.set_line_as_first_visible(maxi(0, line - 3))
+	await _gui_frames(10)
+	await _gui_gif_frame(1600)
+	code.select(line, col, line, col + 5)
+	await _gui_gif_frame(800)
+	code.delete_selection()
+	code.insert_text_at_caret("2")
+	code.text_changed.emit()
+	await _gui_gif_frame(250)
+	var prompt := await _gui_wait_dialog()
+	if prompt == null:
+		_log("[selftest] FAIL: editing showed no checkout prompt")
+		return false
+	await _gui_gif_frame(3200)
+	_gui_press(prompt, true)
+	var deadline := Time.get_ticks_msec() + 10000
+	while _gui_row({"type": "file", "res_path": player_res}) == null and Time.get_ticks_msec() < deadline:
+		await _gui_frames(5)
+	ok = ok and _gui_row({"type": "file", "res_path": player_res}) != null
+	await _gui_gif_frame(1200)
+	for ch in ["4", "0", ".", "0"]:
+		code.insert_text_at_caret(ch)
+		code.text_changed.emit()
+		await _gui_gif_frame(140)
+	await _gui_gif_frame(3500)
+	var se := EditorInterface.get_script_editor()
+	await _gui_gif_finish(Rect2i(se.get_global_rect().position.x - 4, 0,
+			se.get_global_rect().size.x + 8, EditorInterface.get_base_control().get_window().size.y))
+	# More to the player change, for a diff with lines on both sides; saved the
+	# way the script editor saves.
+	var text := code.text
+	text = text.replace("const JUMP_VELOCITY = -300", "const JUMP_VELOCITY = -340")
+	text = text.replace("# Keep this in sync with the AnimationTree's state names.\n", "")
+	text = text.replace("const TERMINAL_VELOCITY = 360\n", "const TERMINAL_VELOCITY = 360\n" +
+			"## How long holding jump keeps adding height, in seconds.\nconst JUMP_HOLD_TIME = 0.2\n")
+	code.text = text
+	script.source_code = text
+	ResourceSaver.save(script, player_res)
+	code.tag_saved_version()
+	EditorInterface.set_main_screen_editor("2D")
+	# Room for every changelist in the panel pictures.
+	await _gui_panel_height(420)
+	# --- The rest of a working day. A first look at the project before any
+	# of it, as the watcher has when the editor has been open a while: a
+	# missing file is one it saw before.
+	detect_external_checkbox.set_pressed_no_signal(true)
+	auto_checkout_detected_checkbox.set_pressed_no_signal(false)
+	await _selftest_watch_pass()
+	var g := func(res: String) -> String: return ProjectSettings.globalize_path(res)
+	var sprite := Image.load_from_file(g.call("res://player/gBot.png"))
+	sprite.adjust_bcs(1.05, 1.0, 0.35)
+	sprite.save_png(g.call("res://player/gBot_winter.png"))
+	await _p4_exec_logged(["add", g.call("res://player/gBot_winter.png")])
+	await _p4_exec_logged(["edit", _client_root.path_join("art/readme.txt")])
+	var parallax := await _create_selftest_change("Parallax: slower clouds and a third layer of far platforms", "")
+	DirAccess.copy_absolute(g.call("res://level/background/distant_platforms_2.png"),
+			g.call("res://level/background/distant_platforms_3.png"))
+	await _p4_exec_logged(["edit", "-c", parallax, g.call("res://level/parallax_background.tscn")])
+	await _p4_exec_logged(["add", "-c", parallax, g.call("res://level/background/distant_platforms_3.png")])
+	await _p4_exec_logged(["delete", "-c", parallax, g.call("res://level/background/cloud_3.png")])
+	await _p4_exec_logged(["shelve", "-c", parallax])
+	var tiles := await _create_selftest_change("Tileset: fix the seams along the grass edge", "")
+	await _p4_exec_logged(["edit", "-c", tiles, g.call("res://level/tileset/tileset.tres")])
+	# What the watcher lists, with automatic opening off: a script changed in
+	# another editor, a new image, a deleted file.
+	var level := g.call("res://level/level.gd") as String
+	_set_file_writable(level, true)
+	var lf := FileAccess.open(level, FileAccess.READ_WRITE)
+	lf.seek_end()
+	lf.store_string("\n# Camera limits follow the tileset's used rect.\n")
+	lf.close()
+	DirAccess.copy_absolute(g.call("res://level/background/sky.png"), g.call("res://level/background/sky_night.png"))
+	# Read-only, as Perforce leaves it: Windows won't delete it until it isn't.
+	_set_file_writable(g.call("res://README.md"), true)
+	if DirAccess.remove_absolute(g.call("res://README.md")) != OK:
+		_log("[selftest] FAIL: couldn't delete README.md")
+		ok = false
+	await _selftest_settle()
+	await _selftest_watch_pass()
+	_rebuild_tree(await _query_pending_model())
+	await _gui_frames(30)
+	# --- The pictures.
+	ok = await _gui_readme_row_menu("changelist-dock", _gui_row({"type": "file", "res_path": player_res})) and ok
+	ok = await _gui_readme_row_menu("watcher", _gui_row({"type": "detected", "action": "add"})) and ok
+	var default_files: Array = []
+	for cl in _last_changelists:
+		if String(cl.change) == "default":
+			default_files = cl.files
+	var confirm_text := await _gui_capture("submit-confirm", func() -> void:
+		_submit_changelist("default", default_files, "Player: faster walk, higher jump, and a winter skin"))
+	ok = ok and confirm_text.contains("Submit the default changelist")
+	_diff_path(player_res)
+	await _gui_frames(60)
+	await _gui_shot("diff-viewer", diff_window)
+	diff_window.hide()
+	_show_history(player_res)
+	await _gui_frames(60)
+	await _gui_shot("history", history_window)
+	history_window.hide()
+	_show_shelves(parallax)
+	await _gui_frames(90)
+	await _gui_shot("shelves", shelves_window)
+	shelves_window.hide()
+	await _gui_capture("connection-setup", func() -> void:
+		_show_option_dialog("P4Godot - Connection Setup", ("Server: ssl:perforce.example.com:1666\nUser: dev\n\n" +
+				"Found a workspace whose root contains this project.\nWorkspace to use for this project " +
+				"(stored per-project, per-user):"), PackedStringArray(["dev-ws  (C:/Projects/Skeleton2D)",
+				"dev-laptop  (D:/Work/Skeleton2D)"]), 0, "Use This Workspace", CHANGE_SERVER_TEXT))
+	# The FileSystem dock's P4 submenu on the player script.
+	var fs := EditorInterface.get_file_system_dock()
+	fs.navigate_to_path(player_res)
+	await _gui_frames(20)
+	var fs_tree: Tree = null
+	for t in fs.find_children("*", "Tree", true, false):
+		if (t as Tree).is_visible_in_tree() and (t as Tree).get_selected() != null:
+			fs_tree = t
+	if fs_tree:
+		var item := fs_tree.get_selected()
+		var rect := fs_tree.get_item_area_rect(item, 0)
+		var at := fs_tree.get_global_rect().position + rect.position + Vector2(rect.size.x * 0.3, rect.size.y * 0.5)
+		await _gui_right_click(at)
+		await _gui_frames(5)
+		var menu := _gui_open_menu()
+		if menu:
+			# At the click, as the mouse would place it: under test Godot puts
+			# it by the window's screen position, which embedding offsets.
+			var bottom := EditorInterface.get_base_control().get_window().size.y
+			menu.position = Vector2i(int(at.x), mini(int(at.y), bottom - menu.size.y - 8))
+			await _gui_frames(2)
+			var sub := await _gui_open_submenu(menu, "P4")
+			var area := Rect2i(fs.get_global_rect()).merge(Rect2i(menu.position, menu.size))
+			if sub:
+				area = area.merge(Rect2i(sub.position, sub.size))
+			await _gui_shot_rect("filesystem-dock", area)
+			menu.hide()
+		else:
+			_log("[selftest] FAIL: no FileSystem dock menu opened")
+			ok = false
+	else:
+		_log("[selftest] FAIL: couldn't find the FileSystem tree")
+		ok = false
+	# Back as it was, for the runner's check that nothing is left open.
+	_selftest_auto_answer = "confirm"
+	await _p4_exec_logged(["shelve", "-d", "-c", parallax])
+	await _p4_exec_logged(["revert", "//%s/..." % _p4_client])
+	await _p4_exec_logged(["change", "-d", parallax])
+	await _p4_exec_logged(["change", "-d", tiles])
 	return ok

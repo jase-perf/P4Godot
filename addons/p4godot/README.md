@@ -25,10 +25,9 @@ all in the [glossary](https://github.com/jase-perf/P4Godot/blob/main/docs/glossa
 P4Godot is written in GDScript, so there's nothing to compile. Behind the
 scenes it runs `p4`, Perforce's command-line program, for you.
 
-<!-- 📷 HERO GIF: the signature loop, captured in one take —
-     edit a file in the editor → checkout prompt appears → accept → the file
-     shows up under the default changelist in the P4G panel.
-     Suggested file: docs/images/hero-checkout.gif -->
+<p align="center">
+  <img src="https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/hero-checkout.gif" alt="Typing in a script that isn't checked out: P4Godot asks to check it out, and after Check Out the file is listed under Default changelist in the P4G panel" width="760">
+</p>
 
 ## Quick start
 
@@ -290,8 +289,7 @@ Whatever you choose here is stored per project and per user, and passed to
 `p4` as command-line flags. Your terminal, P4V, and other projects are
 unaffected.
 
-<!-- 📷 SCREENSHOT (optional): the workspace-suggestion dialog from connection
-     setup. Suggested file: docs/images/connection-setup.png -->
+![Connection setup offering the workspace whose root contains the project, with Use This Workspace, Cancel and Change Server or User buttons](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/connection-setup.png)
 
 ### The P4G panel: everything you have changed
 
@@ -317,10 +315,7 @@ From there you can:
 - Check out what the watcher found, under **Changed, not checked out** (see
   [files you edited elsewhere](#files-you-edited-in-photoshop-blender-or-anywhere-else)).
 
-<!-- 📷 SCREENSHOT: the P4 dock with two or three changelists expanded, a few
-     files with different actions (add/edit/delete show in different colors),
-     and the right-click context menu open on a file row.
-     Suggested file: docs/images/changelist-dock.png -->
+![The P4G panel: files changed outside Godot, the default changelist with an edit, an add and a file outside the project, two numbered changelists (one with a shelf), and the right-click menu on a file](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/changelist-dock.png)
 
 Submitting always shows a confirmation that lists the files and the
 description first. That list comes from the server as you press Submit, so it
@@ -338,8 +333,7 @@ before telling you. A dropped connection can leave a submit that went through
 anyway, so the message says which it was: submitted, not submitted, or
 unknown, with what to do next.
 
-<!-- 📷 SCREENSHOT: the submit confirmation dialog listing files + description.
-     Suggested file: docs/images/submit-confirm.png -->
+![The submit confirmation, listing the description and the three files about to be submitted](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/submit-confirm.png)
 
 ### A file's history
 
@@ -347,6 +341,9 @@ Right-click a file → **P4 → History...** (in the FileSystem dock or the P4G
 panel) lists every submitted revision: who, when, which changelist, and the
 whole description. It follows the file back through moves and renames, so a
 file renamed last month still shows its earlier revisions under the old name.
+
+![History of player.gd: three revisions by two people, with the selected
+revision's whole description below](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/history.png)
 
 - **Diff vs Previous** compares a revision with the one before it. Select two
   revisions and it becomes **Diff Selected**. Double-clicking a revision does
@@ -396,6 +393,10 @@ files that are open in Godot.
 newest shelved changelists with files in this project, everyone's or only
 yours, and opens any changelist by its number - the one in a code review or a
 teammate's message. Pick one to see its description and files:
+
+![The Shelves window: a shelved changelist, its three files and its
+description](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/shelves.png)
+
 
 - **Diff vs Base** shows what the shelf changes in a file: the shelved version
   beside the revision it was made from. Double-clicking a file does the same.
@@ -528,10 +529,7 @@ small files and a server on the same Windows machine, that first look took
 files were in the disk cache. Later looks took about a second and checked
 nothing that hadn't changed. Over a network the first look takes longer.
 
-<!-- 📷 SCREENSHOT: the P4G dock with "Changed, not checked out" expanded (an
-     edit, a new file, a missing file), a changelist holding a ../art/ file,
-     and the right-click menu open on the new file.
-     Suggested file: docs/images/watcher.png -->
+![Changed, not checked out: a deleted README, a new image and a script edited in another program, with the right-click menu on the new image](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/watcher.png)
 
 ### Leaving files writable
 
@@ -550,10 +548,7 @@ file" and leaves it alone (verified with P4 2026.1 and the default
 `noclobber` option). Switching back makes unchanged files read-only again
 and leaves any changed, unopened file writable, so nothing can overwrite it.
 
-<!-- 📷 SCREENSHOT: the FileSystem dock with the P4 context menu open on a file,
-     and (second shot or same composition) a hover tooltip showing
-     "//depot/...#3 (head #5 - out of date) opened for edit".
-     Suggested file: docs/images/filesystem-dock.png -->
+![The FileSystem dock's right-click menu with its P4 submenu open on a checked-out script: Check Out and Mark for Add are greyed out](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/filesystem-dock.png)
 
 ### Diff viewer
 
@@ -564,8 +559,7 @@ colored change bands. Within a changed line, the exact span that differs is
 highlighted. Line-ending differences are ignored, because Godot writes LF
 while Windows workspaces usually sync CRLF.
 
-<!-- 📷 SCREENSHOT: the diff window on a file with a few added and removed
-     lines visible. Suggested file: docs/images/diff-viewer.png -->
+![The diff viewer: the downloaded version of player.gd beside the copy on disk, with changed, removed and added lines highlighted](https://raw.githubusercontent.com/jase-perf/P4Godot/main/docs/images/diff-viewer.png)
 
 ### Speed, and the activity log
 
@@ -719,6 +713,14 @@ Working on the plugin itself? See [CONTRIBUTING.md](https://github.com/jase-perf
 ## License
 
 The code is licensed under the [MIT License](LICENSE).
+
+The screenshots show Godot's
+[Skeleton2D demo](https://github.com/godotengine/godot-demo-projects/tree/master/2d/skeleton)
+from the [Godot demo projects](https://github.com/godotengine/godot-demo-projects)
+(MIT License, Godot Engine contributors). Its GBot character is by Andreas
+Esau and its rigging and animation by RustyStriker, both under the MIT
+License. `tools/run-live-tests.sh` makes them fresh: see
+[docs/test-automation.md](https://github.com/jase-perf/P4Godot/blob/main/docs/test-automation.md).
 
 The Perforce and P4 names and logos are trademarks of Perforce Software, Inc.,
 used here to identify the product this plugin integrates with. This is a

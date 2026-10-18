@@ -30,6 +30,19 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
     windows scale with the editor.
   - Godot's own leftover save files (`project.godot4667122.tmp`) are no
     longer offered for adding.
+  - Changelist names in the panel show the whole first line of the
+    description; they were cut at 31 characters. The tooltip has the rest.
+  - The submit confirmation names files outside the project as the panel
+    does (`../art/readme.txt`), not by their full path.
+  - The P4 submenus grey out Check Out and Mark for Add on files that are
+    already checked out, and Revert on files that aren't.
+  - Every dialog's title starts with "P4Godot" ("P4Godot - Check Out").
+  - Windows follow the editor theme, light or dark: their background and the
+    diff's code colours were the dark theme's whatever the user chose.
+  - Files of other resource types (`.tres` and the like) show their type's
+    icon, as in the FileSystem dock.
+  - The README has screenshots and an animated GIF, made by a test from
+    Godot's Skeleton2D demo, so they can be retaken after any change.
 - **project.godot can be made always writable in one click.** Godot 4.7
   writes `project.godot` at every editor start (measured), which fails with
   "Load Errors" in a read-only workspace. P4Godot offers once to check it

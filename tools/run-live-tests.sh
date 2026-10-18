@@ -85,7 +85,11 @@ fi
 # it opens it (measured, 4.7), and a read-only one then stops on Godot's own
 # "Load Errors" dialog - as it does for a team after every Godot upgrade.
 godot_features="$("$GODOT" --version 2>/dev/null | cut -d. -f1-2)"
-project_name="${demo_name:-config/name=\"p4godot-livetest\"}"
+# Godot's own key order (main_scene before features), or its first save
+# rewrites the file and the watcher lists it as changed.
+application="${demo_name:-config/name=\"p4godot-livetest\"}"
+[ -n "${main_scene:-}" ] && application="$application
+$main_scene"
 cat > "$proj/project.godot" <<EOF
 ; Engine configuration file.
 ; It's best edited using the editor UI and not directly,
@@ -99,9 +103,8 @@ config_version=5
 
 [application]
 
-$project_name
+$application
 config/features=PackedStringArray("$godot_features")
-${main_scene:-}
 EOF
 # A plugin that doesn't compile can't run any test: each would only wait out
 # its timeout and retries.
@@ -119,13 +122,16 @@ if grep -q "SCRIPT ERROR" "$work/logs/check.log"; then
 fi
 printf '.godot/\n*.log\n%s\n' "$P4CONFIG" > "$proj/.p4ignore"
 printf '%s\n' "$P4CONFIG" > "$P4TEST_WS/.p4ignore"
-printf 'extends Node\n' > "$proj/main.gd"
 printf 'Art source, outside the Godot project\n' > "$P4TEST_WS/art/readme.txt"
-# Files some tests work on: a scene, a script, and an image Godot imports.
-mkdir -p "$proj/scenes" "$proj/scripts" "$proj/art" || exit 1
-printf '[gd_scene format=3]\n\n[node name="Level" type="Node2D"]\n' > "$proj/scenes/level.tscn"
-printf 'extends Node\n\n\nfunc _ready() -> void:\n\tpass\n' > "$proj/scripts/player.gd"
-cp docs/images/p4-icon-dark.svg "$proj/art/icon.svg" || exit 1
+# Files some tests work on: a scene, a script, and an image Godot imports. A
+# DEMO project brings its own, and these would only clutter its pictures.
+if [ -z "${DEMO:-}" ]; then
+	printf 'extends Node\n' > "$proj/main.gd"
+	mkdir -p "$proj/scenes" "$proj/scripts" "$proj/art" || exit 1
+	printf '[gd_scene format=3]\n\n[node name="Level" type="Node2D"]\n' > "$proj/scenes/level.tscn"
+	printf 'extends Node\n\n\nfunc _ready() -> void:\n\tpass\n' > "$proj/scripts/player.gd"
+	cp docs/images/p4-icon-dark.svg "$proj/art/icon.svg" || exit 1
+fi
 # Godot's first look at a project rewrites project.godot, writes a .uid for
 # each script and imports the assets; a team checks the result in. Done with
 # the plugin still off, so it doesn't act yet. Without it, every test's
@@ -135,7 +141,7 @@ run_import() {
 	if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi
 }
 run_import "$GODOT" --headless --editor --import --path "$proj" > "$work/logs/import.log" 2>&1
-[ -f "$proj/art/icon.svg.import" ] || { echo "FAIL: Godot didn't import the test project"; exit 1; }
+[ -d "$proj/.godot/imported" ] || { echo "FAIL: Godot didn't import the test project"; exit 1; }
 printf '\n[editor_plugins]\n\nenabled=PackedStringArray("res://addons/p4godot/plugin.cfg")\n' >> "$proj/project.godot"
 (
 	cd "$proj" || exit 1
@@ -257,6 +263,20 @@ for t in $TESTS; do
 				p4t add -t binary big/*.bin >/dev/null &&
 				p4t submit -d "Big files for the cancel test" >/dev/null &&
 				p4t sync -q "big/...#none" >/dev/null) ||
+				{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; } ;;
+		# The README's pictures: a teammate's two changes to the player script
+		# first, so its history has two authors.
+		gui-readme)
+			[ -n "${DEMO:-}" ] || { echo "FAIL: $t takes DEMO=<Godot's Skeleton2D demo>"; failed="$failed $t"; continue; }
+			f=player/player.gd
+			(mate sync -q "//mate-ws/..." >/dev/null 2>&1
+				mate edit "$P4TEST_MATE_WS/$f" >/dev/null &&
+				sed -i 's/^const ACCELERATION_SPEED = WALK_SPEED \* 6.0/const ACCELERATION_SPEED = WALK_SPEED * 8.0/' "$P4TEST_MATE_WS/$f" &&
+				mate submit -d "Player: tighter air control" "$P4TEST_MATE_WS/$f" >/dev/null &&
+				mate edit "$P4TEST_MATE_WS/$f" >/dev/null &&
+				sed -i 's/^const TERMINAL_VELOCITY = 400/const TERMINAL_VELOCITY = 360/' "$P4TEST_MATE_WS/$f" &&
+				mate submit -d "Player: lower fall speed so landings read better" "$P4TEST_MATE_WS/$f" >/dev/null &&
+				cd "$proj" && p4t sync -q ./... >/dev/null) ||
 				{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; } ;;
 		# These leave what they checked out opened, by design; reverted below.
 		history-gate|decline-reprompt) arg="$arg=res://scenes/level.tscn" ;;

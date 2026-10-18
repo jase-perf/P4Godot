@@ -232,7 +232,7 @@ func _shelve_changelist(change: String, revert_after: bool, preset_desc: String 
 		existing = (await _read_shelves([change])).get(change, [])
 	var labels: Array = []
 	for f in files:
-		labels.append("%s  (%s)" % [f.label, f.action])
+		labels.append("%s  (%s)" % [_tree_label(String(f.label)), f.action])
 	var in_editor := _open_in_editor(files.map(func(f: Dictionary) -> String: return String(f.label)))
 
 	var what := "changelist #%s" % change if change != "default" else "the default changelist"

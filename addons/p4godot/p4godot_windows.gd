@@ -55,7 +55,7 @@ var _progress_note_text: String = ""
 func _build_progress_window() -> void:
 	_progress_window = Window.new()
 	_themed_background(_progress_window)
-	_progress_window.title = "Perforce"
+	_progress_window.title = "P4Godot - Transfer"
 	_progress_window.size = Vector2i(Vector2(560, 200) * EditorInterface.get_editor_scale())
 	_progress_window.visible = false
 	_progress_window.unresizable = false
@@ -116,7 +116,7 @@ func _progress_begin(title: String, headline: String, tracker: P4Progress) -> vo
 	_progress_note_text = ""
 	_progress_started_msec = Time.get_ticks_msec()
 	_progress_last_activity_msec = _progress_started_msec
-	_progress_window.title = title
+	_progress_window.title = "P4Godot - " + title
 	_progress_headline.text = headline
 	_progress_cancel_button.disabled = false
 	_progress_cancel_button.text = "Cancel"
