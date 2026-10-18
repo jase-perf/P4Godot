@@ -1322,6 +1322,10 @@ func _register_filesystem_hooks() -> void:
 
 
 func _unregister_filesystem_hooks() -> void:
+	for sub in _fs_submenus:
+		if is_instance_valid(sub):
+			sub.queue_free()
+	_fs_submenus.clear()
 	var fsd := EditorInterface.get_file_system_dock()
 	if fsd:
 		if fsd.has_signal("file_removed") and fsd.file_removed.is_connected(_on_fs_file_removed):
@@ -1356,9 +1360,10 @@ func _fs_context_actions() -> Array:
 	]
 
 
-# The FileSystem dock's P4 submenu for the latest right-click, and the files
-# it acts on.
-var _fs_submenu: PopupMenu
+# The FileSystem dock's P4 submenus, newest last, and the files the newest
+# acts on. The dock has two popups (tree and file list) that each keep the
+# submenu they were last given, so the two newest stay alive.
+var _fs_submenus: Array[PopupMenu] = []
 var _fs_submenu_paths: PackedStringArray
 
 
@@ -1373,15 +1378,20 @@ func _populate_fs_context_menu(menu: EditorContextMenuPlugin, paths: PackedStrin
 	# One "P4" submenu, as on script tabs, scene tabs, the code editor and the
 	# scene tree, rather than seven items crowding Godot's own menu. A new one
 	# each time: Godot clears its menu before asking plugins.
-	if is_instance_valid(_fs_submenu):
-		_fs_submenu.queue_free()
-	_fs_submenu = PopupMenu.new()
+	# Each popup is cleared and refilled before it is shown again, so a third
+	# submenu means the oldest belongs to a popup that has since moved on.
+	while _fs_submenus.size() >= 2:
+		var old: PopupMenu = _fs_submenus.pop_front()
+		if is_instance_valid(old):
+			old.queue_free()
+	var sub := PopupMenu.new()
+	_fs_submenus.append(sub)
 	_fs_submenu_paths = paths
 	var actions := _fs_context_actions()
 	for i in actions.size():
-		_menu_add(_fs_submenu, String(actions[i].icon), String(actions[i].label), i)
-	_fs_submenu.id_pressed.connect(_on_fs_submenu_id)
-	menu.add_context_submenu_item("P4", _fs_submenu)
+		_menu_add(sub, String(actions[i].icon), String(actions[i].label), i)
+	sub.id_pressed.connect(_on_fs_submenu_id)
+	menu.add_context_submenu_item("P4", sub)
 
 
 func _on_fs_submenu_id(id: int) -> void:

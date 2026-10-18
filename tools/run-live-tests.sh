@@ -213,12 +213,14 @@ for t in $TESTS; do
 ' ;;
 			esac
 			stage_behind "$file" "$extra" || { echo "FAIL: $t (staging)"; failed="$failed $t"; continue; }
+			staged=1
 			case "$t" in
 				get-latest-modified)
-					chmod u+w "$proj/$file" && printf '# my unsubmitted change\n' >> "$proj/$file" ;;
+					chmod u+w "$proj/$file" && printf '# my unsubmitted change\n' >> "$proj/$file" || staged="" ;;
 				get-latest-checked-out)
-					(cd "$proj" && p4t edit "$file" >/dev/null) ;;
+					(cd "$proj" && p4t edit "$file" >/dev/null) || staged="" ;;
 			esac
+			[ -n "$staged" ] || { echo "FAIL: $t (staging)"; failed="$failed $t"; continue; }
 			arg="--p4-selftest-get-latest=res://$file" ;;
 		# A project whose project.godot is in Perforce but whose addon isn't:
 		# the addon leaves the depot and stays on disk.
@@ -259,7 +261,10 @@ for t in $TESTS; do
 	grep "\[selftest\]" "$log" | sed 's/^/    /'
 	case "$t" in
 		probe) want="\[selftest\] probe status=ok" ;;
-		get-latest-scene|get-latest-script|get-latest-modified|get-latest-checked-out) want="\[selftest\] PASS: get-latest" ;;
+		# Each variant must end the way its staging demands, not just pass.
+		get-latest-scene|get-latest-script) want="\[selftest\] PASS: get-latest \(downloaded and reloaded\)" ;;
+		get-latest-modified) want="\[selftest\] PASS: get-latest \(refusal reported\)" ;;
+		get-latest-checked-out) want="\[selftest\] PASS: get-latest \(resolve reported\)" ;;
 		*) want="\[selftest\] PASS: $t" ;;
 	esac
 	# A PASS line may carry a note after the name; Godot's lines end in CRLF
@@ -282,8 +287,12 @@ for t in $TESTS; do
 		get-latest-cancel)
 			(cd "$proj" && p4t sync -q "big/..." >/dev/null 2>&1 && p4t delete "big/..." >/dev/null 2>&1 &&
 				p4t submit -d "Remove the cancel test's files" >/dev/null 2>&1; rm -rf big) ;;
-		get-latest-scene|get-latest-script|get-latest-modified|get-latest-checked-out)
-			(cd "$proj" && p4t revert "//$P4CLIENT/..." >/dev/null 2>&1 && p4t sync -f "$file" >/dev/null 2>&1) ;;
+		# Only the checked-out variant leaves a file opened; anything else open
+		# afterwards is a finding for the check below.
+		get-latest-checked-out)
+			(cd "$proj" && p4t revert "$file" >/dev/null 2>&1 && p4t sync -f "$file" >/dev/null 2>&1) ;;
+		get-latest-scene|get-latest-script|get-latest-modified)
+			(cd "$proj" && p4t sync -f "$file" >/dev/null 2>&1) ;;
 	esac
 	left="$(cd "$proj" && p4t -F %depotFile% opened 2>/dev/null)"
 	if [ -n "$left" ]; then

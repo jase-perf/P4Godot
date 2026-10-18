@@ -1225,6 +1225,15 @@ func _run_cli_self_test_if_requested() -> void:
 			checks["a refused preview still counts as a change"] = _preview_refusals(lock_lines) \
 					== {"//d/art/hero.psd": "edit"} and _preview_refusals([
 					"//d/x.png - can't delete exclusive file already opened"]) == {"//d/x.png": "delete"}
+			var tmp_dir := OS.get_cache_dir().path_join("p4g_leftover_test")
+			DirAccess.make_dir_recursive_absolute(tmp_dir)
+			for n: String in ["music.mp3", "music.mp34667122.tmp", "save", "save1.tmp", "orphan.txt12345.tmp"]:
+				var f := FileAccess.open(tmp_dir.path_join(n), FileAccess.WRITE)
+				f.store_string("x")
+				f.close()
+			checks["Godot save leftovers"] = _is_godot_save_leftover(tmp_dir.path_join("music.mp34667122.tmp")) 					and not _is_godot_save_leftover(tmp_dir.path_join("save1.tmp")) 					and not _is_godot_save_leftover(tmp_dir.path_join("orphan.txt12345.tmp")) 					and not _is_godot_save_leftover(tmp_dir.path_join("music.mp3"))
+			for n: String in DirAccess.get_files_at(tmp_dir):
+				DirAccess.remove_absolute(tmp_dir.path_join(n))
 			checks["clean gets raw names"] = Array(_escape_path_args(["clean", "-e", "C:/w/x@2.txt"])) 					== ["clean", "-e", "C:/w/x@2.txt"]
 			checks["revert flags"] = _clean_flag("edit") == "-e" and _clean_flag("delete") == "-d" \
 					and _clean_flag("move/delete") == "-d" and _clean_flag("add") == "" and _clean_flag("move/add") == ""

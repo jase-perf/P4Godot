@@ -278,6 +278,9 @@ func _scan_for_external_changes_inner(reason: String) -> void:
 	if _watch_gone(epoch):
 		return
 	_drop_pruned(walked)
+	for key: String in _watch_cache.keys():
+		if not walked.has(key) and _is_godot_save_leftover(String(_watch_cache[key][0])):
+			_watch_cache.erase(key)
 	# A file that stopped being opened was submitted or reverted somewhere;
 	# what was known about it before it was opened no longer holds.
 	for key: String in _watch_opened_prev:
@@ -1364,16 +1367,23 @@ func _offer_allwrite_inner() -> void:
 ## read-only, the fix is the always-writable filetype, which the whole team
 ## gets once it's submitted. Offered once per project.
 func _offer_project_godot_writable() -> void:
-	if _client_allwrite == true or _selftest_mode or _shutting_down:
+	if _selftest_mode or _shutting_down:
 		return
 	var settings := EditorInterface.get_editor_settings()
 	if settings.get_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", false):
+		return
+	var local_pg := ProjectSettings.globalize_path("res://project.godot")
+	if FileAccess.open(local_pg, FileAccess.READ_WRITE) != null:
+		return # Writable on disk already (allwrite, or checked out): Godot can write it.
+	# Recorded before anything is awaited: the startup call and the
+	# connection-setup call must not both get past this.
+	settings.set_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", true)
+	if await _workspace_is_allwrite():
 		return
 	var rec := await _fetch_fstat_record("res://project.godot")
 	if rec.is_empty() or not rec.has("headType") or rec.has("action") \
 			or _type_is_writable(String(rec.headType)):
 		return # Not in Perforce, already checked out, or already writable.
-	settings.set_project_metadata(SETTINGS_SECTION, "project_godot_writable_asked", true)
 	if not await _show_project_godot_offer():
 		return
 	var local := ProjectSettings.globalize_path("res://project.godot")

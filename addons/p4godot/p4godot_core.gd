@@ -1759,7 +1759,7 @@ func _p4_exec(args: PackedStringArray, offer_login: bool = true,
 	# never contacts the server, and connection settings need its answer most
 	# exactly when the server is unreachable).
 	if _server_unreachable() and _is_probe_command(args) \
-			and not _p4_subcommand(args) in ["info", "login", "set"]:
+			and not _p4_subcommand(args) in ["info", "login", "set", "describe"]:
 		return _skipped_result()
 	var loud := _should_log_cmd(args) # decided BEFORE the -p/-u/-c flags join in
 	args = _with_connection_flags(_escape_path_args(args), maxwait_sec)
@@ -2431,6 +2431,7 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 	_dialog_result_confirmed = false
 
 	var dialog := ConfirmationDialog.new()
+	dialog.title = "P4Godot"
 	dialog.set_text(text)
 	dialog.set_ok_button_text(ok_text)
 	dialog.set_cancel_button_text(cancel_text)
@@ -2723,9 +2724,6 @@ func _show_checkout_target_dialog(text: String, ok_text: String,
 	return {"ok": confirmed, "change": change}
 
 
-static var _godot_temp_re: RegEx
-
-
 ## Whether `local` is the temporary file a Godot save left behind when it
 ## couldn't replace the real file (a read-only one, say): the real file's
 ## name plus digits and ".tmp" - "project.godot4667122.tmp" - with the real
@@ -2733,15 +2731,24 @@ static var _godot_temp_re: RegEx
 static func _is_godot_save_leftover(local: String) -> bool:
 	if not local.ends_with(".tmp"):
 		return false
-	if _godot_temp_re == null:
-		_godot_temp_re = RegEx.create_from_string("^(.+?)\\d+\\.tmp$")
-	var m := _godot_temp_re.search(local.replace("\\", "/"))
-	return m != null and FileAccess.file_exists(m.get_string(1))
+	var stem := local.trim_suffix(".tmp")
+	# The digits can also end the real name ("music.mp3" + "4667122"), so
+	# every split of the trailing digits is tried, leaving at least four.
+	var digits := 0
+	while digits < stem.length() and stem[stem.length() - 1 - digits].is_valid_int():
+		digits += 1
+	for k in range(digits, 3, -1):
+		if FileAccess.file_exists(stem.left(stem.length() - k)):
+			return true
+	return false
 
 
 ## How wide every dialog's text is, before editor scaling: long text wraps
 ## at a reading width instead of stretching the dialog across the screen.
 const DIALOG_WIDTH := 560
+## An alert longer than this is cut short (its whole text is in the Log), so
+## its OK button stays on the screen.
+const ALERT_MAX_LINES := 30
 
 static var _res_prefix_re: RegEx
 
@@ -2750,7 +2757,7 @@ static var _res_prefix_re: RegEx
 ## wrapped, titled "P4Godot" unless it has a title of its own, and with
 ## project paths written as the P4G panel writes them (no "res://").
 func _popup_dialog(dialog: AcceptDialog) -> void:
-	if dialog.title.is_empty() or dialog.title == "Alert!" or dialog.title == "Please Confirm...":
+	if dialog.title.is_empty():
 		dialog.title = "P4Godot"
 	dialog.dialog_text = _plain_paths(dialog.dialog_text)
 	dialog.dialog_autowrap = true
@@ -2809,6 +2816,12 @@ func _show_alert(text: String) -> void:
 	_dialog_result_ready = false
 
 	var dialog := AcceptDialog.new()
+	dialog.title = "P4Godot"
+	# Raw p4 output can run to hundreds of lines; the Log (above) has it all.
+	var lines := text.split("\n")
+	if lines.size() > ALERT_MAX_LINES:
+		text = "\n".join(lines.slice(0, ALERT_MAX_LINES)) + \
+				"\n\n... and %d more lines - press \"Log\" in the P4G panel for the rest." % (lines.size() - ALERT_MAX_LINES)
 	dialog.set_text(text)
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
