@@ -54,6 +54,7 @@ var _progress_note_text: String = ""
 
 func _build_progress_window() -> void:
 	_progress_window = Window.new()
+	_themed_background(_progress_window)
 	_progress_window.title = "Perforce"
 	_progress_window.size = Vector2i(Vector2(560, 200) * EditorInterface.get_editor_scale())
 	_progress_window.visible = false
@@ -309,6 +310,7 @@ class P4DiffHighlighter extends SyntaxHighlighter:
 ## span that actually differs is brightened. Repopulated and popped per diff.
 func _build_diff_window() -> void:
 	diff_window = Window.new()
+	_themed_background(diff_window)
 	diff_window.title = "P4Godot - Diff"
 	diff_window.size = Vector2i(Vector2(1160, 640) * EditorInterface.get_editor_scale())
 	diff_window.visible = false
@@ -374,24 +376,42 @@ func _make_diff_pane() -> TextEdit:
 	te.editable = false
 	te.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	te.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	var hl := P4DiffHighlighter.new()
-	var base := EditorInterface.get_base_control()
-	if base and base.has_theme_color("font_color", "Editor"):
-		hl.default_color = base.get_theme_color("font_color", "Editor")
-	te.syntax_highlighter = hl
+	te.syntax_highlighter = P4DiffHighlighter.new()
 	# Monospace so columns line up; fall back to the default font if missing.
-	var mono := base.get_theme_font("source", "EditorFonts")
+	var mono := EditorInterface.get_base_control().get_theme_font("source", "EditorFonts")
 	if mono:
 		te.add_theme_font_override("font", mono)
-	# A darker base than the editor's default TextEdit so the change bands and
-	# text stand out. read_only is the stylebox a non-editable TextEdit draws.
+	_color_diff_pane(te)
+	# Built with the panel, so the theme can change after: follow it.
+	te.theme_changed.connect(_color_diff_pane.bind(te))
+	return te
+
+
+## The script editor's own colours on a diff pane - background, text, line
+## numbers - so a diff reads like code does in this user's editor, light
+## theme or dark.
+func _color_diff_pane(te: TextEdit) -> void:
+	var hl := te.syntax_highlighter as P4DiffHighlighter
+	if hl:
+		hl.default_color = _code_color("font_color", Color(0.83, 0.84, 0.88))
+		hl.gutter_color = _code_color("line_number_color", Color(0.55, 0.57, 0.62, 0.8))
+	var base := EditorInterface.get_base_control()
+	var code_box: StyleBox = base.get_theme_stylebox("normal", "CodeEdit") \
+			if base.has_theme_stylebox("normal", "CodeEdit") else null
+	var bg := (code_box as StyleBoxFlat).bg_color if code_box is StyleBoxFlat \
+			else Color(0.09, 0.10, 0.12)
+	# Setting an override fires this control's own theme_changed: only set
+	# one when the colour really changed, or this would call itself forever.
+	var current := te.get_theme_stylebox("read_only") as StyleBoxFlat
+	if current != null and te.has_theme_stylebox_override("read_only") and current.bg_color == bg:
+		return
 	var style := StyleBoxFlat.new()
-	style.bg_color = base.get_theme_color("dark_color_2", "Editor") \
-			if base.has_theme_color("dark_color_2", "Editor") else Color(0.09, 0.10, 0.12)
+	style.bg_color = bg
 	style.set_content_margin_all(4)
+	# read_only is the stylebox a non-editable TextEdit draws.
 	te.add_theme_stylebox_override("normal", style)
 	te.add_theme_stylebox_override("read_only", style)
-	return te
+	te.queue_redraw()
 
 
 func _on_diff_pane_scrolled(value: float, target: TextEdit, vertical: bool) -> void:

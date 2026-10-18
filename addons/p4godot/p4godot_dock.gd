@@ -413,6 +413,7 @@ func _on_clear_log_pressed() -> void:
 ## modal semantics and the _dialog_busy serialization used for real prompts.
 func _build_log_window() -> void:
 	log_window = Window.new()
+	_themed_background(log_window)
 	log_window.title = "P4Godot - Log"
 	log_window.size = Vector2i(Vector2(900, 480) * EditorInterface.get_editor_scale())
 	log_window.visible = false

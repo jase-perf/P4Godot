@@ -2743,6 +2743,34 @@ static func _is_godot_save_leftover(local: String) -> bool:
 	return false
 
 
+## A plugin window's background, from the editor theme. Without it a window
+## shows Godot's default grey, which is close to the dark theme by chance and
+## puts dark text on dark grey in the light one (seen in the GUI tour). Call
+## right after creating the window, so it is drawn under everything else.
+func _themed_background(window: Window) -> void:
+	var bg := ColorRect.new()
+	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_color_background(bg)
+	# Windows built with the panel outlive a theme change: follow it.
+	bg.theme_changed.connect(_color_background.bind(bg))
+	window.add_child(bg)
+
+
+func _color_background(bg: ColorRect) -> void:
+	var base := EditorInterface.get_base_control()
+	bg.color = base.get_theme_color("base_color", "Editor") \
+			if base and base.has_theme_color("base_color", "Editor") else Color(0.13, 0.14, 0.16)
+
+
+## A code editor colour from the live editor theme (what the script editor
+## draws with), or `fallback`. The theme, not the text editor settings: those
+## kept their dark values when the theme changed to light at run time.
+static func _code_color(name: String, fallback: Color) -> Color:
+	var base := EditorInterface.get_base_control()
+	return base.get_theme_color(name, "CodeEdit") if base and base.has_theme_color(name, "CodeEdit") else fallback
+
+
 ## How wide every dialog's text is, before editor scaling: long text wraps
 ## at a reading width instead of stretching the dialog across the screen.
 const DIALOG_WIDTH := 560

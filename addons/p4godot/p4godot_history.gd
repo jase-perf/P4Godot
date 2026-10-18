@@ -336,6 +336,7 @@ static func _diff2_identical(text: String) -> bool:
 
 func _build_history_window() -> void:
 	history_window = Window.new()
+	_themed_background(history_window)
 	history_window.title = "P4Godot - History"
 	history_window.size = Vector2i(Vector2(980, 600) * EditorInterface.get_editor_scale())
 	history_window.visible = false

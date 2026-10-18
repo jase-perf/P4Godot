@@ -150,7 +150,7 @@ A Perforce colleague's C++ GDExtension design covers the P4 side this plugin is 
 
 ## From the GUI tour (2026-10-17)
 
-- [ ] The FileSystem dock's hover tooltip showed only Godot's plain file name in the GUI tour, even on a second hover, where the README promises Perforce status (`_on_tooltip_for_path`, EditorResourceTooltipPlugin). Check by hand whether it works with a real mouse; if not, find out which hovers Godot 4.7 hands to tooltip plugins.
+- [ ] The FileSystem dock's hover tooltip can't be checked by the GUI harness: a hover pushed into the editor's viewport gets Godot's plain tooltip (the file name) even for an image, where Godot itself shows a preview, type and size - so the rich tooltip the plugin decorates is never built, and the plugin's hook isn't called. Check by hand with a real mouse that a hovered file shows its P4 lines.
 - [x] Godot 4.7 writes project.godot on every windowed editor start (measured, with and without P4Godot), which shows "Load Errors" when the file is read-only. P4Godot now offers once to give it the +w filetype; README troubleshooting says so.
 - [ ] A plugin dialog opened while Godot's own exclusive dialog (Load Errors) is up: both showed in GUI mode, but whether the plugin's sits behind Godot's on a real desktop wasn't checked.
 

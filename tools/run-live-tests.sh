@@ -66,11 +66,26 @@ cp -r addons "$proj"/ || exit 1
 cp tests/p4godot_test.gd "$proj/addons/p4godot/" || exit 1
 sed 's/^script="p4godot.gd"$/script="p4godot_test.gd"/' "$proj/addons/p4godot/plugin.cfg" > "$work/plugin.cfg" \
 	&& mv "$work/plugin.cfg" "$proj/addons/p4godot/plugin.cfg" || exit 1
+# DEMO=<folder of a Godot project> adds that project's content - for README
+# screenshots that show a real game (gui-readme). Its own addons, editor
+# cache and Perforce settings stay behind.
+if [ -n "${DEMO:-}" ]; then
+	[ -f "$DEMO/project.godot" ] || { echo "FAIL: DEMO=$DEMO has no project.godot"; exit 1; }
+	for item in "$DEMO"/*; do
+		case "$(basename "$item")" in
+			addons|project.godot|screenshots|build.bat|export_presets.cfg|*.p4config*|.p4ignore|logo-p4*|p4-icon*|exclusive_test.tscn) ;;
+			*) cp -r "$item" "$proj/" || exit 1 ;;
+		esac
+	done
+	main_scene="$(grep '^run/main_scene=' "$DEMO/project.godot" | head -1)"
+	demo_name="$(grep '^config/name=' "$DEMO/project.godot" | head -1)"
+fi
 # project.godot as Godot itself writes it, version tag included: a windowed
 # editor rewrites a project.godot that lacks its version's tag the first time
 # it opens it (measured, 4.7), and a read-only one then stops on Godot's own
 # "Load Errors" dialog - as it does for a team after every Godot upgrade.
 godot_features="$("$GODOT" --version 2>/dev/null | cut -d. -f1-2)"
+project_name="${demo_name:-config/name=\"p4godot-livetest\"}"
 cat > "$proj/project.godot" <<EOF
 ; Engine configuration file.
 ; It's best edited using the editor UI and not directly,
@@ -84,8 +99,9 @@ config_version=5
 
 [application]
 
-config/name="p4godot-livetest"
+$project_name
 config/features=PackedStringArray("$godot_features")
+${main_scene:-}
 EOF
 # A plugin that doesn't compile can't run any test: each would only wait out
 # its timeout and retries.
@@ -189,6 +205,8 @@ if [ -n "${GUI:-}" ]; then
 	SHOTS="${SHOTS:-$work/shots}"
 	mkdir -p "$SHOTS"
 	export P4GODOT_SHOTS="$SHOTS"
+	# THEME=light runs the tour in Godot's light theme.
+	export P4GODOT_THEME="${THEME:-}"
 fi
 
 failed=""

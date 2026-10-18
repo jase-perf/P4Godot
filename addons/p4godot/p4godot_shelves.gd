@@ -718,6 +718,7 @@ func _diff_shelved_row(meta: Dictionary, vs_workspace: bool) -> void:
 
 func _build_shelves_window() -> void:
 	shelves_window = Window.new()
+	_themed_background(shelves_window)
 	shelves_window.title = "P4Godot - Shelves"
 	shelves_window.size = Vector2i(Vector2(1000, 640) * EditorInterface.get_editor_scale())
 	shelves_window.visible = false

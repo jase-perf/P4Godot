@@ -4780,6 +4780,15 @@ func _gui_show_dock() -> void:
 	var w := EditorInterface.get_base_control().get_window()
 	w.mode = Window.MODE_WINDOWED
 	w.size = Vector2i(1600, 900)
+	# THEME=light: the same tour in Godot's light theme, where colours that
+	# only work on dark backgrounds show up.
+	if OS.get_environment("P4GODOT_THEME") == "light":
+		var es := EditorInterface.get_editor_settings()
+		es.set_setting("interface/theme/follow_system_theme", false)
+		es.set_setting("interface/theme/color_preset", "Light")
+		es.set_setting("interface/theme/base_color", Color(0.9, 0.9, 0.9))
+		es.set_setting("interface/theme/accent_color", Color(0.18, 0.5, 1.0))
+		await _gui_frames(30)
 	# Dialogs and menus drawn inside the editor window, not as windows of
 	# their own: a new native window stalled the editor's frame loop under
 	# test (measured), and inside, a screenshot shows them in context.
@@ -5219,6 +5228,22 @@ func _gui_test_editor() -> bool:
 	else:
 		_log("[selftest] FAIL: couldn't find the FileSystem tree")
 		ok = false
+	# An image's tooltip: Godot builds the rich kind (preview, type, size) for
+	# images, which is where the plugin's lines go.
+	fs.navigate_to_path("res://art/icon.svg")
+	await _gui_frames(20)
+	if fs_tree and fs_tree.get_selected():
+		var img_item := fs_tree.get_selected()
+		var img_rect := fs_tree.get_item_area_rect(img_item, 0)
+		var img_at := fs_tree.get_global_rect().position + img_rect.position + img_rect.size * 0.5
+		await _gui_hover(img_at)
+		await _gui_frames(90)
+		await _gui_hover(img_at + Vector2(0, 200))
+		await _gui_frames(30)
+		await _gui_hover(img_at)
+		await _gui_frames(120)
+		await _gui_shot("fs-tooltip-image")
+		_log("[selftest] tooltip cache has icon.svg: %s" % _fstat_cache.has("res://art/icon.svg"))
 	# The code editor: a script with changed lines (the marks), its P4
 	# submenu, and Who Changed This Line.
 	var script := load("res://scripts/player.gd") as Script
