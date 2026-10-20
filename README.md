@@ -29,6 +29,33 @@ scenes it runs `p4`, Perforce's command-line program, for you.
   <img src="docs/images/hero-checkout.gif" alt="Typing in a script that isn't checked out: P4Godot asks to check it out, and after Check Out the file is listed under Default changelist in the P4G panel" width="760">
 </p>
 
+## What you get
+
+<table>
+  <tr>
+    <td width="50%"><a href="#the-p4g-panel-everything-you-have-changed"><img src="docs/images/changelist-dock.png" alt="The P4G panel listing changed files by changelist, with a file's right-click menu open"></a></td>
+    <td width="50%"><a href="#diff-viewer"><img src="docs/images/diff-viewer.png" alt="The diff viewer showing a script's changed lines side by side"></a></td>
+  </tr>
+  <tr>
+    <td><b>One panel for everything you've changed.</b> Compare, revert, move between changelists, and submit with a confirmation that lists every file.</td>
+    <td><b>See exactly what changed</b> before you send it: your copy beside the one you downloaded.</td>
+  </tr>
+  <tr>
+    <td><a href="#files-you-edited-in-photoshop-blender-or-anywhere-else"><img src="docs/images/watcher.png" alt="Files changed outside Godot, listed in the panel"></a></td>
+    <td><a href="#a-files-history"><img src="docs/images/history.png" alt="A file's history: who changed it, when, and why"></a></td>
+  </tr>
+  <tr>
+    <td><b>Art edited outside Godot is caught too.</b> Files you change in Photoshop or Blender are checked out for you, or listed if you'd rather decide.</td>
+    <td><b>Every file's history</b>: who changed it, when, and why, with any old version a click away.</td>
+  </tr>
+</table>
+
+Also: [Get Latest](#getting-everyone-elses-work) that reloads what's open,
+[shelves](#shelving-share-work-without-submitting-it) for sharing work
+without submitting it, and a **P4** menu wherever you right-click a file,
+[in the file browser](#right-click-actions-in-godots-file-browser) and
+[in the editor](#p4-in-the-editors-other-menus).
+
 ## Quick start
 
 This is for joining a project that's already in Perforce, which is the usual
