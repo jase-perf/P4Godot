@@ -1838,6 +1838,25 @@ func _open_editor_files() -> Dictionary:
 	return open
 
 
+## The res:// paths open in the editor with changes that aren't saved:
+## Godot's own lists (scenes; scripts and text files in the script editor),
+## plus edits P4Godot holds for a checkout at save time, in case a tab's state
+## isn't in Godot's lists. A reload or a combine would lose these.
+## `open`: the open files, if the caller has them (_open_editor_files).
+func _unsaved_editor_files(open: Dictionary = {}) -> Dictionary:
+	var out := {}
+	for path in EditorInterface.get_unsaved_scenes():
+		out[ProjectSettings.localize_path(String(path))] = true
+	for path in EditorInterface.get_script_editor().get_unsaved_files():
+		out[ProjectSettings.localize_path(String(path))] = true
+	if open.is_empty():
+		open = _open_editor_files()
+	for res: String in _pending_save_checkout.keys() + _declined_this_session.keys():
+		if open.has(res):
+			out[res] = true
+	return out
+
+
 # ---------------------------------------------------------------------------
 # Reloading files from disk
 # ---------------------------------------------------------------------------

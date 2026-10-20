@@ -4,6 +4,17 @@ Notable changes to P4Godot. Versions before 0.5.0 predate this repository.
 
 ## Unreleased
 
+- **Get Latest never throws away your work.**
+  - A file open with unsaved changes is no longer reloaded over them. P4Godot
+    checks it out if needed, so the download leaves it alone, and you combine
+    the two versions after saving. Resolve... also waits for the save: before,
+    combining a checked-out file right after Get Latest reloaded its tab and
+    lost unsaved changes.
+  - Files changed on disk without a checkout get **Check Out Mine, Then Get
+    Latest**: P4Godot checks them out, downloads, and combines your changes
+    with the new version. Before, it only said to run Reconcile and start
+    again.
+
 - **A design pass, from screenshots of every screen** (a new GUI test mode
   runs the plugin in a real editor window and captures the panel, menus,
   dialogs and windows):

@@ -146,12 +146,14 @@ change it. Files that aren't in Perforce yet get no prompt: add them with
 
 This is the loop you'll repeat all day. Five steps.
 
-1. **Save your work, then get everyone else's.** Press **Get Latest...** in
-   the P4G panel. It lists what's about to arrive before downloading anything.
-   Any of those files you have open gets reloaded on the downloaded version,
-   and unsaved changes in it are lost — the confirmation names those files, so
-   read it.
-   *You should see* the files land, and any open ones reload.
+1. **Get everyone else's work.** Press **Get Latest...** in the P4G panel.
+   It lists what's about to arrive before downloading anything. Your own
+   changes are never thrown away, saved or not: a tab with unsaved changes
+   isn't reloaded, and where you and a teammate changed the same file,
+   P4Godot can check yours out and help you combine the two (see
+   [Getting everyone else's work](#getting-everyone-elses-work)).
+   *You should see* the files land, and open tabs without unsaved changes
+   reload.
 2. **Change something.** Move a node, edit a script, whatever. The moment you
    do, P4Godot asks whether to check the file out. Say **Check Out**.
    The other button, **Discard My Changes**, reloads the file from disk, which
@@ -223,17 +225,26 @@ changed files the next time you switch back to Godot.
 **Get Latest...** downloads every file in the project that someone has
 submitted since you last looked. It shows you the list and the total size
 first, then downloads, then reloads anything you had open — so an open scene
-shows the new version instead of quietly keeping the old one. That reload is
-also why you should save first: unsaved changes to a file being downloaded are
-lost, and the confirmation names those files before anything happens.
+shows the new version instead of quietly keeping the old one.
 
-It also tells you about the two things it can't simply download:
+It never throws away your work. Where you changed a file that a teammate also
+changed, the new version can't simply be downloaded, and P4Godot handles it
+like this:
 
-- **A file you changed without checking it out.** Perforce refuses to
-  overwrite it, which is the point: your work isn't thrown away. P4Godot names
-  those files before it downloads anything and again afterwards, and tells
-  you to Reconcile them. It checks each file's contents to find them (a "safe
-  sync"), so this holds even for a file that still looks locked.
+- **A file you changed and saved without checking it out.** Perforce refuses
+  to overwrite it. The confirmation names those files and offers **Check Out
+  Mine, Then Get Latest**: P4Godot checks them out, downloads, and then
+  combines your changes with the new version (see the next point). **Get
+  Latest** instead leaves them as they are for now. It checks each file's
+  contents to find them (a "safe sync"), so this holds even for a file that
+  still looks locked.
+- **A file open in the editor with changes you haven't saved.** P4Godot
+  doesn't reload it: it checks the file out if it isn't already, so your
+  changes stay in the tab. Save, then right-click it in the P4G panel →
+  **Resolve...** to combine your changes with the new version. (Resolve waits
+  for the save, because until then the copy on disk doesn't have your
+  changes.) If the file can't be checked out (a teammate has it locked), Get
+  Latest stops before downloading anything and says why.
 - **A file you have checked out that someone else changed too.** Perforce
   leaves yours alone and expects the two versions to be combined — *resolved*,
   in Perforce's word. P4Godot names those files and offers to combine them;
@@ -696,9 +707,9 @@ contents really changed, P4Godot checks it out afterwards.
 - **"Perforce would not overwrite" some files after Get Latest.** Those files
   are changed on your disk but not checked out, so Perforce left your version
   alone rather than throw it away. That's usually a checkout it refused
-  earlier, or a file another program wrote. Press **Reconcile...** to check
-  them out, then **Get Latest...** again — after which Perforce will ask you
-  to combine the two versions.
+  earlier, or a file another program wrote. Press **Get Latest...** again and
+  choose **Check Out Mine, Then Get Latest**: P4Godot checks them out and asks
+  you to combine the two versions.
 - **"Not connected" in the toolbar.** Click it, or press Refresh (the
   circular-arrow button at the left end of the P4G toolbar), to rerun
   connection setup. It names what's missing. The P4 Log window (toolbar →

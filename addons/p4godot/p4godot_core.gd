@@ -316,6 +316,9 @@ var _selftest_auto_answer: String = ""
 var _selftest_typed: Array = []
 ## Self-tests only: which entry to choose in the next option dialogs.
 var _selftest_option_picks: Array = []
+# Self-tests only: answers for the next choice dialogs, in order, before
+# _selftest_auto_answer applies ("ok"/"confirm", "extra", "cancel").
+var _selftest_answer_queue: Array = []
 var _selftest_shown: Array = []
 ## True while a --p4-selftest-* run is driving the plugin. Startup prompts and
 ## the focus-in scan stay out of the way so a test sees only its own actions.
@@ -2427,8 +2430,15 @@ static func _decode_p4_bytes(bytes: PackedByteArray) -> String:
 ## undo-redo actions while a decision is pending. Serialized via _dialog_busy:
 ## callers queue up rather than clobbering each other's pending result.
 func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) -> bool:
+	return await _show_choice_dialog(text, ok_text, "", cancel_text) == "ok"
+
+
+## _show_confirm_dialog with a third button, `extra_text` (none when empty).
+## Returns "ok", "extra" or "cancel" (closing the window is "cancel").
+func _show_choice_dialog(text: String, ok_text: String, extra_text: String,
+		cancel_text: String) -> String:
 	if _shutting_down:
-		return false # A continuation resumed mid-teardown - nobody left to ask.
+		return "cancel" # A continuation resumed mid-teardown - nobody left to ask.
 	if _selftest_mode:
 		_selftest_shown.append(text)
 	while _dialog_busy:
@@ -2436,12 +2446,16 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 	_dialog_busy = true
 	_dialog_result_ready = false
 	_dialog_result_confirmed = false
+	_dialog_result_extra = false
 
 	var dialog := ConfirmationDialog.new()
 	dialog.title = "P4Godot"
 	dialog.set_text(text)
 	dialog.set_ok_button_text(ok_text)
 	dialog.set_cancel_button_text(cancel_text)
+	if not extra_text.is_empty():
+		dialog.add_button(extra_text, true, "extra")
+		dialog.custom_action.connect(_on_dialog_extra_action)
 	dialog.confirmed.connect(_on_confirm_dialog_confirmed)
 	dialog.canceled.connect(_on_confirm_dialog_canceled)
 	# Belt and braces: also resolve if the window is closed some way that
@@ -2450,19 +2464,24 @@ func _show_confirm_dialog(text: String, ok_text: String, cancel_text: String) ->
 
 	_popup_dialog(dialog)
 
-	if not _selftest_auto_answer.is_empty():
+	var auto := String(_selftest_answer_queue.pop_front()) if not _selftest_answer_queue.is_empty() \
+			else _selftest_auto_answer
+	if not auto.is_empty():
 		await get_tree().process_frame
 		if is_instance_valid(dialog):
-			if _selftest_auto_answer == "confirm":
+			if auto == "confirm":
 				dialog.confirmed.emit()
+			elif auto == "extra" and not extra_text.is_empty():
+				dialog.custom_action.emit(&"extra")
 			else:
 				dialog.canceled.emit()
 
 	while not _dialog_result_ready:
 		await get_tree().process_frame
+	var answer := "extra" if _dialog_result_extra else ("ok" if _dialog_result_confirmed else "cancel")
 	_discard_dialog(dialog)
 	_dialog_busy = false
-	return _dialog_result_confirmed
+	return answer
 
 
 ## Shows a modal dialog with a text field and returns {ok: bool, text: String}.

@@ -18,7 +18,7 @@ GODOT="${1:-${GODOT:-godot}}"
 [ $# -gt 0 ] && shift
 ALL="probe history-gate decline-reprompt script-revert import-dock
 get-latest-scene get-latest-script get-latest-modified get-latest-checked-out
-ignore-check-live file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
+get-latest-keep-mine get-latest-unsaved get-latest-unsaved-checked-out ignore-check-live file-actions-live moves-live password-expired-live create-changelist submit-roundtrip
 special-names history-live shelves-live submit-behind-live resolve-live submit-verdict-live submit-cancel submit-slow-trigger-live
 watch-live allwrite-live allwrite-offer-live diff-limits-live plugin-prompt get-latest-cancel ssl-fingerprint-live"
 TESTS="${*:-$ALL}"
@@ -249,6 +249,24 @@ for t in $TESTS; do
 			esac
 			[ -n "$staged" ] || { echo "FAIL: $t (staging)"; failed="$failed $t"; continue; }
 			arg="--p4-selftest-get-latest=res://$file" ;;
+		# Get Latest must keep the user's work: a change on disk that isn't
+		# checked out (and another file behind, so the confirmation shows),
+		# or an unsaved edit in an open tab (made in the test).
+		get-latest-keep-mine|get-latest-unsaved|get-latest-unsaved-checked-out)
+			file="scripts/player.gd"
+			# The teammate's line goes at the top and the user's at the end,
+			# so the two combine without a conflict.
+			(mate sync -q "//mate-ws/..." >/dev/null 2>&1
+				mate edit "$P4TEST_MATE_WS/$file" >/dev/null &&
+				sed -i '1i # a teammate was here' "$P4TEST_MATE_WS/$file" &&
+				mate submit -d "A teammate's change to $file" "$P4TEST_MATE_WS/$file" >/dev/null) ||
+				{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; }
+			if [ "$t" = get-latest-keep-mine ]; then
+				stage_behind scenes/level.tscn '
+[node name="Teammate" type="Node2D" parent="."]
+' && chmod u+w "$proj/$file" && printf '# my unsubmitted change\n' >> "$proj/$file" ||
+					{ echo "FAIL: $t (staging)"; failed="$failed $t"; continue; }
+			fi ;;
 		# A project whose project.godot is in Perforce but whose addon isn't:
 		# the addon leaves the depot and stays on disk.
 		plugin-prompt)
@@ -332,7 +350,7 @@ for t in $TESTS; do
 				p4t submit -d "Remove the cancel test's files" >/dev/null 2>&1; rm -rf big) ;;
 		# Only the checked-out variant leaves a file opened; anything else open
 		# afterwards is a finding for the check below.
-		get-latest-checked-out)
+		get-latest-checked-out|get-latest-keep-mine|get-latest-unsaved|get-latest-unsaved-checked-out)
 			(cd "$proj" && p4t revert "$file" >/dev/null 2>&1 && p4t sync -f "$file" >/dev/null 2>&1) ;;
 		get-latest-scene|get-latest-script|get-latest-modified)
 			(cd "$proj" && p4t sync -f "$file" >/dev/null 2>&1) ;;

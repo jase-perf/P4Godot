@@ -47,7 +47,7 @@ written yet.
 | 10 A teammate's lock | Automated | `watch-live` (both answers); dialog in `gui-dialogs` |
 | 11 Addon not in Perforce | Automated | `plugin-prompt`: the runner takes the addon out of the depot first (`delete -k`), then puts it back |
 | 12 Get Latest, nothing to do | Screenshot | `gui-dialogs` |
-| 13-15 Get Latest: reload, refusals, behind | Automated | `get-latest-scene`, `-script`, `-modified`, `-checked-out`: the runner has `mate` submit a newer revision first |
+| 13-15b Get Latest: reload, refusals, behind, your work kept | Automated | `get-latest-scene`, `-script`, `-modified`, `-checked-out`, `-keep-mine` (the new button combines a change made on disk), `-unsaved` and `-unsaved-checked-out` (an unsaved edit survives, and is combined only after the save): the runner has `mate` submit a newer revision first. The last two were checked against a build with the protection switched off, and fail there |
 | 16-18 Connection settings and workspace switching | Screenshot | dialogs in `gui-dialogs`; `connection-dialogs`, `connection-store` offline |
 | 19, 34-36 Resolve | Automated | `submit-behind-live`, `resolve-live`; dialogs captured in `gui-dialogs` |
 | 20-22 Progress window, cancel | Automated | `submit-slow-trigger-live`, `submit-cancel`, `get-latest-cancel` (40 files of 3 MB synced away first); the window is captured in `gui-windows` |

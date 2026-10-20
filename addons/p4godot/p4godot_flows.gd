@@ -60,6 +60,10 @@ var _sync_success_re := RegEx.create_from_string(
 ## Above this, the confirmation warns that the download will take a while.
 const BIG_DOWNLOAD_BYTES := 50 * 1024 * 1024
 
+## The Get Latest button that checks out files changed on disk first, so the
+## download combines them with the new version instead of skipping them.
+const KEEP_MINE_TEXT := "Check Out Mine, Then Get Latest"
+
 
 # Single-flights the flow. The dock's other long operations each have one
 # (_refresh_inflight, _external_scan_inflight). Without it a double-click runs
@@ -85,7 +89,11 @@ func _get_latest_flow() -> String:
 	return report
 
 
-func _get_latest_body() -> String:
+## `approved`: the user already said yes (to checking out their changed
+## files, from the "nothing was downloaded" message), so don't ask again.
+## `not_checked_out`: from that first step, files it couldn't check out, for
+## the report.
+func _get_latest_body(approved: bool = false, not_checked_out: Array = []) -> String:
 	if not await _ensure_identity():
 		await _show_alert(NOT_CONNECTED_MESSAGE)
 		return ""
@@ -125,13 +133,52 @@ func _get_latest_body() -> String:
 		if not notes.problems.is_empty():
 			idle = ("Nothing to download." if not kept_only else idle + "\n\n") \
 					+ " Perforce also said:\n\n%s" % _file_listing(notes.problems, 5)
-		await _show_alert(idle)
-		return idle
-	if not await _confirm_get_latest(found, notes):
+		if notes.modified.is_empty() or approved:
+			idle += _check_out_failures_text(not_checked_out)
+			await _show_alert(idle)
+			return idle
+		# The only newer versions are of files changed on disk: offer to check
+		# them out, which is what lets the download combine the two.
+		if await _show_choice_dialog(idle, KEEP_MINE_TEXT, "", "Close") != "ok":
+			return idle
+		var mine := await _check_out_for_get_latest(notes.modified)
+		if mine.failed.size() < notes.modified.size():
+			return await _get_latest_body(true, mine.failed)
+		var refused := "Nothing was downloaded." + _check_out_failures_text(mine.failed)
+		await _show_alert(refused)
+		return refused
+	# Open tabs with edits that aren't saved or checked out. A reload would
+	# throw those edits away, so they are checked out instead (below): p4 then
+	# leaves the file alone, and the user combines the two after saving.
+	var held := _get_latest_held(found, _open_editor_files())
+	# The user said yes to checking out their changed files, which only adds
+	# a resolve. Anything that arrived since then gets the usual question.
+	var answer := "ok" if approved and found.names.is_empty() \
+			else await _confirm_get_latest(found, notes, held)
+	if answer == "cancel":
 		_log("Get Latest cancelled.")
 		return ""
 	if not await _transfer_slot_free():
 		return "" # a submit was started while the confirmation sat open
+	var kept_back := await _check_out_for_get_latest(held)
+	if not kept_back.failed.is_empty():
+		# The edits can't be protected, so nothing is downloaded: a reload
+		# would lose them, and leaving the tab on an old version invites a
+		# save over the new one.
+		var stopped := ("Get Latest stopped before downloading anything. You have unsaved " +
+				"changes in files that are getting a newer version, and P4Godot couldn't " +
+				"check them out to keep those changes:\n\n%s\n\nSave or undo your changes " +
+				"to them, then press \"Get Latest...\" again.") % _file_listing(kept_back.failed, 20)
+		var did := held.filter(func(h: String) -> bool:
+				return not kept_back.failed.any(func(f: String) -> bool: return f.begins_with(h + " - ")))
+		if not did.is_empty():
+			stopped += ("\n\nThese were checked out on the way and stay checked out:\n\n%s") \
+					% _file_listing(did, 20)
+		await _show_alert(stopped)
+		return stopped
+	var mine_failed: Array = not_checked_out.duplicate()
+	if answer == "extra":
+		mine_failed.append_array((await _check_out_for_get_latest(notes.modified)).failed)
 	_log("Get Latest: %d file(s), %s..." % [found.names.size(), _human_bytes(int(found.bytes))])
 	var tracker := P4Progress.new()
 	tracker.total_files = int(found.adds) + int(found.updates)
@@ -179,8 +226,8 @@ func _get_latest_body() -> String:
 		var again_notes := _sync_notes(again)
 		var asked: bool = int(again.get("exit_code", -1)) == 0 or not still.is_empty()
 		var kept_names := {}
-		for held in again_notes.modified + again_notes.existing:
-			kept_names[String(held)] = true
+		for kept_name in again_notes.modified + again_notes.existing:
+			kept_names[String(kept_name)] = true
 		var arrived: Array = []
 		for rec in preview_records:
 			var local := String(rec.get("clientFile", ""))
@@ -196,12 +243,25 @@ func _get_latest_body() -> String:
 			after = again_notes
 	_request_refresh()
 	EditorInterface.get_resource_filesystem().scan()
-	var reload := await _reload_after_sync(done, after.clobbered)
+	var reload := await _reload_after_sync(done, after.clobbered + held)
 	# The resolve list only means anything after the sync: the sync is what
-	# moves the have revision and schedules the merge.
-	var to_resolve: Array = await _resolve_preview_names()
+	# moves the have revision and schedules the merge. Files with unsaved
+	# changes wait - the ones held above, and checked-out ones open with
+	# unsaved changes: combined now, the copy on disk (without those changes)
+	# would be merged, and the next save would overwrite the result.
+	var unsaved_now := _unsaved_editor_files()
+	var to_resolve: Array = []
+	for n: String in await _resolve_preview_names():
+		if held.has(n) or unsaved_now.has(n):
+			if not held.has(n):
+				held.append(n)
+		else:
+			to_resolve.append(n)
+	var gone := held.filter(func(h: String) -> bool: return found.deleted_names.has(h))
 	var report := _get_latest_report(done, after, reload, to_resolve,
-			0 if cancelled else int(synced.exit_code))
+			0 if cancelled else int(synced.exit_code),
+			held.filter(func(h: String) -> bool: return not gone.has(h)), gone) \
+			+ _check_out_failures_text(mine_failed)
 	if cancelled:
 		var head := "Get Latest was cancelled before it finished."
 		if cleaned > 0:
@@ -221,6 +281,39 @@ func _get_latest_body() -> String:
 	if not to_resolve.is_empty() and not cancelled:
 		await _resolve_flow(to_resolve)
 	return report
+
+
+## The files in the download that are open with changes that aren't saved
+## (_unsaved_editor_files). Reloading those would lose the changes, so they
+## are checked out instead. A file that is already checked out isn't in the
+## download at all: p4 leaves it alone.
+func _get_latest_held(found: Dictionary, open_files: Dictionary) -> Array:
+	var unsaved := _unsaved_editor_files(open_files)
+	var held: Array = []
+	for name_any in found.names:
+		var res := String(name_any)
+		if open_files.has(res) and unsaved.has(res):
+			held.append(res)
+	return held
+
+
+## Check out `names` (res:// paths, or local paths outside the project) for
+## Get Latest. Returns {failed: Array of "name - reason"}.
+func _check_out_for_get_latest(names: Array) -> Dictionary:
+	var failed: Array = []
+	for name_any in names:
+		var res := String(name_any)
+		var result: Dictionary = await _do_checkout(res)
+		if not result.ok:
+			failed.append("%s - %s" % [res, result.reason])
+	return {"failed": failed}
+
+
+func _check_out_failures_text(failed: Array) -> String:
+	if failed.is_empty():
+		return ""
+	return ("\n\nCouldn't check out:\n\n%s\n\nThose keep your version and didn't get the new " +
+			"one.") % _file_listing(failed, 20)
 
 
 ## After a cancelled sync, remove what the killed p4 left half-written.
@@ -408,9 +501,9 @@ static func _path_key(path: String) -> String:
 func _kept_modified_text(modified: Array) -> String:
 	return ("\n\nPerforce would not overwrite %d file(s) that have a newer version on the " +
 			"server:\n\n%s\n\nThose are changed on your disk but not checked out, so Perforce " +
-			"left your version alone instead of throwing it away. Press \"Reconcile...\" to " +
-			"check them out, then \"Get Latest...\" again.") \
-			% [modified.size(), _file_listing(modified, 30)]
+			"left your version alone instead of throwing it away. To combine your changes " +
+			"with the new version, press \"Get Latest...\" again and choose \"%s\".") \
+			% [modified.size(), _file_listing(modified, 30), KEEP_MINE_TEXT]
 
 
 ## The paragraph naming files the server added that collide with a file
@@ -558,7 +651,7 @@ func _sync_notes(result: Dictionary) -> Dictionary:
 ## this string; while it lived inside the dialog call, deleting the warnings
 ## broke nothing that any test could see.
 func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
-		open_files: Dictionary) -> String:
+		open_files: Dictionary, held: Array = []) -> String:
 	# Open files split two ways. A file being rewritten gets its tab reloaded.
 	# A file being DELETED cannot be, and its surviving tab is the dangerous
 	# one: saving it puts back what the team just deleted.
@@ -569,7 +662,7 @@ func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
 	var orphaned: Array = []
 	for name_any in found.names:
 		var res := String(name_any)
-		if not open_files.has(res):
+		if not open_files.has(res) or held.has(res):
 			continue
 		if deleted.has(res):
 			orphaned.append(res)
@@ -577,10 +670,15 @@ func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
 			reloading.append(res)
 
 	var note := ""
+	if not held.is_empty():
+		note += ("\n\nYou have unsaved changes in %d of them:\n\n%s\n\nP4Godot checks " +
+				"%s out first instead of reloading, so your changes stay in the editor. " +
+				"Save, then right-click each one in the P4G panel and choose \"Resolve...\" " +
+				"to combine your changes with the new version.") \
+				% [held.size(), _file_listing(held), "it" if held.size() == 1 else "them"]
 	if not reloading.is_empty():
-		note += ("\n\n%d of them %s open in the editor:\n\n%s\n\nThose tabs will be " +
-				"reloaded on the downloaded version, so anything you changed in them and " +
-				"didn't save is lost. Save first if you want to keep it.") \
+		note += ("\n\n%d of them %s open in the editor and will be reloaded to show the " +
+				"new version:\n\n%s") \
 				% [reloading.size(), "is" if reloading.size() == 1 else "are",
 				_file_listing(reloading)]
 	if not orphaned.is_empty():
@@ -597,10 +695,10 @@ func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
 				"P4Godot names them when it's finished.") % notes.opened_behind
 	var kept: Array = notes.get("modified", [])
 	if not kept.is_empty():
-		note += ("\n\n%d file(s) will NOT be downloaded, because you changed them on your " +
-				"disk without checking them out and Perforce won't overwrite that:\n\n%s\n\n" +
-				"Your versions stay as they are. Press \"Reconcile...\" afterwards to check " +
-				"them out.") % [kept.size(), _file_listing(kept)]
+		note += ("\n\n%d file(s) are changed on your disk but not checked out, and Perforce " +
+				"won't overwrite them:\n\n%s\n\n\"%s\" checks them out and combines " +
+				"your changes with the new version. \"Get Latest\" leaves them as they are " +
+				"for now.") % [kept.size(), _file_listing(kept), KEEP_MINE_TEXT]
 	var colliding: Array = notes.get("existing", [])
 	if not colliding.is_empty():
 		note += ("\n\n%d new file(s) from the server will NOT be downloaded, because a " +
@@ -634,10 +732,12 @@ func _get_latest_confirm_text(found: Dictionary, notes: Dictionary,
 	return "%s\n\n%s%s" % [headline, _file_listing(found.names), note]
 
 
-func _confirm_get_latest(found: Dictionary, notes: Dictionary) -> bool:
-	return await _show_confirm_dialog(
-			_get_latest_confirm_text(found, notes, _open_editor_files()),
-			"Get Latest", "Cancel")
+## "ok", "extra" (check out the files changed on disk first) or "cancel".
+func _confirm_get_latest(found: Dictionary, notes: Dictionary, held: Array) -> String:
+	var modified: Array = notes.get("modified", [])
+	return await _show_choice_dialog(
+			_get_latest_confirm_text(found, notes, _open_editor_files(), held),
+			"Get Latest", KEEP_MINE_TEXT if not modified.is_empty() else "", "Cancel")
 
 
 ## Put the downloaded contents in front of the user. Godot serves open tabs AND
@@ -653,9 +753,13 @@ func _confirm_get_latest(found: Dictionary, notes: Dictionary) -> bool:
 func _reload_after_sync(done: Dictionary, clobbered: Array) -> Dictionary:
 	var reloaded: Array = []
 	var orphaned: Array = []
+	# Open with unsaved changes NOW (typed during the download, or a file that
+	# arrived without being in the preview): never reloaded.
+	var unsaved_left: Array = []
 	if _shutting_down:
-		return {"reloaded": reloaded, "orphaned": orphaned}
+		return {"reloaded": reloaded, "orphaned": orphaned, "unsaved": unsaved_left}
 	var open_files := _open_editor_files()
+	var unsaved := _unsaved_editor_files(open_files)
 	for name_any in done.names:
 		var res := String(name_any)
 		if not res.begins_with("res://") or clobbered.has(res):
@@ -670,11 +774,15 @@ func _reload_after_sync(done: Dictionary, clobbered: Array) -> Dictionary:
 			continue
 		if not (open_files.has(res) or ResourceLoader.has_cached(res)):
 			continue
+		if unsaved.has(res):
+			unsaved_left.append(res)
+			_log("Not reloading '%s': it has unsaved changes. The new version is on disk." % res)
+			continue
 		if _shutting_down:
 			break
 		await _reload_path(res)
 		reloaded.append(res)
-	return {"reloaded": reloaded, "orphaned": orphaned}
+	return {"reloaded": reloaded, "orphaned": orphaned, "unsaved": unsaved_left}
 
 
 ## The files that now need their two versions combined before they can be
@@ -734,6 +842,21 @@ func _resolve_flow(only: Array = []) -> int:
 		return 0
 	var left := 0
 	var changed_on_disk: Array = []
+	# Combining rewrites the file and reloads its tab: a tab with unsaved
+	# changes would lose them, and the copy on disk being combined doesn't
+	# have them. Those wait until they are saved.
+	var unsaved := _unsaved_editor_files()
+	var unsaved_waiting: Array = []
+	for w: Dictionary in waiting:
+		if unsaved.has(String(w.res_path)):
+			unsaved_waiting.append(String(w.res_path))
+	if not unsaved_waiting.is_empty():
+		waiting = waiting.filter(func(w: Dictionary) -> bool: return not unsaved_waiting.has(String(w.res_path)))
+		left += unsaved_waiting.size()
+		await _show_alert(("%d file(s) waiting to be combined have changes you haven't " +
+				"saved:\n\n%s\n\nSave them first, then right-click each one in the P4G panel " +
+				"and choose \"Resolve...\". Combining now would combine the copy on disk " +
+				"without your unsaved changes.") % [unsaved_waiting.size(), _file_listing(unsaved_waiting)])
 	for i in waiting.size():
 		var outcome := await _resolve_one(waiting[i], i + 1, waiting.size())
 		if outcome == "combined" or outcome == "theirs":
@@ -843,7 +966,7 @@ func _resolve_one(file: Dictionary, position: int, total: int) -> String:
 ## overwrite, so the refusals are subtracted here. Every problem names its next
 ## step, because each one leaves work for the user to finish by hand.
 func _get_latest_report(done: Dictionary, after: Dictionary, reload: Dictionary,
-		to_resolve: Array, exit_code: int) -> String:
+		to_resolve: Array, exit_code: int, held: Array = [], held_deleted: Array = []) -> String:
 	var clobbered: Array = after.clobbered
 	var written: int = maxi(int(done.adds) + int(done.updates) - clobbered.size(), 0)
 	var parts: Array = []
@@ -879,6 +1002,26 @@ func _get_latest_report(done: Dictionary, after: Dictionary, reload: Dictionary,
 				"P4Godot asks you about each one next. You can also do it later: they are " +
 				"marked \"needs resolve\" in the P4G panel, and right-clicking one offers " +
 				"\"Resolve...\".") % [to_resolve.size(), _file_listing(to_resolve, 30)]
+	if not held.is_empty():
+		text += ("\n\nYour unsaved changes are still in the editor. %s checked out and " +
+				"left as %s, not reloaded:\n\n%s\n\nSave, then right-click each one in the P4G " +
+				"panel and choose \"Resolve...\" to combine your changes with the new version.") \
+				% ["This file is" if held.size() == 1 else "These files are",
+				"it was" if held.size() == 1 else "they were", _file_listing(held)]
+	if not held_deleted.is_empty():
+		text += ("\n\nA teammate deleted %s on the server while you have unsaved changes " +
+				"in it:\n\n%s\n\nIt's checked out, so your file and your changes are kept. " +
+				"Save, then right-click it in the P4G panel and choose \"Resolve...\" to " +
+				"keep your version or accept the delete.") \
+				% ["this file" if held_deleted.size() == 1 else "these files", _file_listing(held_deleted)]
+	var late: Array = reload.get("unsaved", [])
+	if not late.is_empty():
+		text += ("\n\nCAREFUL: %d file(s) got a new version while you had unsaved changes " +
+				"in %s:\n\n%s\n\nThe tab wasn't reloaded, so your changes are still there, " +
+				"but the file on disk is now the teammate's version. Saving would replace it " +
+				"with yours. To keep both, copy your changes, close the tab without saving, " +
+				"reopen it and make them again.") \
+				% [late.size(), "it" if late.size() == 1 else "them", _file_listing(late)]
 	if int(done.malformed) > 0:
 		text += ("\n\n%d line(s) of Perforce's answer couldn't be read, so this summary " +
 				"may be incomplete. Press \"Get Latest...\" again to check.") % done.malformed

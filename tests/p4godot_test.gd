@@ -217,7 +217,24 @@ func _run_cli_self_test_if_requested() -> void:
 			var open_files := {"C:\\ws\\proj\\level.gd": true, "C:\\ws\\proj\\gone.tscn": true}
 			var confirm := _get_latest_confirm_text(msum, {"opened_behind": 2}, open_files)
 			_log("[selftest] confirm text: %s" % confirm.replace("\n", " | "))
-			var confirm_ok: bool = confirm.contains("didn't save is lost") \
+			# A tab with unsaved edits on a file that isn't checked out is
+			# checked out instead of reloaded; only those are named as such.
+			_pending_save_checkout["C:\\ws\\proj\\level.gd"] = true
+			var held := _get_latest_held(msum, open_files)
+			_pending_save_checkout.erase("C:\\ws\\proj\\level.gd")
+			var hconfirm := _get_latest_confirm_text(msum, {"opened_behind": 0}, open_files, held)
+			var hreport := _get_latest_report(msum, {"clobbered": [], "problems": []},
+					{"reloaded": [], "orphaned": []}, [], 0, held)
+			_log("[selftest] held %s; confirm with it: %s" % [held, hconfirm.replace("\n", " | ")])
+			var held_ok: bool = held == ["C:\\ws\\proj\\level.gd"] \
+					and _get_latest_held(msum, open_files).is_empty() \
+					and hconfirm.contains("unsaved changes in 1 of them") \
+					and not hconfirm.contains("will be reloaded") \
+					and hreport.contains("unsaved changes are still in the editor") \
+					and hreport.contains("Resolve...")
+			var confirm_ok: bool = confirm.contains("reloaded to show the new version") \
+					and not confirm.contains("unsaved changes") \
+					and held_ok \
 					and confirm.contains("C:\\ws\\proj\\level.gd") \
 					and confirm.contains("CAREFUL") \
 					and confirm.contains("put the file back") \
@@ -313,8 +330,9 @@ func _run_cli_self_test_if_requested() -> void:
 					and mreport.contains("downloaded 1 file(s)") \
 					and mreport.contains("would not overwrite 2 file(s)") \
 					and mreport.contains("C:\\ws\\proj\\project.godot") \
-					and mreport.contains("Reconcile") \
-					and mconfirm.contains("will NOT be downloaded") \
+					and mreport.contains(KEEP_MINE_TEXT) \
+					and mconfirm.contains("changed on your disk but not checked out") \
+					and mconfirm.contains(KEEP_MINE_TEXT) \
 					and mconfirm.contains("C:\\ws\\proj\\.p4ignore") \
 					and only_modified.modified.size() == 1 \
 					and not _get_latest_has_work(_summarize_sync([]), only_modified) \
@@ -3749,6 +3767,92 @@ func _run_cli_self_test_if_requested() -> void:
 			_log("[selftest] %s: reconcile-report" % ("PASS" if well_formed else "FAIL"))
 			get_tree().quit()
 			return
+		if arg in ["--p4-selftest-get-latest-keep-mine", "--p4-selftest-get-latest-unsaved",
+				"--p4-selftest-get-latest-unsaved-checked-out"]:
+			# Live. Staged by the runner: a teammate submitted a newer
+			# scripts/player.gd (ending "# a teammate was here").
+			#   keep-mine: the runner also changed it on disk without checking it
+			#     out ("# my unsubmitted change") and put scenes/level.tscn
+			#     behind, so the confirmation shows; the test presses
+			#     "Check Out Mine, Then Get Latest".
+			#   unsaved: the script is open here with an edit that isn't saved,
+			#     made with "Check out on edit" off.
+			#   unsaved-checked-out: the same edit, on the script checked out
+			#     first: p4 leaves it alone, and combining it right away would
+			#     reload the tab.
+			# Either way nothing of the user's may be lost: the file ends up
+			# checked out and, once combined, holds both changes.
+			var which := arg.trim_prefix("--p4-selftest-")
+			var res := "res://scripts/player.gd"
+			var local := ProjectSettings.globalize_path(res)
+			var mine_line := "# my unsubmitted change" if which == "get-latest-keep-mine" else "# my unsaved edit"
+			var unsaved_case := which.begins_with("get-latest-unsaved")
+			var checks := {}
+			var code: CodeEdit = null
+			if unsaved_case:
+				if which == "get-latest-unsaved-checked-out":
+					await _do_checkout(res)
+				else:
+					auto_checkout_checkbox.set_pressed_no_signal(false)
+				EditorInterface.edit_script(load(res) as Script)
+				await _selftest_drain_frames()
+				code = EditorInterface.get_script_editor().get_current_editor().get_base_editor() as CodeEdit
+				code.text = code.text + mine_line + "\n"
+				code.text_changed.emit()
+				await _selftest_drain_frames()
+				_log("[selftest] Godot's unsaved lists: scenes %s, script editor %s" % [
+						EditorInterface.get_unsaved_scenes(), EditorInterface.get_script_editor().get_unsaved_files()])
+				checks["edit seen as unsaved"] = _unsaved_editor_files().has(res)
+				_selftest_auto_answer = "confirm"
+			else:
+				# The new button on the confirmation, then "Combine both
+				# versions" in Get Latest's own resolve step.
+				_selftest_answer_queue = ["extra"]
+				_selftest_auto_answer = "confirm"
+			_selftest_shown.clear()
+			var report := await _get_latest_flow()
+			await _selftest_drain_frames()
+			_log("[selftest] report: %s" % report.replace("\n", " | "))
+			var asked := "\n".join(_selftest_shown)
+			checks["checked out"] = await _selftest_action(local) == "edit"
+			if unsaved_case:
+				if which == "get-latest-unsaved":
+					checks["confirmation named the unsaved file"] = asked.contains("unsaved changes in 1")
+				# A reload replaces the tab's editor: ask for it again.
+				var tab := EditorInterface.get_script_editor().get_current_editor()
+				code = tab.get_base_editor() as CodeEdit if tab else null
+				checks["edit still in the tab"] = code != null and code.text.contains(mine_line)
+				if code == null:
+					_log("[selftest] FAIL: %s - the script tab is gone" % which)
+					get_tree().quit()
+					return
+				checks["not combined before the save"] = _resolve_preview_has(await _resolve_preview_names(), res)
+				checks["report says to save, then resolve"] = report.contains("unsaved changes are still in the editor")
+				# The user saves.
+				var scr := load(res) as Script
+				scr.source_code = code.text
+				ResourceSaver.save(scr, res)
+				code.tag_saved_version()
+			else:
+				checks["confirmation offered the button"] = asked.contains(KEEP_MINE_TEXT)
+				checks["combined by Get Latest itself"] = not _resolve_preview_has(await _resolve_preview_names(), res)
+			# Combine, as the P4G panel's "Resolve..." does ("Combine both versions").
+			_selftest_auto_answer = "confirm"
+			var pending := await _resolve_preview_names()
+			if not pending.is_empty():
+				await _resolve_flow(pending)
+				await _selftest_drain_frames()
+			var text := FileAccess.get_file_as_string(local)
+			checks["combined"] = not _resolve_preview_has(await _resolve_preview_names(), res)
+			checks["has my change"] = text.contains(mine_line)
+			checks["has the teammate's change"] = text.contains("# a teammate was here")
+			var ok := true
+			for name: String in checks:
+				_log("[selftest] %s: %s" % [name, checks[name]])
+				ok = ok and bool(checks[name])
+			_log("[selftest] %s: %s" % ["PASS" if ok else "FAIL", which])
+			get_tree().quit()
+			return
 		if arg.begins_with("--p4-selftest-get-latest="):
 			# Live: the real Get Latest flow against a workspace that is
 			# genuinely behind. STAGE IT OUTSIDE GODOT first - a revision
@@ -3789,6 +3893,12 @@ func _run_cli_self_test_if_requested() -> void:
 			var before: Dictionary = await _p4_exec(["-ztag", "sync", "-n", _project_scope()])
 			var staged := _summarize_sync(_parse_ztag(before))
 			var staged_notes := _sync_notes(before)
+			# A file changed on disk: Get Latest offers to check it out
+			# (get-latest-keep-mine covers that). This test is about the
+			# refusal, so it declines - which also cancels any other download
+			# staged with it, so stage this variant on its own.
+			if not _sync_notes(await _p4_exec(["-ztag", "sync", "-n", "-s", _project_scope()])).modified.is_empty():
+				_selftest_auto_answer = "cancel"
 			var checked_out_behind: bool = int(staged_notes.opened_behind) > 0
 			_log("[selftest] staged: %d record(s) behind head %s, %d checked-out-and-behind (open in editor=%s)"
 					% [staged.names.size(), staged.names, staged_notes.opened_behind, was_open])
@@ -4593,6 +4703,11 @@ func _selftest_is_read_only(global_path: String) -> bool:
 
 ## Self-tests only: a new pending changelist holding `local_path` (or empty
 ## when that is ""). Returns its number.
+## Self-tests only: whether `names` (from _resolve_preview_names) has res.
+func _resolve_preview_has(names: Array, res: String) -> bool:
+	return names.has(res) or names.has(ProjectSettings.globalize_path(res))
+
+
 func _create_selftest_change(description: String, local_path: String) -> String:
 	var spec := "Change: new\n\nDescription:\n\t%s\n" % description
 	if not local_path.is_empty():
