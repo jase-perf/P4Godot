@@ -7,19 +7,19 @@
 
 **Use Perforce without leaving the Godot editor.**
 
-Perforce is a version control system: a server that keeps every version of
+Perforce P4 is a version control system: a server that keeps every version of
 every file in your game, so a whole team can work on it without overwriting
 each other. Game studios use it because it handles big art files well. It
 used to be called Helix Core, and you'll see it written as "P4".
 
 P4Godot (P4G for short) brings it into Godot 4. Start changing a file and it
 offers to *check the file out* — to tell the server you're working on it.
-Everything you've changed collects in a panel at the bottom of the editor,
+Everything you've changed is put in a "changelist" in a panel at the bottom of the editor,
 where you can compare it against the server's copy and send it to your team.
 No alt-tabbing to another program.
 
-New to version control? This page assumes you've never used it. Perforce
-words that don't mean what you'd guess — *open*, *revert*, *check out* — are
+New to version control? This page assumes you've never used it. P4
+words that show up — *open*, *revert*, *check out* — are
 all in the [glossary](docs/glossary.md).
 
 P4Godot is written in GDScript, so there's nothing to compile. Behind the
@@ -38,32 +38,31 @@ scenes it runs `p4`, Perforce's command-line program, for you.
   </tr>
   <tr>
     <td><b>One panel for everything you've changed.</b> Compare, revert, move between changelists, and submit with a confirmation that lists every file.</td>
-    <td><b>See exactly what changed</b> before you send it: your copy beside the one you downloaded.</td>
+    <td><b>See exactly what changed</b> before you send it: diff your copy beside the original</td>
   </tr>
   <tr>
     <td><a href="#files-you-edited-in-photoshop-blender-or-anywhere-else"><img src="docs/images/watcher.png" alt="Files changed outside Godot, listed in the panel"></a></td>
     <td><a href="#a-files-history"><img src="docs/images/history.png" alt="A file's history: who changed it, when, and why"></a></td>
   </tr>
   <tr>
-    <td><b>Art edited outside Godot is caught too.</b> Files you change in Photoshop or Blender are checked out for you, or listed if you'd rather decide.</td>
-    <td><b>Every file's history</b>: who changed it, when, and why, with any old version a click away.</td>
+    <td><b>Art edited outside Godot is caught too.</b> Files you change in Photoshop or Blender are checked out for you, or just listed for you if you don't want automatic checkout.</td>
+    <td><b>Every file's history</b>: who changed it, when, and why, with any previous version just a click away.</td>
   </tr>
 </table>
 
-Also: [Get Latest](#getting-everyone-elses-work) that reloads what's open,
-[shelves](#shelving-share-work-without-submitting-it) for sharing work
-without submitting it, and a **P4** menu wherever you right-click a file,
+Also: [Get Latest](#getting-everyone-elses-work) that gets updated from others on your P4 server,
+[shelves](#shelving-share-work-without-submitting-it) for storing or sharing wor0in-progress
+without submitting it, and a **P4** menu when you right-click a file,
 [in the file browser](#right-click-actions-in-godots-file-browser) and
 [in the editor](#p4-in-the-editors-other-menus).
 
 ## Quick start
 
 This is for joining a project that's already in Perforce, which is the usual
-case. If nobody has put your project there yet, one person does the
+case. If nobody has put your project in your P4 server yet, one person does the
 [first-time setup](docs/first-time-setup.md) once, then comes back here.
 
 You do two things in P4V, Perforce's desktop app, and the rest in Godot.
-Nothing here asks you to type a command.
 
 ### What you need
 
@@ -84,20 +83,21 @@ Nothing here asks you to type a command.
 1. **Log in.** Open P4V and enter your server address, user name, and
    password.
 2. **Make a workspace.** A workspace links a folder on your computer to your
-   team's project on the server. Choose **Connection → New Workspace** and
-   fill in three things:
-   - **Workspace name**: the suggested name is fine.
+   team's project on the server. Workspaces are unique to each machine, folder, and user,
+   so if you work on two different computers you will set up a workspace on each.
+   Choose **Connection → New Workspace** and fill in three things:
+   - **Workspace name**: the suggested name is fine or you can edit it.
    - **Workspace root**: an empty folder where the project will live.
    - **Stream**: click **Browse** and pick your team's stream. A stream is
-     the server's copy of the project. Most teams have one called `main`;
-     ask if you see several.
+     the server's copy of the project files (a branch). Most teams have one called `main`;
+     ask your admin if you see several.
 
    Tick **Automatically get all revisions**, then confirm.
    *You should see* the project's files appear in the folder you chose. If
    the folder stays empty, select it in P4V's **Workspace** tab and click
    **Get Latest** in the toolbar.
 
-That's everything you need P4V for today.
+Now your project has been downloaded to your workspace folder and you can use the P4Godot plugin.
 
 ### In Godot: turn on P4Godot
 
@@ -116,8 +116,8 @@ That's everything you need P4V for today.
      right-click that file → **Check Out**, and tick the box again.
 
    *You should see* the **P4G** tab appear.
-5. **Connect.** P4Godot asks only for what it can't work out by itself,
-   which is usually your password and which workspace to use. Pick the
+5. **Connect.** P4Godot asks for any information it needs,
+   which is usually your password and potentially your server address. Pick the
    workspace you made in step 2.
    *You should see* your user name and workspace in the P4G toolbar.
 6. **If you installed the plugin in step 4, share it with your team.** Press
@@ -130,7 +130,7 @@ That's everything you need P4V for today.
 
    Read the list Reconcile shows before you accept it:
    - Anything it calls *missing* gets deleted for the whole team when you
-     submit. If a file should still be there, cancel. You probably haven't
+     submit. If a file shows up as deleted that you don't expect, cancel. You probably haven't
      downloaded everything yet.
    - If it lists files under `.godot/`, cancel. That folder is Godot's
      private cache, and your project is missing the file that tells Perforce
